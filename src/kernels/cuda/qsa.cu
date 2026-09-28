@@ -1,3 +1,4 @@
+#include "hip/hip_runtime.h"
 // src/kernels/cuda/qsa.cu - P2.S2: the QSA cache, indexer and attention (see include/strata/kernels/qsa.hpp).
 //
 // The header documents the layouts and the scope; this file documents the four decisions that are about the
@@ -47,7 +48,8 @@
 #include "strata/kernels/rope.hpp"
 #include "strata/kernels/mrope.hpp"
 
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
+#include "strata/hip_compat.h"
 
 #include <cfloat>
 #include <cmath>
@@ -66,9 +68,9 @@ void fail(const char* what) {
 }
 
 void check_launch(const char* what) {
-    const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "qsa: %s launch: %s\n", what, cudaGetErrorString(e));
+    const hipError_t e = hipGetLastError();
+    if (e != hipSuccess) {
+        std::fprintf(stderr, "qsa: %s launch: %s\n", what, hipGetErrorString(e));
         std::exit(1);
     }
 }
@@ -77,9 +79,9 @@ void check_launch(const char* what) {
 /// faulted becomes visible only at the NEXT call's `cudaGetLastError()`, which then names the wrong kernel -
 /// exactly the mis-attribution that made round 198's first `kv_append` failure look like a later one.
 void check_sync(const char* what) {
-    const cudaError_t e = cudaDeviceSynchronize();
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "qsa: %s (synchronise): %s\n", what, cudaGetErrorString(e));
+    const hipError_t e = hipDeviceSynchronize();
+    if (e != hipSuccess) {
+        std::fprintf(stderr, "qsa: %s (synchronise): %s\n", what, hipGetErrorString(e));
         std::exit(1);
     }
 }
@@ -259,7 +261,7 @@ __global__ void qsa_index_kernel(const float* __restrict__ pooled,
     for (int d = lane; d < idx_dim; d += 32)
         acc = __dadd_rn(acc, __dmul_rn((double) pooled[(size_t) b * idx_dim + d],
                                        (double) q_idx[(size_t) wid * idx_dim + d]));
-    for (int o = 16; o > 0; o >>= 1) acc = __dadd_rn(acc, __shfl_xor_sync(0xffffffffu, acc, o));
+    for (int o = 16; o > 0; o >>= 1) acc = __dadd_rn(acc, __shfl_xor_sync(0xffffffffffffffffull, acc, o, 32));
     if (lane == 0) s_dot[wid] = acc;
     __syncthreads();
 
@@ -417,12 +419,12 @@ __global__ void kv_gather_kernel(const uint16_t* __restrict__ k_pool, const uint
 // ================= 6. qsa_attend =================
 
 __device__ __forceinline__ float warp_max(float v) {
-    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffffffffffull, v, o, 32));
     return v;
 }
 
 __device__ __forceinline__ float warp_sum(float v) {
-    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffffffffffull, v, o, 32);
     return v;
 }
 
@@ -530,8 +532,8 @@ namespace {
 int32_t* step_scratch() {
     static int32_t* d_step = nullptr;
     if (d_step == nullptr) {
-        if (cudaMalloc(&d_step, qsa_step_bytes()) != cudaSuccess) {
-            std::fprintf(stderr, "qsa: step upload: cudaMalloc failed\n");
+        if (hipMalloc(&d_step, qsa_step_bytes()) != hipSuccess) {
+            std::fprintf(stderr, "qsa: step upload: hipMalloc failed\n");
             std::exit(1);
         }
     }
@@ -540,8 +542,8 @@ int32_t* step_scratch() {
 
 void step_upload_raw(const int32_t* h_step) {
     int32_t* d = step_scratch();
-    if (cudaMemcpy(d, h_step, qsa_step_bytes(), cudaMemcpyHostToDevice) != cudaSuccess) {
-        std::fprintf(stderr, "qsa: step upload: cudaMemcpy failed\n");
+    if (hipMemcpy(d, h_step, qsa_step_bytes(), hipMemcpyHostToDevice) != hipSuccess) {
+        std::fprintf(stderr, "qsa: step upload: hipMemcpy failed\n");
         std::exit(1);
     }
 }
@@ -589,7 +591,7 @@ void kv_append_step(uint16_t* k_pool, uint16_t* v_pool, const int32_t* page_tabl
     if (step == nullptr) fail("kv_append: step is null");
     // The grid is the head x dim count, which is a CONSTANT - `kv_append` writes one cell.
     const long long n = s.n_head_kv * s.head_dim;
-    kv_append_kernel<<<grid_for(n, THREADS), THREADS, 0, (cudaStream_t) stream>>>(
+    kv_append_kernel<<<grid_for(n, THREADS), THREADS, 0, (hipStream_t) stream>>>(
         k_pool, v_pool, page_table, step, kcur, vcur, (int) s.n_head_kv, (int) s.head_dim, (int) s.page_size,
         host ? *host : KvHostPools{});
     check_launch("kv_append");
@@ -604,7 +606,7 @@ void qsa_index_step(const float* pooled, const float* q_idx, const float* bias, 
     // THE GRID IS `max_blocks`, A CONSTANT - not this token's `n_bid + 1`.  The kernel returns for
     // `b > n_bid`, so the surplus blocks cost a launch and nothing else.
     const int threads = 32 * (int) s.idx_n_head;
-    qsa_index_kernel<<<(unsigned) max_blocks, threads, 0, (cudaStream_t) stream>>>(
+    qsa_index_kernel<<<(unsigned) max_blocks, threads, 0, (hipStream_t) stream>>>(
         pooled, q_idx, bias, (int) s.idx_n_head, (int) s.idx_dim, s.idx_block, step, cell_scores);
     check_launch("qsa_index");
     if (stream == nullptr) check_sync("qsa_index");
@@ -624,7 +626,7 @@ void topk_512_step(const float* cell_scores, const QsaShapes& s, int64_t cap, co
         std::exit(1);
     }
     // One block, so the launch is already constant; the kernel reads `n_kv` and `width` from `step`.
-    topk_kernel<<<1, TOPK_THREADS, 0, (cudaStream_t) stream>>>(cell_scores, step, ids);
+    topk_kernel<<<1, TOPK_THREADS, 0, (hipStream_t) stream>>>(cell_scores, step, ids);
     check_launch("topk_512");
     if (stream == nullptr) check_sync("topk_512");
 }
@@ -638,7 +640,7 @@ void kv_gather_step(const uint16_t* k_pool, const uint16_t* v_pool, const int32_
     // THE GRID IS THE CAPACITY.  The kernel reads the real `n_ids` from `step` and its `if (i >= total) return;`
     // guard leaves the surplus threads idle.
     const long long total = max_ids * s.n_head_kv * (s.head_dim / 4);
-    kv_gather_kernel<<<grid_for(total, 256), 256, 0, (cudaStream_t) stream>>>(
+    kv_gather_kernel<<<grid_for(total, 256), 256, 0, (hipStream_t) stream>>>(
         k_pool, v_pool, page_table, ids, step, (int) s.n_head_kv, (int) s.head_dim, (int) s.page_size,
         k_scratch, v_scratch);
     check_launch("kv_gather");
@@ -659,22 +661,22 @@ void qsa_attend_step(const float* q, const uint16_t* k_scratch, const uint16_t* 
     static size_t s_configured = 0;
     if (smem > s_configured) {
         int dev = 0, max_shared = 0;
-        cudaGetDevice(&dev);
-        cudaDeviceGetAttribute(&max_shared, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+        hipGetDevice(&dev);
+        hipDeviceGetAttribute(&max_shared, hipDeviceAttributeSharedMemPerBlockOptin, dev);
         if ((int) smem > max_shared) {
             std::fprintf(stderr, "qsa: qsa_attend: max_ids %lld needs %zu B of shared, over the %d B limit\n",
                          (long long) max_ids, smem, max_shared);
             std::exit(1);
         }
-        const cudaError_t e =
-            cudaFuncSetAttribute(qsa_attend_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
-        if (e != cudaSuccess) {
-            std::fprintf(stderr, "qsa: qsa_attend: shared opt-in: %s\n", cudaGetErrorString(e));
+        const hipError_t e =
+            hipFuncSetAttribute(reinterpret_cast<const void*>(qsa_attend_kernel), hipFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
+        if (e != hipSuccess) {
+            std::fprintf(stderr, "qsa: qsa_attend: shared opt-in: %s\n", hipGetErrorString(e));
             std::exit(1);
         }
         s_configured = smem;
     }
-    qsa_attend_kernel<<<(unsigned) s.n_head, (unsigned) s.head_dim, smem, (cudaStream_t) stream>>>(
+    qsa_attend_kernel<<<(unsigned) s.n_head, (unsigned) s.head_dim, smem, (hipStream_t) stream>>>(
         q, k_scratch, v_scratch, step, (int) s.n_head, (int) s.n_head_kv, (int) s.head_dim, attn, weights);
     check_launch("qsa_attend");
     if (stream == nullptr) check_sync("qsa_attend");
@@ -717,7 +719,7 @@ void indexer_key_append(const float* raw, const int32_t* pos_dev, int32_t pos_ba
     // **ONE LAUNCH, NO HOST BRANCH ON THE POSITION.**  The completion rotation is inside the kernel now.  The
     // arguments here are identical for every token, which is the property a CUDA graph needs: this function can
     // be captured and replayed, and the position arrives through `pos_dev` like every other kernel's data.
-    indexer_key_append_kernel<<<1, threads, smem, (cudaStream_t) stream>>>(
+    indexer_key_append_kernel<<<1, threads, smem, (hipStream_t) stream>>>(
         raw, pos_dev, (int) pos_base, w_k_norm, eps, b.tail, b.dead, b.pooled, b.block_pos, (int) s.idx_dim,
         (int) s.idx_block, (int) s.n_rot, cos_tab, sin_tab, mrope_table());
     check_launch("indexer_key_append");
@@ -789,7 +791,7 @@ __global__ void qsa_gate_apply_f32_kernel(const float* __restrict__ attn, const 
 void qsa_gate_apply_f32(const float* attn, const float* q_full, const QsaShapes& s, float* out, void* stream) {
     validate(s, "qsa_gate_apply_f32");
     const long long n = s.n_head * s.head_dim;
-    qsa_gate_apply_f32_kernel<<<grid_for(n, 256), 256, 0, (cudaStream_t) stream>>>(attn, q_full, (int) s.n_head,
+    qsa_gate_apply_f32_kernel<<<grid_for(n, 256), 256, 0, (hipStream_t) stream>>>(attn, q_full, (int) s.n_head,
                                                                                   (int) s.head_dim, out);
     check_launch("qsa_gate_apply_f32");
     if (stream == nullptr) check_sync("qsa_gate_apply_f32");
@@ -798,7 +800,7 @@ void qsa_gate_apply_f32(const float* attn, const float* q_full, const QsaShapes&
 void qsa_gate_apply(const float* attn, const float* q_full, const QsaShapes& s, uint16_t* out, void* stream) {
     validate(s, "qsa_gate_apply");
     const long long n = s.n_head * s.head_dim;
-    qsa_gate_apply_kernel<<<grid_for(n, 256), 256, 0, (cudaStream_t) stream>>>(attn, q_full, (int) s.n_head,
+    qsa_gate_apply_kernel<<<grid_for(n, 256), 256, 0, (hipStream_t) stream>>>(attn, q_full, (int) s.n_head,
                                                                               (int) s.head_dim, out);
     check_launch("qsa_gate_apply");
     if (stream == nullptr) check_sync("qsa_gate_apply");

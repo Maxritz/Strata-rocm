@@ -1,3 +1,4 @@
+#include "hip/hip_runtime.h"
 // src/kernels/cuda/ple.cu - P2.S4: the PLE block's GPU half.
 //
 // See include/strata/kernels/ple.hpp for the structure and for the `normalized`-is-the-conv-input finding.
@@ -22,7 +23,7 @@
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/native_ple_postops.hpp"
 
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
 
 #include <cmath>
 #include <cstdio>
@@ -74,13 +75,13 @@ __device__ __forceinline__ float silu_f(float x) { return x / (1.0f + expf(-x));
 __device__ double block_sum(double v, double* scratch) {
     __syncthreads();
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xFFFFFFFFu, v, off);
+    for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, v, off, 32);
     if (lane == 0) scratch[warp] = v;
     __syncthreads();
     const int nw = ((int) blockDim.x + 31) >> 5;
     v = (threadIdx.x < nw) ? scratch[threadIdx.x] : 0.0;
     if (warp == 0)
-        for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xFFFFFFFFu, v, off);
+        for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, v, off, 32);
     if (threadIdx.x == 0) scratch[0] = v;
     __syncthreads();
     return scratch[0];
@@ -187,9 +188,9 @@ __global__ void to_bf16_kernel(const float* __restrict__ x, uint16_t* __restrict
     if (i < n) y[i] = bf16_bits(x[i]);
 }
 
-void ck(cudaError_t e, const char* what) {
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "ple_block: %s: %s\n", what, cudaGetErrorString(e));
+void ck(hipError_t e, const char* what) {
+    if (e != hipSuccess) {
+        std::fprintf(stderr, "ple_block: %s: %s\n", what, hipGetErrorString(e));
         std::exit(1);
     }
 }
@@ -206,13 +207,13 @@ void ple_history_advance(float* hist, const float* normalized, void* stream) {
     if (overlap(hist, (size_t) NG_HIST * NG_HC_DIM * sizeof(float),
                 normalized, (size_t) NG_HC_DIM * sizeof(float)))
         throw std::invalid_argument("ple_history_advance: history and normalized input overlap");
-    history_advance_kernel<<<(NG_HC_DIM + THREADS - 1) / THREADS, THREADS, 0, (cudaStream_t) stream>>>(hist, normalized);
-    ck(cudaGetLastError(), "history advance launch");
+    history_advance_kernel<<<(NG_HC_DIM + THREADS - 1) / THREADS, THREADS, 0, (hipStream_t) stream>>>(hist, normalized);
+    ck(hipGetLastError(), "history advance launch");
 }
 
 bool ple_block_available() {
     int n = 0;
-    return cudaGetDeviceCount(&n) == cudaSuccess && n > 0;
+    return hipGetDeviceCount(&n) == hipSuccess && n > 0;
 }
 
 uint64_t ple_block_scratch_bytes() {
@@ -228,13 +229,13 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
                PleOut& out, void* scratch, void* stream) {
     const bool native_key = w.key_native_data != nullptr && w.key_bf16 == nullptr;
     if (native_key && (!emb || !hidden || !hist_rows || !out.result || !scratch || !stream ||
-                       !w.key_native_q8_1 || w.key_native_type != 42))
-        throw std::invalid_argument("ple_block: native key requires Q2_0 weights, input/output, private scratch and explicit stream");
+                       !w.key_native_q8_1 || !native_mmvq_supported(w.key_native_type)))
+        throw std::invalid_argument("ple_block: native key requires supported weights, input/output, private scratch and explicit stream");
     if (emb == nullptr || hidden == nullptr || hist_rows == nullptr || out.result == nullptr) return;
     const int n_embd = NG_N_EMBD, hc = NG_HC, hc_dim = NG_HC_DIM;
     static_assert(NG_N_EMBD == 2560 && NG_HC_DIM == 10240, "native PLE key geometry changed");
     const size_t float_bytes = (size_t) (5 * hc_dim + n_embd + hc) * sizeof(float);
-    cudaStream_t st = (cudaStream_t) stream;
+    hipStream_t st = (hipStream_t) stream;
 
     // One allocation for every intermediate.
     //
@@ -346,18 +347,18 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
     // ---- the intermediates the oracle comparison needs.  `key` is the NORMALISED key, because the source's
     //      `cb(key, ...)` capture is after `gnorm`; `value` is the projection before the gate.  Each stage the
     //      oracle records is reproduced here so a mismatch can be attributed instead of guessed at.
-    if (out.key) ck(cudaMemcpyAsync(out.key, normalized_key, hc_dim * sizeof(float), cudaMemcpyDeviceToDevice, st), "key");
+    if (out.key) ck(hipMemcpyAsync(out.key, normalized_key, hc_dim * sizeof(float), hipMemcpyDeviceToDevice, st), "key");
     if (out.value)
-        ck(cudaMemcpyAsync(out.value, d_value, n_embd * sizeof(float), cudaMemcpyDeviceToDevice, st), "value");
-    if (out.gate) ck(cudaMemcpyAsync(out.gate, d_gate, hc * sizeof(float), cudaMemcpyDeviceToDevice, st), "gate");
+        ck(hipMemcpyAsync(out.value, d_value, n_embd * sizeof(float), hipMemcpyDeviceToDevice, st), "value");
+    if (out.gate) ck(hipMemcpyAsync(out.gate, d_gate, hc * sizeof(float), hipMemcpyDeviceToDevice, st), "gate");
     if (out.gated)
-        ck(cudaMemcpyAsync(out.gated, d_gated, hc_dim * sizeof(float), cudaMemcpyDeviceToDevice, st), "gated");
+        ck(hipMemcpyAsync(out.gated, d_gated, hc_dim * sizeof(float), hipMemcpyDeviceToDevice, st), "gated");
     if (out.normalized)
-        ck(cudaMemcpyAsync(out.normalized, d_norm, hc_dim * sizeof(float), cudaMemcpyDeviceToDevice, st), "norm");
+        ck(hipMemcpyAsync(out.normalized, d_norm, hc_dim * sizeof(float), hipMemcpyDeviceToDevice, st), "norm");
     if (out.conv)
-        ck(cudaMemcpyAsync(out.conv, d_conv, hc_dim * sizeof(float), cudaMemcpyDeviceToDevice, st), "conv");
+        ck(hipMemcpyAsync(out.conv, d_conv, hc_dim * sizeof(float), hipMemcpyDeviceToDevice, st), "conv");
 
-    ck(cudaGetLastError(), "launch");
+    ck(hipGetLastError(), "launch");
     // **NO `cudaStreamSynchronize` HERE.**  It was there to make the function self-contained for the parity
     // test, and inside a capture it is an error - a caller that wants the result immediately synchronises
     // itself, and the engine's caller does not want that at all.

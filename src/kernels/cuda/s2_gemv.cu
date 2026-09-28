@@ -1,3 +1,4 @@
+#include "hip/hip_runtime.h"
 // src/kernels/cuda/s2_gemv.cu - P2.S2: the S2 GEMV, one thread per output row.
 //
 // Naive per the phase rule: dequantize on the fly, FP32 accumulation inside the row, no shared memory, no
@@ -5,8 +6,8 @@
 // still right.
 #include "strata/kernels/s2_gemv.hpp"
 
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
+#include <hip/hip_fp16.h>
+#include <hip/hip_runtime.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -53,9 +54,9 @@ void s2_gemv(const uint16_t* x, const uint8_t* codes, const float* scales, float
     const int threads = 128;
     const long long blocks = (n_out + threads - 1) / threads;
     s2_gemv_kernel<<<(unsigned) blocks, threads>>>(x, codes, scales, y, n_in, n_out);
-    const cudaError_t e = cudaDeviceSynchronize();
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "s2_gemv: %s\n", cudaGetErrorString(e));
+    const hipError_t e = hipDeviceSynchronize();
+    if (e != hipSuccess) {
+        std::fprintf(stderr, "s2_gemv: %s\n", hipGetErrorString(e));
         std::exit(1);
     }
 }

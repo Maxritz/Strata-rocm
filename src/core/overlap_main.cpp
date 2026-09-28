@@ -12,7 +12,7 @@
 #include "strata/core/pinned.hpp"
 #include "strata/kernels/s_gemv.hpp"
 
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
 
 #include <chrono>
 #include <cstdio>
@@ -24,9 +24,9 @@
 
 namespace {
 
-void check(cudaError_t e, const char* what) {
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e));
+void check(hipError_t e, const char* what) {
+    if (e != hipSuccess) {
+        std::fprintf(stderr, "%s: %s\n", what, hipGetErrorString(e));
         std::exit(1);
     }
 }
@@ -86,20 +86,20 @@ int main(int argc, char** argv) {
 
     // device side: double buffered codes, plus x / scales / y
     uint8_t* d_codes[2] = {nullptr, nullptr};
-    for (int b = 0; b < 2; ++b) check(cudaMalloc(&d_codes[b], role_codes), "cudaMalloc codes");
+    for (int b = 0; b < 2; ++b) check(hipMalloc(&d_codes[b], role_codes), "hipMalloc codes");
     uint16_t* d_x = nullptr;
     float *d_scales = nullptr, *d_y = nullptr;
-    check(cudaMalloc(&d_x, n_in * sizeof(uint16_t)), "cudaMalloc x");
-    check(cudaMalloc(&d_scales, (size_t) n_out * (n_in / 64) * sizeof(float)), "cudaMalloc scales");
-    check(cudaMalloc(&d_y, n_out * sizeof(float)), "cudaMalloc y");
+    check(hipMalloc(&d_x, n_in * sizeof(uint16_t)), "hipMalloc x");
+    check(hipMalloc(&d_scales, (size_t) n_out * (n_in / 64) * sizeof(float)), "hipMalloc scales");
+    check(hipMalloc(&d_y, n_out * sizeof(float)), "hipMalloc y");
     std::vector<uint16_t> hx((size_t) n_in, 0x3C00);
     std::vector<float> hs((size_t) n_out * (size_t) (n_in / 64), 0.001f);
-    check(cudaMemcpy(d_x, hx.data(), hx.size() * sizeof(uint16_t), cudaMemcpyHostToDevice), "copy x");
-    check(cudaMemcpy(d_scales, hs.data(), hs.size() * sizeof(float), cudaMemcpyHostToDevice), "copy scales");
+    check(hipMemcpy(d_x, hx.data(), hx.size() * sizeof(uint16_t), hipMemcpyHostToDevice), "copy x");
+    check(hipMemcpy(d_scales, hs.data(), hs.size() * sizeof(float), hipMemcpyHostToDevice), "copy scales");
 
-    cudaStream_t s_copy{}, s_comp{};
-    check(cudaStreamCreate(&s_copy), "stream copy");
-    check(cudaStreamCreate(&s_comp), "stream compute");
+    hipStream_t s_copy{}, s_comp{};
+    check(hipStreamCreate(&s_copy), "stream copy");
+    check(hipStreamCreate(&s_comp), "stream compute");
     const strata::kernels::SForm form{2, -1, 64, strata::kernels::Codebook::Affine, false};
 
     // ---- SERIAL: the same operations on the SAME stream, so the GPU runs them one after another ----
@@ -109,41 +109,41 @@ int main(int argc, char** argv) {
     // round-trip, so the ratio of 0.095 mostly measured "with syncs" against "without syncs".  Putting both
     // operations on one stream expresses the same dependency with NO CPU involvement and ONE sync at the end,
     // which is what makes the comparison about overlap rather than about synchronisation.
-    check(cudaStreamSynchronize(0), "pre sync");
+    check(hipStreamSynchronize(0), "pre sync");
     auto t0 = std::chrono::steady_clock::now();
     for (int i = 0; i < experts; ++i) {
-        check(cudaMemcpyAsync(d_codes[0], arena.data() + (uint64_t) i * role_codes, role_codes,
-                              cudaMemcpyHostToDevice, 0),
+        check(hipMemcpyAsync(d_codes[0], arena.data() + (uint64_t) i * role_codes, role_codes,
+                              hipMemcpyHostToDevice, 0),
               "serial copy");
         strata::kernels::s_gemv_split_async(d_x, d_codes[0], d_scales, nullptr, d_y, n_in, n_out, form,
-                                            threads_per_row, (void*) (cudaStream_t) 0);
+                                            threads_per_row, (void*) (hipStream_t) 0);
     }
-    check(cudaStreamSynchronize(0), "serial final sync");
+    check(hipStreamSynchronize(0), "serial final sync");
     const double serial = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 
     // ---- OVERLAPPED: copy the next one while computing on the current one ----
-    check(cudaStreamSynchronize(0), "pre sync 2");
-    cudaEvent_t ev[2];
-    for (int b = 0; b < 2; ++b) check(cudaEventCreateWithFlags(&ev[b], cudaEventDisableTiming), "event");
+    check(hipStreamSynchronize(0), "pre sync 2");
+    hipEvent_t ev[2];
+    for (int b = 0; b < 2; ++b) check(hipEventCreateWithFlags(&ev[b], hipEventDisableTiming), "event");
     t0 = std::chrono::steady_clock::now();
-    check(cudaMemcpyAsync(d_codes[0], arena.data(), role_codes, cudaMemcpyHostToDevice, s_copy), "prologue");
-    check(cudaEventRecord(ev[0], s_copy), "prologue event");
+    check(hipMemcpyAsync(d_codes[0], arena.data(), role_codes, hipMemcpyHostToDevice, s_copy), "prologue");
+    check(hipEventRecord(ev[0], s_copy), "prologue event");
     for (int i = 0; i < experts; ++i) {
         const int cur = i & 1, nxt = (i + 1) & 1;
         if (i + 1 < experts) {
-            check(cudaMemcpyAsync(d_codes[nxt], arena.data() + (uint64_t) (i + 1) * role_codes, role_codes,
-                                  cudaMemcpyHostToDevice, s_copy),
+            check(hipMemcpyAsync(d_codes[nxt], arena.data() + (uint64_t) (i + 1) * role_codes, role_codes,
+                                  hipMemcpyHostToDevice, s_copy),
                   "overlap copy");
-            check(cudaEventRecord(ev[nxt], s_copy), "overlap event");
+            check(hipEventRecord(ev[nxt], s_copy), "overlap event");
         }
         // the compute stream must not start row i until its codes have landed
-        check(cudaStreamWaitEvent(s_comp, ev[cur], 0), "wait");
+        check(hipStreamWaitEvent(s_comp, ev[cur], 0), "wait");
         // a hand-written launch so it goes on s_comp; `s_gemv` synchronises on the default stream
         strata::kernels::s_gemv_split_async(d_x, d_codes[cur], d_scales, nullptr, d_y, n_in, n_out, form,
                                             threads_per_row, (void*) s_comp);
     }
-    check(cudaStreamSynchronize(s_comp), "final sync");
-    check(cudaStreamSynchronize(s_copy), "final sync 2");
+    check(hipStreamSynchronize(s_comp), "final sync");
+    check(hipStreamSynchronize(s_copy), "final sync 2");
     const double overlap = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 
     std::printf("\n  serial     %8.3f ms for %d experts  (%.1f us/expert)\n", serial * 1000, experts,
@@ -157,13 +157,13 @@ int main(int argc, char** argv) {
                 "      stream rather than %d.\n", experts);
 
     for (int b = 0; b < 2; ++b) {
-        cudaFree(d_codes[b]);
-        cudaEventDestroy(ev[b]);
+        hipFree(d_codes[b]);
+        hipEventDestroy(ev[b]);
     }
-    cudaFree(d_x);
-    cudaFree(d_scales);
-    cudaFree(d_y);
-    cudaStreamDestroy(s_copy);
-    cudaStreamDestroy(s_comp);
+    hipFree(d_x);
+    hipFree(d_scales);
+    hipFree(d_y);
+    hipStreamDestroy(s_copy);
+    hipStreamDestroy(s_comp);
     return 0;
 }

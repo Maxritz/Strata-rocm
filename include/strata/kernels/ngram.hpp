@@ -44,7 +44,8 @@ inline constexpr float NG_RMS_EPS = 1e-6f;
 // The table: [160, 320001536] IQ4_NL.  ne0 = 160 is the FAST axis, so one row is 160 contiguous elements =
 // 5 blocks of 32 at 18 bytes = 90 bytes.  The head-slowest flatten then makes 16 rows exactly n_embd = 2560.
 inline constexpr uint64_t PLE_TABLE_ROWS = 320001536ull;
-inline constexpr int PLE_ROW_BYTES = (PLE_HEAD_DIM / 32) * 18;           // 90
+inline constexpr int PLE_ROW_BYTES = (PLE_HEAD_DIM / 32) * 18;           // 90 (IQ4_NL, the canonical table)
+inline constexpr int PLE_ROW_BYTES_MAX = (PLE_HEAD_DIM / 32) * 22;       // 110 (Q5_0, a plain Q4_K_M model)
 
 /// The artifact's own hash constants, transcribed from `docs/gguf-dump-shard1.txt`:
 ///

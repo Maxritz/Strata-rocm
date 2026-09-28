@@ -1,11 +1,12 @@
+#include "hip/hip_runtime.h"
 // src/kernels/cuda/kv_q4.cu - see include/strata/kernels/kv_q4.hpp. Q4_0 KV with Walsh-Hadamard rotation
 // (from PR #21 by code-martin; KV-streaming integration and the deterministic group maximum added on merge).
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/kv_stream.hpp"
 
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
+#include <hip/hip_fp16.h>
+#include <hip/hip_runtime.h>
 #include <cstdio>
 #include <cstdlib>
 
@@ -13,9 +14,9 @@ namespace strata::kernels {
 namespace {
 
 void check(const char* what) {
-    const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "kv_q4: %s: %s\n", what, cudaGetErrorString(e));
+    const hipError_t e = hipGetLastError();
+    if (e != hipSuccess) {
+        std::fprintf(stderr, "kv_q4: %s: %s\n", what, hipGetErrorString(e));
         std::exit(1);
     }
 }
@@ -45,7 +46,7 @@ __global__ void fwht256_kernel(const float* __restrict__ src, float* __restrict_
 #pragma unroll
         for (int j = 0; j < el_w; ++j) {
             const float val = reg[j];
-            const float val2 = __shfl_xor_sync(0xffffffffu, val, h, warp_size);
+            const float val2 = __shfl_xor_sync(0xffffffffffffffffull, val, h, warp_size);
             reg[j] = (lane & h) == 0 ? val + val2 : val2 - val;
         }
     }
@@ -76,15 +77,15 @@ __device__ __forceinline__ uint16_t q4_group(float x, int lane, uint8_t& byte) {
     float amax = fabsf(x), mval = x;
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) {
-        const float a = __shfl_xor_sync(0xffffffffu, amax, o);
-        const float v = __shfl_xor_sync(0xffffffffu, mval, o);
+        const float a = __shfl_xor_sync(0xffffffffffffffffull, amax, o, 32);
+        const float v = __shfl_xor_sync(0xffffffffffffffffull, mval, o, 32);
         if (a > amax || (a == amax && v > mval)) { amax = a; mval = v; }
     }
     const float d = mval / -8.0f;
     const float id = d != 0.0f ? 1.0f / d : 0.0f;
     int q = __float2int_rz(x * id + 8.5f);
     const uint8_t qc = (uint8_t) (q < 0 ? 0 : (q > 15 ? 15 : q));
-    const uint8_t qhi = __shfl_down_sync(0xffffffffu, qc, 16);
+    const uint8_t qhi = __shfl_down_sync(0xffffffffffffffffull, qc, 16, 32);
     byte = (uint8_t) (qc | (qhi << 4));
     (void) lane;
     return f16_from_f32(d);
@@ -185,7 +186,7 @@ void fwht256_cuda(const float* src, float* dst, int64_t n_rows, void* stream) {
     if (n_rows <= 0) return;
     const int rows_per_block = 4;
     const int64_t num_blocks = (n_rows + rows_per_block - 1) / rows_per_block;
-    fwht256_kernel<<<dim3((unsigned) num_blocks), dim3(32, rows_per_block), 0, (cudaStream_t) stream>>>(
+    fwht256_kernel<<<dim3((unsigned) num_blocks), dim3(32, rows_per_block), 0, (hipStream_t) stream>>>(
         src, dst, n_rows, 1.0f / 16.0f);
     check("fwht256 launch");
 }
@@ -195,7 +196,7 @@ void kv_append_q4_step(uint8_t* k_q4, uint8_t* v_q4, const int32_t* page_table, 
                        const KvHostPools* host) {
     need_256(s, "kv_append_q4");
     const dim3 grid((unsigned) s.n_head_kv, (unsigned) (s.head_dim / QK4_0), 2);
-    kv_append_q4_kernel<<<grid, 32, 0, (cudaStream_t) stream>>>(
+    kv_append_q4_kernel<<<grid, 32, 0, (hipStream_t) stream>>>(
         k_q4, v_q4, page_table, step, kcur, vcur, (int) s.n_head_kv, (int) s.head_dim, (int) s.page_size,
         host ? *host : KvHostPools{});
     check("kv_append_q4 launch");
@@ -206,7 +207,7 @@ void kv_append_q4(uint8_t* k_q4, uint8_t* v_q4, const int32_t* page_table, int64
     if (T <= 0) return;
     need_256(s, "kv_append_q4");
     const dim3 grid((unsigned) T, (unsigned) s.n_head_kv, (unsigned) (s.head_dim / QK4_0));
-    cudaStream_t cs = (cudaStream_t) stream;
+    hipStream_t cs = (hipStream_t) stream;
     const KvHostPools h = host ? *host : KvHostPools{}, st = stage ? *stage : KvHostPools{};
     for (int is_v = 0; is_v < 2; ++is_v)
         kv_append_q4_batch_kernel<<<grid, 32, 0, cs>>>(k_q4, v_q4, page_table, pos0, K, V, (int) s.n_head_kv,
@@ -222,7 +223,7 @@ void kv_gather_q4_step(const uint8_t* k_q4, const uint8_t* v_q4, const int32_t* 
     const int64_t total_blocks = max_ids * s.n_head_kv * blocks_per_head;
     const int rows_per_block = 4;
     const unsigned num_blocks = (unsigned) ((total_blocks + rows_per_block - 1) / rows_per_block);
-    kv_gather_q4_kernel<<<dim3(num_blocks), dim3(32, rows_per_block), 0, (cudaStream_t) stream>>>(
+    kv_gather_q4_kernel<<<dim3(num_blocks), dim3(32, rows_per_block), 0, (hipStream_t) stream>>>(
         k_q4, v_q4, page_table, ids, step, (int) s.n_head_kv, (int) s.head_dim, (int) s.page_size, k_scratch,
         v_scratch);
     check("kv_gather_q4 launch");

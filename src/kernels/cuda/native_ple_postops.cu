@@ -1,3 +1,4 @@
+#include "hip/hip_runtime.h"
 // Arithmetic adapted from llama.cpp 3cf03257f219afbe7334045ff7c6a06ac68c627d:
 // src/models/qwen4exp.cpp and ggml-cuda/{reduce_rows.cuh,sumrows.cu,unary.cu}.
 // MIT License
@@ -21,8 +22,9 @@
 #include "strata/kernels/native_ple_postops.hpp"
 #include "strata/kernels/native_gr_norm.hpp"
 #include "strata/kernels/ngram.hpp"
-#include <cuda_runtime.h>
-#include <cuda_fp16.h>
+#include <hip/hip_runtime.h>
+#include "strata/hip_compat.h"
+#include <hip/hip_fp16.h>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -34,7 +36,7 @@ namespace strata::kernels {
 namespace {
 constexpr int N = 2560, H = 4, D = N * H, HISTORY = 9;
 __device__ float warp_sum(float x) {
-    for (int offset = 16; offset; offset >>= 1) x += __shfl_xor_sync(0xffffffffu, x, offset);
+    for (int offset = 16; offset; offset >>= 1) x += __shfl_xor_sync(0xffffffffffffffffull, x, offset, 32);
     return x;
 }
 __global__ void gate_kernel(const float* key, const float* query, float* gate, float scale) {
@@ -90,7 +92,7 @@ __global__ void conv_residual_kernel(const float* history, const float* normaliz
 // weighted_rms_norm (native_gr_norm.cu) with the gamma row repeating every H rows (one token's H groups)
 __device__ float norm_warp_sum(float value) {
 #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) value += __shfl_xor_sync(0xffffffffu, value, offset, 32);
+    for (int offset = 16; offset > 0; offset >>= 1) value += __shfl_xor_sync(0xffffffffffffffffull, value, offset, 32);
     return value;
 }
 __global__ void rms_rep_kernel(const float* __restrict__ input, const float* __restrict__ gamma,
@@ -167,8 +169,8 @@ void validate(Span span) {
         throw std::invalid_argument("native PLE postops require nonnull aligned bounded spans");
 }
 void launch_check() {
-    const auto error = cudaGetLastError();
-    if (error != cudaSuccess) throw std::runtime_error(std::string("native PLE postops launch: ") + cudaGetErrorString(error));
+    const auto error = hipGetLastError();
+    if (error != hipSuccess) throw std::runtime_error(std::string("native PLE postops launch: ") + hipGetErrorString(error));
 }
 } // namespace
 
@@ -193,7 +195,7 @@ void native_ple_postops(const float* projected_key, const float* hidden,
     }
     native_gr_rms_norm_weighted(projected_key,w.norm_key,b.key,N,H,NG_RMS_EPS,stream);
     native_gr_rms_norm_weighted(hidden,w.norm_query,b.query,N,H,NG_RMS_EPS,stream);
-    auto st = static_cast<cudaStream_t>(stream);
+    auto st = static_cast<hipStream_t>(stream);
     gate_kernel<<<H,512,0,st>>>(b.key,b.query,b.gate,1.0f / std::sqrt(float(N)));
     broadcast_kernel<<<D/256,256,0,st>>>(value,b.gate,b.gated);
     launch_check();
@@ -206,7 +208,7 @@ void native_ple_postops_batch(float* key, float* hidden, const float* value, flo
                               float* query_norm, float* gated, float* gate, int T, void* stream) {
     if (!stream || T <= 0 || !key || !hidden || !value || !history || !query_norm || !gated || !gate)
         throw std::invalid_argument("native PLE postops batch: null input or empty batch");
-    auto st = static_cast<cudaStream_t>(stream);
+    auto st = static_cast<hipStream_t>(stream);
     const unsigned rows = unsigned(T) * H;
     const unsigned blocks = unsigned((size_t(T) * D + 255) / 256);
     rms_rep_kernel<<<rows, 1024, 0, st>>>(key, w.norm_key, key);

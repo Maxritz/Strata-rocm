@@ -1,3 +1,4 @@
+#include "hip/hip_runtime.h"
 // Specialized from llama.cpp 3cf03257f219afbe7334045ff7c6a06ac68c627d,
 // ggml/src/ggml-cuda/{fattn-vec.cuh,fattn-common.cuh,common.cuh}.
 // MIT License
@@ -19,8 +20,9 @@
 // SOFTWARE.
 
 #include "strata/kernels/native_flash_attn.hpp"
-#include <cuda_runtime.h>
-#include <cuda_fp16.h>
+#include <hip/hip_runtime.h>
+#include "strata/hip_compat.h"
+#include <hip/hip_fp16.h>
 #include <cfloat>
 #include <cstddef>
 #include <cstdint>
@@ -33,13 +35,13 @@ namespace {
 template<int Width> __device__ __forceinline__ float warp_sum(float x) {
 #pragma unroll
     for (int offset = Width / 2; offset; offset >>= 1)
-        x += __shfl_xor_sync(0xffffffffu, x, offset, Width);
+        x += __shfl_xor_sync(0xffffffffffffffffull, x, offset, Width);
     return x;
 }
 __device__ __forceinline__ float warp_max(float x) {
 #pragma unroll
     for (int offset = 16; offset; offset >>= 1)
-        x = fmaxf(x, __shfl_xor_sync(0xffffffffu, x, offset, 32));
+        x = fmaxf(x, __shfl_xor_sync(0xffffffffffffffffull, x, offset, 32));
     return x;
 }
 
@@ -103,7 +105,7 @@ __global__ void attend(const float* __restrict__ q, const half* __restrict__ k,
         }
 #pragma unroll
         for (int offset = 8; offset < 32; offset <<= 1)
-            next_max = fmaxf(next_max, __shfl_xor_sync(0xffffffffu, next_max, offset, 32));
+            next_max = fmaxf(next_max, __shfl_xor_sync(0xffffffffffffffffull, next_max, offset, 32));
         const float rescale = expf(maximum - next_max);
         maximum = next_max;
         score = expf(score - maximum);
@@ -203,10 +205,10 @@ void native_flash_attn_short_step(const float* q, const uint16_t* k, const uint1
                           {step, kStepCount * 4, 4}, {output, 24 * 256 * 4, 4},
                           {status, 4, 4}, {mask, 256 * 2, 2}};
     validate_spans(spans, mask ? 7 : 6);
-    attend<<<24, dim3(32, 4), 0, static_cast<cudaStream_t>(stream)>>>(q, reinterpret_cast<const half*>(k),
+    attend<<<24, dim3(32, 4), 0, static_cast<hipStream_t>(stream)>>>(q, reinterpret_cast<const half*>(k),
         reinterpret_cast<const half*>(v), step, max_context, 256, 0.0625f, output, status, reinterpret_cast<const half*>(mask));
-    const auto result = cudaGetLastError();
-    if (result != cudaSuccess)
-        throw std::runtime_error(std::string("native FlashAttention launch: ") + cudaGetErrorString(result));
+    const auto result = hipGetLastError();
+    if (result != hipSuccess)
+        throw std::runtime_error(std::string("native FlashAttention launch: ") + hipGetErrorString(result));
 }
 } // namespace strata::kernels

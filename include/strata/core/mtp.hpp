@@ -22,7 +22,7 @@
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
 
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
 
 #include <cstdint>
 #include <string>
@@ -74,11 +74,11 @@ public:
     int64_t rounds = 0;
 
 private:
-    bool record_forward(int T, int step_row0, cudaStream_t cs, std::string& err);
+    bool record_forward(int T, int step_row0, hipStream_t cs, std::string& err);
     bool capture_prefill(int T, std::string& err);
     bool capture_round(int T, std::string& err);
     bool capture_step(int j, std::string& err);
-    cudaGraphExec_t step_exec_[9] = {};
+    hipGraphExec_t step_exec_[9] = {};
     const float* f32(const char* name) const;
     const uint16_t* bf16(const char* name) const;
     const void* q8(const char* name) const;
@@ -92,9 +92,9 @@ private:
     int max_drafts_ = 1 << 30;
     int64_t n_vocab_ = 0;
     uint64_t vram_ = 0;
-    cudaStream_t cs_ = nullptr;
-    cudaGraphExec_t prefill_exec_[9] = {};
-    cudaGraphExec_t round_exec_[9] = {};
+    hipStream_t cs_ = nullptr;
+    hipGraphExec_t prefill_exec_[9] = {};
+    hipGraphExec_t round_exec_[9] = {};
 
     struct Tensor { std::string name, kind; int64_t rows = 0, cols = 0; uint64_t off = 0, bytes = 0; };
     std::vector<Tensor> tensors_;

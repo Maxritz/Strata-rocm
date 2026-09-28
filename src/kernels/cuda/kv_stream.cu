@@ -1,9 +1,10 @@
+#include "hip/hip_runtime.h"
 // src/kernels/cuda/kv_stream.cu - see include/strata/kernels/kv_stream.hpp.
 #include "strata/kernels/kv_stream.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/kv_q8.hpp"
 
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
 
 #include <algorithm>
 #include <cstdio>
@@ -13,9 +14,9 @@ namespace strata::kernels {
 namespace {
 
 void check(const char* what) {
-    const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "kv_stream: %s: %s\n", what, cudaGetErrorString(e));
+    const hipError_t e = hipGetLastError();
+    if (e != hipSuccess) {
+        std::fprintf(stderr, "kv_stream: %s: %s\n", what, hipGetErrorString(e));
         std::exit(1);
     }
 }
@@ -59,7 +60,7 @@ __device__ int block_scan(int v, int* warp_sums, int& total) {
     const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
     int x = v;
     for (int o = 1; o < 32; o <<= 1) {
-        const int y = __shfl_up_sync(0xffffffffu, x, o);
+        const int y = __shfl_up_sync(0xffffffffffffffffull, x, o, 32);
         if (lane >= o) x += y;
     }
     if (lane == 31) warp_sums[w] = x;
@@ -67,7 +68,7 @@ __device__ int block_scan(int v, int* warp_sums, int& total) {
     if (w == 0) {
         int t = warp_sums[lane];
         for (int o = 1; o < 32; o <<= 1) {
-            const int y = __shfl_up_sync(0xffffffffu, t, o);
+            const int y = __shfl_up_sync(0xffffffffffffffffull, t, o, 32);
             if (lane >= o) t += y;
         }
         warp_sums[lane] = t;
@@ -197,7 +198,7 @@ uint64_t kv_block_bytes(const QsaShapes& s, int fmt) {
 }
 
 void kv_stream_reset(const KvStreamMap& m, void* stream) {
-    reset_kernel<<<128, 256, 0, (cudaStream_t) stream>>>(m);
+    reset_kernel<<<128, 256, 0, (hipStream_t) stream>>>(m);
     check("reset");
 }
 
@@ -209,14 +210,14 @@ void kv_stream_resolve(const KvStreamMap& m, const QsaAttnPools& slots, const Kv
         std::fprintf(stderr, "kv_stream: a block's scale run must be a multiple of 16 bytes\n");
         std::exit(1);
     }
-    resolve_kernel<<<1, RT, 0, (cudaStream_t) stream>>>(m, ids, steps, (int) n_q, (int) cap, (int) s.page_size);
+    resolve_kernel<<<1, RT, 0, (hipStream_t) stream>>>(m, ids, steps, (int) n_q, (int) cap, (int) s.page_size);
     check("resolve");
-    copy_kernel<<<96, 128, 0, (cudaStream_t) stream>>>(m, runs_of(slots, host, fmt, s));
+    copy_kernel<<<96, 128, 0, (hipStream_t) stream>>>(m, runs_of(slots, host, fmt, s));
     check("copy");
 }
 
 void kv_ring_table(int32_t* page_table, int64_t n_blocks, int64_t n_slots, void* stream) {
-    ring_kernel<<<64, 256, 0, (cudaStream_t) stream>>>(page_table, n_blocks, n_slots);
+    ring_kernel<<<64, 256, 0, (hipStream_t) stream>>>(page_table, n_blocks, n_slots);
     check("ring table");
 }
 
@@ -226,8 +227,8 @@ void kv_ring_restore(const QsaAttnPools& slots, const KvHostPools& host, int fmt
     for (int64_t b = b0; b < b1;) {
         const int64_t sl = b % n_slots, run = std::min<int64_t>(b1 - b, n_slots - sl);   // up to the ring's end
         for (int a = 0; a < r.n; ++a)
-            if (cudaMemcpyAsync(r.dst[a] + sl * r.len[a], r.src[a] + b * r.len[a], (size_t) (run * r.len[a]),
-                                cudaMemcpyDefault, (cudaStream_t) stream) != cudaSuccess)
+            if (hipMemcpyAsync(r.dst[a] + sl * r.len[a], r.src[a] + b * r.len[a], (size_t) (run * r.len[a]),
+                                hipMemcpyDefault, (hipStream_t) stream) != hipSuccess)
                 check("ring restore");
         b += run;
     }
@@ -238,15 +239,15 @@ void kv_stage_from_host(const QsaAttnPools& stage, const KvHostPools& host, int 
     if (n_blocks <= 0) return;
     const Runs r = runs_of(stage, host, fmt, s);
     for (int a = 0; a < r.n; ++a)
-        if (cudaMemcpyAsync(r.dst[a], r.src[a], (size_t) (n_blocks * r.len[a]), cudaMemcpyDefault,
-                            (cudaStream_t) stream) != cudaSuccess)
+        if (hipMemcpyAsync(r.dst[a], r.src[a], (size_t) (n_blocks * r.len[a]), hipMemcpyDefault,
+                            (hipStream_t) stream) != hipSuccess)
             check("stage");
 }
 
 KvStreamCounters kv_stream_counters(const KvStreamMap& m) {
     int32_t c[kKvCtlInts] = {};
     KvStreamCounters r;
-    if (m.ctl == nullptr || cudaMemcpy(c, m.ctl, sizeof(c), cudaMemcpyDeviceToHost) != cudaSuccess) return r;
+    if (m.ctl == nullptr || hipMemcpy(c, m.ctl, sizeof(c), hipMemcpyDeviceToHost) != hipSuccess) return r;
     const unsigned long long* u = reinterpret_cast<const unsigned long long*>(c + 4);
     r.misses = u[0];
     r.lookups = u[1];

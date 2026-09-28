@@ -41,6 +41,90 @@ import gguf_reader as G  # noqa: E402
 FLOAT = {"BF16", "F32", "F16"}
 ROUTERS = ("ffn_gate_inp.weight", "ffn_gate_inp_shexp.weight")
 NOT_IN_PACK = {"per_layer_token_embd.weight"}      # the 28.8 GB PLE table: read from its GGUF by the engine
+# Tensors the engine reads as resident float even in a quantized (Q4_K_M) model: dequantize to BF16 in dense.bin.
+FORCE_BF16 = {"blk.1.ple_value.weight"} | {
+    "blk.%d.%s.weight" % (l, s) for l in range(48)
+    for s in ("hc_attn_down", "hc_attn_up", "hc_attn_inject", "hc_ffn_down", "hc_ffn_up", "hc_ffn_inject",
+              "ssm_alpha", "ssm_beta")
+} | {"output_hc_down.weight", "output_hc_up.weight"}
+
+
+def _bf16(f32: np.ndarray) -> np.ndarray:
+    u = np.ascontiguousarray(f32, dtype=np.float32).view(np.uint32)
+    u = (u + np.uint32(0x7fff) + ((u >> np.uint32(16)) & np.uint32(1))) >> np.uint32(16)
+    return u.astype(np.uint16)
+
+
+def _f16pair(b: np.ndarray) -> np.ndarray:
+    return b.copy().view(np.float16).astype(np.float32)
+
+
+def dequant_q4_k(raw: bytes) -> np.ndarray:
+    """ggml Q4_K -> f32 (matches the GPU dq_q4_k)."""
+    b = np.frombuffer(raw, dtype=np.uint8)
+    nb = len(b) // 144
+    blk = b.reshape(nb, 144)
+    d = _f16pair(blk[:, 0:2]).reshape(nb)
+    dmin = _f16pair(blk[:, 2:4]).reshape(nb)
+    sc12 = blk[:, 4:16]
+    qs = blk[:, 16:144]
+    out = np.empty((nb, 256), dtype=np.float32)
+    for gi in range(8):
+        if gi < 4:
+            sc = (sc12[:, gi] & 63).astype(np.int32)
+            m = (sc12[:, gi + 4] & 63).astype(np.int32)
+        else:
+            sc = ((sc12[:, gi + 4] & 0xF) | ((sc12[:, gi - 4] >> 6) << 4)).astype(np.int32)
+            m = ((sc12[:, gi + 4] >> 4) | ((sc12[:, gi] >> 6) << 4)).astype(np.int32)
+        q = qs[:, 32 * (gi // 2):32 * (gi // 2) + 32]
+        codes = (q >> 4 if (gi & 1) else q & 0xF).astype(np.float32)
+        out[:, gi * 32:gi * 32 + 32] = d[:, None] * sc[:, None] * codes - dmin[:, None] * m[:, None]
+    return out.reshape(-1)
+
+
+def dequant_q5_0(raw: bytes) -> np.ndarray:
+    b = np.frombuffer(raw, dtype=np.uint8)
+    nb = len(b) // 22
+    blk = b.reshape(nb, 22)
+    d = _f16pair(blk[:, 0:2]).reshape(nb)
+    qh = (blk[:, 2].astype(np.uint32) | (blk[:, 3].astype(np.uint32) << 8) |
+          (blk[:, 4].astype(np.uint32) << 16) | (blk[:, 5].astype(np.uint32) << 24))
+    qs = blk[:, 6:22]
+    out = np.empty((nb, 32), dtype=np.float32)
+    for j in range(16):
+        xh0 = ((qh >> np.uint32(j)) << np.uint32(4)) & np.uint32(0x10)
+        xh1 = (qh >> np.uint32(j + 12)) & np.uint32(0x10)
+        lo = (((qs[:, j] & 0x0F).astype(np.uint32) | xh0).astype(np.int32) - 16)
+        hi = (((qs[:, j] >> 4).astype(np.uint32) | xh1).astype(np.int32) - 16)
+        out[:, j] = lo * d
+        out[:, j + 16] = hi * d
+    return out.reshape(-1)
+
+
+def dequant_q6_k(raw: bytes) -> np.ndarray:
+    b = np.frombuffer(raw, dtype=np.uint8)
+    nb = len(b) // 210
+    blk = b.reshape(nb, 210)
+    ql = blk[:, 0:128]
+    qh = blk[:, 128:192]
+    sc = blk[:, 192:208].copy().view(np.int8)
+    d = _f16pair(blk[:, 208:210]).reshape(nb)
+    out = np.empty((nb, 256), dtype=np.float32)
+    for g in range(8):
+        n, qu = g // 4, g % 4
+        qlb = ql[:, 64 * n:64 * n + 64]
+        qhb = qh[:, 32 * n:32 * n + 32]
+        scb = sc[:, 8 * n:8 * n + 8]
+        for l in range(32):
+            if qu == 0:      q = (qlb[:, l] & 0x0F) | (((qhb[:, l] >> 0) & 3) << 4)
+            elif qu == 1:    q = (qlb[:, l + 32] & 0x0F) | (((qhb[:, l] >> 2) & 3) << 4)
+            elif qu == 2:    q = (qlb[:, l] >> 4) | (((qhb[:, l] >> 4) & 3) << 4)
+            else:            q = (qlb[:, l + 32] >> 4) | (((qhb[:, l] >> 6) & 3) << 4)
+            out[:, g * 32 + l] = d * scb[:, (l >> 4) + 2 * qu].astype(np.float32) * (q.astype(np.int32) - 32)
+    return out.reshape(-1)
+
+
+DEQUANT = {"Q4_K": dequant_q4_k, "Q5_0": dequant_q5_0, "Q6_K": dequant_q6_k}
 
 
 class Model:
@@ -67,7 +151,7 @@ class Model:
         g, t, mm, _ = self.where[name]
         return tensor_bytes(mm, g, t)
 ROLES = ("gate", "up", "down")
-N_EXPERT = 512
+N_EXPERT = 512   # overridden from the model's `qwen4exp.expert_count` in main()
 ALIGN = 64
 
 
@@ -105,6 +189,19 @@ def index_standalone(src, out, model: Model) -> int:
                 return 1
             ne0 = int(t.shape[0])
             ne1 = int(t.shape[1]) if len(t.shape) > 1 else 0
+            if t.name in FORCE_BF16 and t.type_name not in FLOAT:
+                fn = DEQUANT.get(t.type_name)
+                if fn is None:
+                    print("force-bf16 tensor %s is %s; no dequant" % (t.name, t.type_name))
+                    return 1
+                raw = _bf16(fn(tensor_bytes(mm, g, t).tobytes())).tobytes()
+                rows.append([t.name, "0", "4", str(at), str(len(raw)), "0", str(len(raw)), str(ne0), str(ne1),
+                             "0", "0", "1"] + ["0"] * 7)
+                fo.write(raw)
+                pad = (-len(raw)) % ALIGN
+                fo.write(b"\0" * pad)
+                at += len(raw) + pad
+                continue
             if t.type_name in FLOAT:
                 raw = tensor_bytes(mm, g, t).tobytes()
                 kind = {"BF16": "4", "F16": "5", "F32": "2"}[t.type_name]
@@ -207,6 +304,9 @@ def main() -> int:
     out.mkdir(parents=True, exist_ok=True)
 
     g = G.GGUFFile(src)
+    global N_EXPERT
+    N_EXPERT = int(g.metadata.get("qwen4exp.expert_count", N_EXPERT))
+    print("experts: %d (qwen4exp.expert_count)" % N_EXPERT)
     mm = np.memmap(src, dtype=np.uint8, mode="r")
     model = Model(src)
     T = {n: w[1] for n, w in model.where.items()}

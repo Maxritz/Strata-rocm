@@ -1,3 +1,4 @@
+#include "hip/hip_runtime.h"
 // src/kernels/cuda/quantize_act.cu - P2.S2: quantize an activation the way ggml converts src1.
 //
 // WHY THIS EXISTS AT ALL.  `ggml_mul_mat` converts the ACTIVATION (src1) to the weight's `vec_dot_type`
@@ -24,7 +25,8 @@
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/f16_bits.hpp"
 
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
+#include "strata/hip_compat.h"
 
 #include <cmath>
 #include <cstdio>
@@ -230,13 +232,13 @@ void quantize_q8_0(const float* x, uint8_t* blocks, int64_t n, void* stream) {
     const long long nb = n / QK8_0;
     const int threads = 128;
     const unsigned grid = (unsigned) ((nb + threads - 1) / threads);
-    quantize_q8_0_kernel<<<grid, threads, 0, (cudaStream_t) stream>>>(x, blocks, nb);
-    const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "quantize_q8_0 launch: %s\n", cudaGetErrorString(e));
+    quantize_q8_0_kernel<<<grid, threads, 0, (hipStream_t) stream>>>(x, blocks, nb);
+    const hipError_t e = hipGetLastError();
+    if (e != hipSuccess) {
+        std::fprintf(stderr, "quantize_q8_0 launch: %s\n", hipGetErrorString(e));
         std::exit(1);
     }
-    if (stream == nullptr) cudaDeviceSynchronize();
+    if (stream == nullptr) hipDeviceSynchronize();
 }
 
 /// See `quantize_q8_0_scaled_kernel`.  Writes the same 34-byte `block_q8_0` layout as `quantize_q8_0`, plus
@@ -255,13 +257,13 @@ void quantize_q8_0_scaled(const float* x, uint8_t* blocks, float* scales, int64_
     const long long nb = n / QK8_0;
     const int threads = 128;
     const unsigned grid = (unsigned) ((nb + threads - 1) / threads);
-    quantize_q8_0_scaled_kernel<<<grid, threads, 0, (cudaStream_t) stream>>>(x, blocks, scales, nb);
-    const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "quantize_q8_0_scaled launch: %s\n", cudaGetErrorString(e));
+    quantize_q8_0_scaled_kernel<<<grid, threads, 0, (hipStream_t) stream>>>(x, blocks, scales, nb);
+    const hipError_t e = hipGetLastError();
+    if (e != hipSuccess) {
+        std::fprintf(stderr, "quantize_q8_0_scaled launch: %s\n", hipGetErrorString(e));
         std::exit(1);
     }
-    if (stream == nullptr) cudaDeviceSynchronize();
+    if (stream == nullptr) hipDeviceSynchronize();
 }
 
 void dequant_q8_0(const uint8_t* blocks, float* x, int64_t n, void* stream) {
@@ -269,13 +271,13 @@ void dequant_q8_0(const uint8_t* blocks, float* x, int64_t n, void* stream) {
     const long long nb = n / QK8_0;
     const int threads = 128;
     const unsigned grid = (unsigned) ((nb + threads - 1) / threads);
-    dequant_q8_0_kernel<<<grid, threads, 0, (cudaStream_t) stream>>>(blocks, x, nb);
-    const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "dequant_q8_0 launch: %s\n", cudaGetErrorString(e));
+    dequant_q8_0_kernel<<<grid, threads, 0, (hipStream_t) stream>>>(blocks, x, nb);
+    const hipError_t e = hipGetLastError();
+    if (e != hipSuccess) {
+        std::fprintf(stderr, "dequant_q8_0 launch: %s\n", hipGetErrorString(e));
         std::exit(1);
     }
-    if (stream == nullptr) cudaDeviceSynchronize();
+    if (stream == nullptr) hipDeviceSynchronize();
 }
 
 void quantize_q8_K(const float* x, uint8_t* blocks, int64_t n, void* stream) {
@@ -287,13 +289,13 @@ void quantize_q8_K(const float* x, uint8_t* blocks, int64_t n, void* stream) {
     const long long nb = n / QK_K;
     const int threads = 64;                       // one block per thread, and a block is 256 elements
     const unsigned grid = (unsigned) ((nb + threads - 1) / threads);
-    quantize_q8_K_kernel<<<grid, threads, 0, (cudaStream_t) stream>>>(x, blocks, nb);
-    const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "quantize_q8_K launch: %s\n", cudaGetErrorString(e));
+    quantize_q8_K_kernel<<<grid, threads, 0, (hipStream_t) stream>>>(x, blocks, nb);
+    const hipError_t e = hipGetLastError();
+    if (e != hipSuccess) {
+        std::fprintf(stderr, "quantize_q8_K launch: %s\n", hipGetErrorString(e));
         std::exit(1);
     }
-    if (stream == nullptr) cudaDeviceSynchronize();
+    if (stream == nullptr) hipDeviceSynchronize();
 }
 
 void dequant_q8_K(const uint8_t* blocks, float* x, int64_t n, void* stream) {
@@ -301,13 +303,13 @@ void dequant_q8_K(const uint8_t* blocks, float* x, int64_t n, void* stream) {
     const long long nb = n / QK_K;
     const int threads = 64;
     const unsigned grid = (unsigned) ((nb + threads - 1) / threads);
-    dequant_q8_K_kernel<<<grid, threads, 0, (cudaStream_t) stream>>>(blocks, x, nb);
-    const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "dequant_q8_K launch: %s\n", cudaGetErrorString(e));
+    dequant_q8_K_kernel<<<grid, threads, 0, (hipStream_t) stream>>>(blocks, x, nb);
+    const hipError_t e = hipGetLastError();
+    if (e != hipSuccess) {
+        std::fprintf(stderr, "dequant_q8_K launch: %s\n", hipGetErrorString(e));
         std::exit(1);
     }
-    if (stream == nullptr) cudaDeviceSynchronize();
+    if (stream == nullptr) hipDeviceSynchronize();
 }
 
 }  // namespace strata::kernels

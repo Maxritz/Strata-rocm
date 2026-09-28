@@ -14,7 +14,7 @@
 
 int ggml_cuda_get_device() {
     int id = 0;
-    CUDA_CHECK(cudaGetDevice(&id));
+    CUDA_CHECK(hipGetDevice(&id));
     return id;
 }
 
@@ -22,13 +22,13 @@ const ggml_cuda_device_info & ggml_cuda_info() {
     static ggml_cuda_device_info info = [] {
         ggml_cuda_device_info in = {};
         int n = 0;
-        if (cudaGetDeviceCount(&n) != cudaSuccess) n = 0;
+        if (hipGetDeviceCount(&n) != hipSuccess) n = 0;
         n = n > GGML_CUDA_MAX_DEVICES ? GGML_CUDA_MAX_DEVICES : n;
         in.device_count = n;
         in.physical_device_count = n;
         for (int id = 0; id < n; ++id) {
-            cudaDeviceProp prop;
-            CUDA_CHECK(cudaGetDeviceProperties(&prop, id));
+            hipDeviceProp_t prop;
+            CUDA_CHECK(hipGetDeviceProperties(&prop, id));
             auto & d = in.devices[id];
             d.cc = 100 * prop.major + 10 * prop.minor;
             d.nsm = prop.multiProcessorCount;
@@ -59,7 +59,7 @@ struct CachingPool : ggml_cuda_pool {
         for (auto & b : bufs)
             if (!b.used && b.size >= size) { b.used = true; *actual_size = b.size; return b.p; }
         void * p = nullptr;
-        CUDA_CHECK(cudaMalloc(&p, size));
+        CUDA_CHECK(hipMalloc(&p, size));
         bufs.push_back({p, size, true});
         *actual_size = size;
         return p;
@@ -70,7 +70,7 @@ struct CachingPool : ggml_cuda_pool {
             if (b.p == ptr) { b.used = false; return; }
     }
     ~CachingPool() override {
-        for (auto & b : bufs) cudaFree(b.p);
+        for (auto & b : bufs) hipFree(b.p);
     }
 };
 }  // namespace

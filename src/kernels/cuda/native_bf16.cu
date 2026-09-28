@@ -1,7 +1,9 @@
+#include "hip/hip_runtime.h"
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
+#include "strata/hip_compat.h"
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -36,7 +38,7 @@ namespace {
 __device__ __forceinline__ float mmvf_warp_sum(float value) {
 #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1)
-        value += __shfl_xor_sync(0xffffffffu, value, offset, 32);
+        value += __shfl_xor_sync(0xffffffffffffffffull, value, offset, 32);
     return value;
 }
 
@@ -95,7 +97,7 @@ void bf16_gemv_fp32_mmvf(const float* x, const uint16_t* w, float* y,
         (reinterpret_cast<uintptr_t>(w) & 3u) != 0 ||
         (reinterpret_cast<uintptr_t>(y) & 3u) != 0)
         throw std::invalid_argument("bf16_gemv_fp32_mmvf: null or misaligned pointer");
-    const cudaStream_t st = (cudaStream_t) stream;
+    const hipStream_t st = (hipStream_t) stream;
 #define STRATA_MMVF_CASE(N) case N: \
     bf16_f32_mmvf_kernel<N><<<(unsigned) n_out, N, 0, st>>>(x, w, y, (int) n_in); break
     switch (mmvf_block_size(n_in)) {
@@ -109,9 +111,9 @@ void bf16_gemv_fp32_mmvf(const float* x, const uint16_t* w, float* y,
         STRATA_MMVF_CASE(256);
     }
 #undef STRATA_MMVF_CASE
-    const cudaError_t result = cudaGetLastError();
-    if (result != cudaSuccess)
-        throw std::runtime_error(std::string("bf16_gemv_fp32_mmvf launch: ") + cudaGetErrorString(result));
+    const hipError_t result = hipGetLastError();
+    if (result != hipSuccess)
+        throw std::runtime_error(std::string("bf16_gemv_fp32_mmvf launch: ") + hipGetErrorString(result));
 }
 
 

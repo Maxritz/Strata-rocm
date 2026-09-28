@@ -28,7 +28,7 @@
 #include "strata/core/session.hpp"
 #include "strata/kernels/sampler.hpp"
 
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
 
 #include <cstdint>
 #include <string>
@@ -113,7 +113,7 @@ private:
     const int32_t* hist_d_ = nullptr;   ///< penalty-history row (set_history); null = no penalties apply
     int hist_len_ = 0;
     bool capture_commit(std::string& err);
-    bool record_window(int T, cudaStream_t cs, std::string& err);
+    bool record_window(int T, hipStream_t cs, std::string& err);
 
     const WeightTable* wt_ = nullptr;
     const ModelGeometry* g_ = nullptr;
@@ -125,9 +125,9 @@ private:
     int64_t last_pos0_ = 0;
     int32_t last_tokens_[8] = {};
     int64_t n_vocab_ = 0;
-    cudaStream_t cs_ = nullptr;
-    cudaGraphExec_t exec_[9] = {};
-    cudaGraphExec_t commit_exec_ = nullptr;
+    hipStream_t cs_ = nullptr;
+    hipGraphExec_t exec_[9] = {};
+    hipGraphExec_t commit_exec_ = nullptr;
 
     // mapped staging (host pointer, device alias)
     int32_t* h_tok_ = nullptr;   int32_t* m_tok_ = nullptr;     // T
@@ -143,7 +143,7 @@ private:
     uint32_t* h_flag_ = nullptr; uint32_t* m_flag_ = nullptr;
     uint32_t* h_flagA_ = nullptr; uint32_t* m_flagA_ = nullptr;  // the GPU plan is in place
     uint32_t* h_flagB_ = nullptr; uint32_t* m_flagB_ = nullptr;  // the PCIe share's DMA copies have landed
-    cudaStream_t copy_ = nullptr;                                 // the copy engine's stream (DMA of missed experts)
+    hipStream_t copy_ = nullptr;                                 // the copy engine's stream (DMA of missed experts)
     struct FlagSet { uint32_t* flag; uint32_t value; };
     FlagSet flag_sets_[2 * 64 * 2] = {};                          // host-function arguments, one per (layer, group)
     static void fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t bytes);

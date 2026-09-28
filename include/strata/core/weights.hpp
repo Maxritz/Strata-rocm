@@ -1,4 +1,4 @@
-﻿// include/strata/core/weights.hpp - the dense weights, loaded into VRAM in ENGINE form.
+// include/strata/core/weights.hpp - the dense weights, loaded into VRAM in ENGINE form.
 //
 // The pack is the ARTIFACT's business; this is the ENGINE's.  The differences are deliberate, and they run in
 // BOTH directions:

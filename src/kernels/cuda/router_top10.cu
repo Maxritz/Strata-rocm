@@ -1,3 +1,4 @@
+#include "hip/hip_runtime.h"
 // src/kernels/cuda/router_top10.cu - P2.S2: the MoE router.
 //
 // P2.S2's spec: "BF16 GEMV, softmax / top-k / renormalize per docs/semantics.md; emits (expert_id, weight) x 10
@@ -53,7 +54,7 @@
 //     version was O(k*n) with a serial `exp` inside.
 #include "strata/kernels/router_top10.hpp"
 
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
 
 #include <cmath>
 #include <cstdio>
@@ -88,13 +89,13 @@ __global__ void router_top10_kernel(const float* __restrict__ logits, int n_toke
     // so this is bit-identical to the serial scan.
     float mx = -INFINITY;
     for (int e = tid; e < n_expert; e += nt) mx = fmaxf(mx, l[e]);
-    for (int off = 16; off > 0; off >>= 1) mx = fmaxf(mx, __shfl_down_sync(0xffffffffu, mx, off));
+    for (int off = 16; off > 0; off >>= 1) mx = fmaxf(mx, __shfl_down_sync(0xffffffffffffffffull, mx, off, 32));
     if ((tid & 31) == 0) s_red[tid >> 5] = mx;
     __syncthreads();
     if (tid < 32) {
         const int nw = (nt + 31) >> 5;
         float v = (tid < nw) ? s_red[tid] : -INFINITY;
-        for (int off = 16; off > 0; off >>= 1) v = fmaxf(v, __shfl_down_sync(0xffffffffu, v, off));
+        for (int off = 16; off > 0; off >>= 1) v = fmaxf(v, __shfl_down_sync(0xffffffffffffffffull, v, off, 32));
         if (tid == 0) s_red[0] = v;
     }
     __syncthreads();
@@ -151,8 +152,8 @@ __global__ void router_top10_kernel(const float* __restrict__ logits, int n_toke
             if (pe > bv) { bv = pe; bi = e; }
         }
         for (int off = 16; off > 0; off >>= 1) {
-            const float ov = __shfl_down_sync(0xffffffffu, bv, off);
-            const int oi = __shfl_down_sync(0xffffffffu, bi, off);
+            const float ov = __shfl_down_sync(0xffffffffffffffffull, bv, off, 32);
+            const int oi = __shfl_down_sync(0xffffffffffffffffull, bi, off, 32);
             if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
         }
         if ((tid & 31) == 0) { s_red[tid >> 5] = bv; s_rid[tid >> 5] = bi; }
@@ -162,8 +163,8 @@ __global__ void router_top10_kernel(const float* __restrict__ logits, int n_toke
             float v = (tid < nw) ? s_red[tid] : -INFINITY;
             int ix = (tid < nw) ? s_rid[tid] : n_expert;
             for (int off = 16; off > 0; off >>= 1) {
-                const float ov = __shfl_down_sync(0xffffffffu, v, off);
-                const int oi = __shfl_down_sync(0xffffffffu, ix, off);
+                const float ov = __shfl_down_sync(0xffffffffffffffffull, v, off, 32);
+                const int oi = __shfl_down_sync(0xffffffffffffffffull, ix, off, 32);
                 if (ov > v || (ov == v && oi < ix)) { v = ov; ix = oi; }
             }
             if (tid == 0 && ix < n_expert) {
@@ -207,17 +208,17 @@ void router_top10(const float* logits, int n_tokens, int n_expert, int k, int* i
     const size_t taken_bytes = ((size_t) n_expert + 15u) & ~(size_t) 15u;
     const size_t smem =
         taken_bytes + (size_t) n_expert * sizeof(double) + (size_t) n_expert * sizeof(float);
-    router_top10_kernel<<<(unsigned) n_tokens, threads, smem, (cudaStream_t) stream>>>(
+    router_top10_kernel<<<(unsigned) n_tokens, threads, smem, (hipStream_t) stream>>>(
         logits, n_tokens, n_expert, k, ids, weights);
-    const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "router_top10 launch: %s\n", cudaGetErrorString(e));
+    const hipError_t e = hipGetLastError();
+    if (e != hipSuccess) {
+        std::fprintf(stderr, "router_top10 launch: %s\n", hipGetErrorString(e));
         std::exit(1);
     }
     if (stream == nullptr) {
-        const cudaError_t s = cudaDeviceSynchronize();
-        if (s != cudaSuccess) {
-            std::fprintf(stderr, "router_top10: %s\n", cudaGetErrorString(s));
+        const hipError_t s = hipDeviceSynchronize();
+        if (s != hipSuccess) {
+            std::fprintf(stderr, "router_top10: %s\n", hipGetErrorString(s));
             std::exit(1);
         }
     }

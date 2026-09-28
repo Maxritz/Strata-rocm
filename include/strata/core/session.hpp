@@ -17,7 +17,7 @@
 #include "strata/core/hit_hook.hpp"
 #include "strata/core/layer.hpp"
 
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
 
 #include <cstdint>
 #include <string>
@@ -111,7 +111,7 @@ bool session_token(const WeightTable& tables, const ModelGeometry& g, int64_t po
 /// of them while a block makes ~45.  Replaying the 43-node block graph measured **1.585 ms against 2.393 ms**
 /// for the same work as direct launches - a 1.51x that is pure launch overhead.
 struct SessionGraphs {
-    cudaGraphExec_t* execs = nullptr;   ///< one per layer, in layer order
+    hipGraphExec_t* execs = nullptr;   ///< one per layer, in layer order
     int64_t n = 0;
     /// **THE SECOND GRAPH PER LAYER: `moe_finish` + `gr_write`, launched AFTER the host has run the pool.**
     ///
@@ -123,7 +123,7 @@ struct SessionGraphs {
     /// inside `pre[l]` - the shared expert, and nothing else, because everything after the combine depends on
     /// `parts`.  **A per-layer CPU pool cannot be hidden behind a strictly serial residual chain**, which is
     /// why the CPU term is answered by Phase 3's VRAM cache and not by this pipeline.
-    cudaGraphExec_t* posts = nullptr;
+    hipGraphExec_t* posts = nullptr;
     bool captured = false;
     /// THE DEVICE ADDRESS THE GRAPHS WERE CAPTURED WITH.  The host loop copies each layer's expert outputs
     /// here before launching the next layer, and a graph bakes the POINTER, so it has to be this one.
@@ -170,9 +170,9 @@ struct SessionGraphs {
     /// has ~7 more nodes than prefix 4, so the two differ in launch setup as well as in execution - and the
     /// difference attributed ALL of it to stage 4, the router. Capturing prefix 5 the same way as the others
     /// makes the two comparable and the difference purely stage 4's.
-    cudaGraphExec_t* preP[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
-    cudaGraphExec_t* preA = nullptr;   ///< `half == 1`: gr_read -> attention -> gr_write   (the MIXER)
-    cudaGraphExec_t* preB = nullptr;   ///< `half == 2`: gr_read -> moe_route              (FFN front + ROUTER)
+    hipGraphExec_t* preP[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
+    hipGraphExec_t* preA = nullptr;   ///< `half == 1`: gr_read -> attention -> gr_write   (the MIXER)
+    hipGraphExec_t* preB = nullptr;   ///< `half == 2`: gr_read -> moe_route              (FFN front + ROUTER)
     bool split_captured = false;
 
     /// How many times `session_loop` has run.  `rings_mid_graph` and `ms_to_ring` are CUMULATIVE and the loop
@@ -344,7 +344,7 @@ using PoolFn = void (*)(void* user, const float* x_f, const int32_t* ids, const 
 struct SessionLoopScratch {
     float* y_miss = nullptr;        ///< pinned host staging for the pool's answer, `parts_bytes` long
     size_t parts_bytes = 0;
-    cudaEvent_t probe = nullptr;
+    hipEvent_t probe = nullptr;
     long long pinned_core = -1;     ///< the affinity to restore, or -1 if the host was never pinned
     bool pinned = false;
 
@@ -372,7 +372,7 @@ bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, Session
 // Same kernels, same order per layer as `session_loop`, so the token is bitwise the same.  No VRAM expert tier
 // yet (the hit decision is a host step between ring and post); the caller falls back to `session_loop` then.
 struct TokenGraph {
-    cudaGraphExec_t exec = nullptr;
+    hipGraphExec_t exec = nullptr;
     bool captured = false;
     int64_t n_layers = 0;
     const float* y_src = nullptr;    ///< the pinned host staging the graph's H2D copies read (baked in)

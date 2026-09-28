@@ -11,8 +11,8 @@ namespace {
 
 /// Fills `err` from the CUDA runtime, naming the call that failed.  A bare "invalid argument" with no call
 /// site is the least useful error this API can produce and the easiest to avoid.
-bool fail(std::string& err, const char* what, cudaError_t e) {
-    err = std::string(what) + ": " + cudaGetErrorString(e);
+bool fail(std::string& err, const char* what, hipError_t e) {
+    err = std::string(what) + ": " + hipGetErrorString(e);
     return false;
 }
 
@@ -38,46 +38,46 @@ void CapturedGraph::reset() {
     // destroying it before the event is harmless but destroying it after a spin that was supposed to observe
     // completion would silently become the thing that caused it.  `bench/micro/graph_capture.cu` was fooled by
     // exactly this once - it looked like captured graphs made a doorbell visible and direct launches did not.
-    if (exec_) { cudaGraphExecDestroy(exec_); exec_ = nullptr; }
-    if (graph_) { cudaGraphDestroy(graph_); graph_ = nullptr; }
-    if (done_) { cudaEventDestroy(done_); done_ = nullptr; }
+    if (exec_) { hipGraphExecDestroy(exec_); exec_ = nullptr; }
+    if (graph_) { hipGraphDestroy(graph_); graph_ = nullptr; }
+    if (done_) { hipEventDestroy(done_); done_ = nullptr; }
     nodes_ = 0;
 }
 
 bool CapturedGraph::begin(void* stream, std::string& err) {
     if (graph_ || exec_) { err = "begin: this CapturedGraph is already recorded"; return false; }
-    const cudaError_t e = cudaStreamBeginCapture((cudaStream_t) stream, cudaStreamCaptureModeThreadLocal);
-    if (e != cudaSuccess) return fail(err, "cudaStreamBeginCapture", e);
+    const hipError_t e = hipStreamBeginCapture((hipStream_t) stream, hipStreamCaptureModeThreadLocal);
+    if (e != hipSuccess) return fail(err, "hipStreamBeginCapture", e);
     return true;
 }
 
 bool CapturedGraph::end(void* stream, std::string& err) {
-    cudaError_t e = cudaStreamEndCapture((cudaStream_t) stream, &graph_);
-    if (e != cudaSuccess) { graph_ = nullptr; return fail(err, "cudaStreamEndCapture", e); }
+    hipError_t e = hipStreamEndCapture((hipStream_t) stream, &graph_);
+    if (e != hipSuccess) { graph_ = nullptr; return fail(err, "hipStreamEndCapture", e); }
 
     nodes_ = 0;
-    e = cudaGraphGetNodes(graph_, nullptr, &nodes_);
-    if (e != cudaSuccess) return fail(err, "cudaGraphGetNodes", e);
+    e = hipGraphGetNodes(graph_, nullptr, &nodes_);
+    if (e != hipSuccess) return fail(err, "hipGraphGetNodes", e);
     // A capture that recorded NOTHING is a wiring mistake, and a graph that replays nothing produces no error
     // and no output - the silent kind of failure this project keeps paying for.
     if (nodes_ == 0) { err = "end: the capture recorded ZERO nodes - the body launched nothing"; reset(); return false; }
 
-    e = cudaGraphInstantiate(&exec_, graph_, nullptr, nullptr, 0);
-    if (e != cudaSuccess) return fail(err, "cudaGraphInstantiate", e);
+    e = hipGraphInstantiate(&exec_, graph_, nullptr, nullptr, 0);
+    if (e != hipSuccess) return fail(err, "hipGraphInstantiate", e);
 
     // The completion event is recorded ONCE and reused: `launch` records it again after each replay, which is
     // what makes `wait_ms` a query rather than a sync.
-    e = cudaEventCreateWithFlags(&done_, cudaEventDisableTiming);
-    if (e != cudaSuccess) return fail(err, "cudaEventCreateWithFlags", e);
+    e = hipEventCreateWithFlags(&done_, hipEventDisableTiming);
+    if (e != hipSuccess) return fail(err, "hipEventCreateWithFlags", e);
     return true;
 }
 
 bool CapturedGraph::launch(void* stream, std::string& err) const {
     if (!exec_) { err = "launch: not recorded"; return false; }
-    cudaError_t e = cudaGraphLaunch(exec_, (cudaStream_t) stream);
-    if (e != cudaSuccess) return fail(err, "cudaGraphLaunch", e);
-    e = cudaEventRecord(done_, (cudaStream_t) stream);
-    if (e != cudaSuccess) return fail(err, "cudaEventRecord", e);
+    hipError_t e = hipGraphLaunch(exec_, (hipStream_t) stream);
+    if (e != hipSuccess) return fail(err, "hipGraphLaunch", e);
+    e = hipEventRecord(done_, (hipStream_t) stream);
+    if (e != hipSuccess) return fail(err, "hipEventRecord", e);
     return true;
 }
 
@@ -93,9 +93,9 @@ bool CapturedGraph::wait_ms(int timeout_ms) const {
     // a timeout that does not time out is worse than none, because it reports a hang as a pass.
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
     for (;;) {
-        const cudaError_t q = cudaEventQuery(done_);
-        if (q == cudaSuccess) return true;
-        if (q != cudaErrorNotReady) return false;   // a real error, not "not finished"
+        const hipError_t q = hipEventQuery(done_);
+        if (q == hipSuccess) return true;
+        if (q != hipErrorNotReady) return false;   // a real error, not "not finished"
         if (std::chrono::steady_clock::now() >= deadline) return false;
         for (int i = 0; i < 64; ++i) _mm_pause();
     }
@@ -110,12 +110,12 @@ bool GraphRegistry::record(LayerType type, int n_tokens, const std::function<voi
     body();                                        // the caller launches into the captured stream
     // The body must not have failed silently.  An error state left on the stream would make EndCapture
     // succeed with a broken graph, so it is checked and cleared first.
-    const cudaError_t body_err = cudaGetLastError();
-    if (body_err != cudaSuccess) {
+    const hipError_t body_err = hipGetLastError();
+    if (body_err != hipSuccess) {
         // Abandon the capture without instantiating anything.
-        cudaGraph_t junk = nullptr;
-        cudaStreamEndCapture((cudaStream_t) stream_, &junk);
-        if (junk) cudaGraphDestroy(junk);
+        hipGraph_t junk = nullptr;
+        hipStreamEndCapture((hipStream_t) stream_, &junk);
+        if (junk) hipGraphDestroy(junk);
         return fail(err, "the capture body left a CUDA error", body_err);
     }
     if (!g.end(stream_, err)) return false;

@@ -1,9 +1,10 @@
+#include "hip/hip_runtime.h"
 #include "strata/core/native_dense.hpp"
 #include "strata/core/weights.hpp"
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
 #include <algorithm>
 #include <climits>
 #include <exception>
@@ -22,7 +23,7 @@ bool eligible(const std::string& name, bool include_ple_key) {
     for (const char* suffix : suffixes) if (name.ends_with(suffix)) return true;
     return false;
 }
-struct DeviceFree { void operator()(void* p) const { if (p) cudaFree(p); } };
+struct DeviceFree { void operator()(void* p) const { if (p) hipFree(p); } };
 using DevicePtr = std::unique_ptr<void, DeviceFree>;
 struct Pending {
     WeightRef* ref;
@@ -50,8 +51,8 @@ bool NativeDense::served_names(const std::vector<std::string>& shards, bool incl
 }
 
 NativeDense::~NativeDense() {
-    if (scratch_) cudaFree(scratch_);
-    for (void* p : weights_) cudaFree(p);
+    if (scratch_) hipFree(scratch_);
+    for (void* p : weights_) hipFree(p);
 }
 
 bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& table, std::string& err,
@@ -143,12 +144,12 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 const auto bytes = strata::kernels::native_mmvq_weight_bytes(
                     tensor.type, (int) ref.ne0, (int) ref.ne1);
                 void* allocation = nullptr;
-                auto status = cudaMalloc(&allocation, bytes);
+                auto status = hipMalloc(&allocation, bytes);
                 DevicePtr data(allocation);
-                if (status == cudaSuccess)
-                    status = cudaMemcpy(data.get(), gguf.tensor_data(tensor), bytes, cudaMemcpyHostToDevice);
-                if (status != cudaSuccess) {
-                    err = "native dense upload " + tensor.name + ": " + cudaGetErrorString(status); return false;
+                if (status == hipSuccess)
+                    status = hipMemcpy(data.get(), gguf.tensor_data(tensor), bytes, hipMemcpyHostToDevice);
+                if (status != hipSuccess) {
+                    err = "native dense upload " + tensor.name + ": " + hipGetErrorString(status); return false;
                 }
                 max_in = (std::max)(max_in, (int) ref.ne0);
                 total += bytes;
@@ -157,9 +158,9 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
         }
         if (pending.empty()) { err = "native dense: no supported GDN/QSA matrices in supplied shards"; return false; }
         void* allocation = nullptr;
-        const auto status = cudaMalloc(&allocation, strata::kernels::native_q8_1_bytes(max_in));
+        const auto status = hipMalloc(&allocation, strata::kernels::native_q8_1_bytes(max_in));
         DevicePtr scratch(allocation);
-        if (status != cudaSuccess) { err = std::string("native dense scratch: ") + cudaGetErrorString(status); return false; }
+        if (status != hipSuccess) { err = std::string("native dense scratch: ") + hipGetErrorString(status); return false; }
         // All checks and allocations finish before publishing any reference.
         weights_.reserve(pending.size());
         for (auto& item : pending) {

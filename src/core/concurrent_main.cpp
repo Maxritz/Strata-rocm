@@ -16,7 +16,7 @@
 #include "strata/core/pinned.hpp"
 #include "strata/kernels/s_gemv.hpp"
 
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
 
 #include <atomic>
 #include <chrono>
@@ -30,9 +30,9 @@
 
 namespace {
 
-void check(cudaError_t e, const char* what) {
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e));
+void check(hipError_t e, const char* what) {
+    if (e != hipSuccess) {
+        std::fprintf(stderr, "%s: %s\n", what, hipGetErrorString(e));
         std::exit(1);
     }
 }
@@ -94,19 +94,19 @@ int main(int argc, char** argv) {
                 (double) arena.capacity / (1024.0 * 1024 * 1024), cpu_threads, gpu_roles);
 
     uint8_t* d_codes = nullptr;
-    check(cudaMalloc(&d_codes, role_codes), "cudaMalloc codes");
+    check(hipMalloc(&d_codes, role_codes), "hipMalloc codes");
     uint16_t* d_x = nullptr;
     float *d_scales = nullptr, *d_y = nullptr;
-    check(cudaMalloc(&d_x, n_in * sizeof(uint16_t)), "cudaMalloc x");
-    check(cudaMalloc(&d_scales, (size_t) n_out * (n_in / 64) * sizeof(float)), "cudaMalloc scales");
-    check(cudaMalloc(&d_y, n_out * sizeof(float)), "cudaMalloc y");
+    check(hipMalloc(&d_x, n_in * sizeof(uint16_t)), "hipMalloc x");
+    check(hipMalloc(&d_scales, (size_t) n_out * (n_in / 64) * sizeof(float)), "hipMalloc scales");
+    check(hipMalloc(&d_y, n_out * sizeof(float)), "hipMalloc y");
     std::vector<uint16_t> hx((size_t) n_in, 0x3C00);
     std::vector<float> hs((size_t) n_out * (size_t) (n_in / 64), 0.001f);
-    check(cudaMemcpy(d_x, hx.data(), hx.size() * sizeof(uint16_t), cudaMemcpyHostToDevice), "copy x");
-    check(cudaMemcpy(d_scales, hs.data(), hs.size() * sizeof(float), cudaMemcpyHostToDevice), "copy scales");
-    cudaStream_t s_copy{}, s_comp{};
-    check(cudaStreamCreate(&s_copy), "stream copy");
-    check(cudaStreamCreate(&s_comp), "stream compute");
+    check(hipMemcpy(d_x, hx.data(), hx.size() * sizeof(uint16_t), hipMemcpyHostToDevice), "copy x");
+    check(hipMemcpy(d_scales, hs.data(), hs.size() * sizeof(float), hipMemcpyHostToDevice), "copy scales");
+    hipStream_t s_copy{}, s_comp{};
+    check(hipStreamCreate(&s_copy), "stream copy");
+    check(hipStreamCreate(&s_comp), "stream compute");
     const strata::kernels::SForm form{2, -1, 64, strata::kernels::Codebook::Affine, false};
 
     // The CPU loop: read the whole arena, Nthreads ways, and sum bytes so nothing is elided.
@@ -124,33 +124,33 @@ int main(int argc, char** argv) {
 
     // The GPU loop: stream each role plane on the copy stream while computing on the compute stream.
     auto gpu_work = [&](int roles) {
-        cudaEvent_t ev[2];
-        for (int b = 0; b < 2; ++b) check(cudaEventCreateWithFlags(&ev[b], cudaEventDisableTiming), "event");
+        hipEvent_t ev[2];
+        for (int b = 0; b < 2; ++b) check(hipEventCreateWithFlags(&ev[b], hipEventDisableTiming), "event");
         uint8_t* buf[2] = {d_codes, d_codes};      // one buffer is enough: the timing is what is measured
-        check(cudaMemcpyAsync(buf[0], arena.data(), role_codes, cudaMemcpyHostToDevice, s_copy), "prologue");
-        check(cudaEventRecord(ev[0], s_copy), "prologue event");
+        check(hipMemcpyAsync(buf[0], arena.data(), role_codes, hipMemcpyHostToDevice, s_copy), "prologue");
+        check(hipEventRecord(ev[0], s_copy), "prologue event");
         for (int i = 0; i < roles; ++i) {
             const int cur = i & 1, nxt = (i + 1) & 1;
             if (i + 1 < roles) {
-                check(cudaMemcpyAsync(buf[nxt], arena.data() + (uint64_t) ((i + 1) % experts) * role_codes,
-                                      role_codes, cudaMemcpyHostToDevice, s_copy),
+                check(hipMemcpyAsync(buf[nxt], arena.data() + (uint64_t) ((i + 1) % experts) * role_codes,
+                                      role_codes, hipMemcpyHostToDevice, s_copy),
                       "copy");
-                check(cudaEventRecord(ev[nxt], s_copy), "event");
+                check(hipEventRecord(ev[nxt], s_copy), "event");
             }
-            check(cudaStreamWaitEvent(s_comp, ev[cur], 0), "wait");
+            check(hipStreamWaitEvent(s_comp, ev[cur], 0), "wait");
             strata::kernels::s_gemv_split_async(d_x, buf[cur], d_scales, nullptr, d_y, n_in, n_out, form, 32,
                                                 (void*) s_comp);
         }
-        check(cudaStreamSynchronize(s_comp), "sync comp");
-        check(cudaStreamSynchronize(s_copy), "sync copy");
-        for (int b = 0; b < 2; ++b) cudaEventDestroy(ev[b]);
+        check(hipStreamSynchronize(s_comp), "sync comp");
+        check(hipStreamSynchronize(s_copy), "sync copy");
+        for (int b = 0; b < 2; ++b) hipEventDestroy(ev[b]);
     };
 
     auto run = [&](bool do_cpu, bool do_gpu, const char* name) {
         std::atomic<bool> stop{false};
         std::atomic<uint64_t> bytes{0};
         std::vector<std::thread> cpu;
-        check(cudaStreamSynchronize(0), "pre");
+        check(hipStreamSynchronize(0), "pre");
         const auto t0 = std::chrono::steady_clock::now();
         if (do_cpu) for (int t = 0; t < cpu_threads; ++t) cpu.emplace_back(cpu_work, std::ref(stop), std::ref(bytes));
         if (do_gpu) {
@@ -187,11 +187,11 @@ int main(int argc, char** argv) {
     std::printf("\n  NOTE: the CPU side is a READ LOOP, not the VNNI kernel - it measures DRAM DEMAND, which is the\n"
                 "        resource the question is about.  L9's 129 tok/s assumes these two do not contend.\n");
 
-    cudaFree(d_codes);
-    cudaFree(d_x);
-    cudaFree(d_scales);
-    cudaFree(d_y);
-    cudaStreamDestroy(s_copy);
-    cudaStreamDestroy(s_comp);
+    hipFree(d_codes);
+    hipFree(d_x);
+    hipFree(d_scales);
+    hipFree(d_y);
+    hipStreamDestroy(s_copy);
+    hipStreamDestroy(s_comp);
     return 0;
 }

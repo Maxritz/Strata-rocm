@@ -1,3 +1,4 @@
+#include "hip/hip_runtime.h"
 // src/kernels/cuda/dequant_bf16.cu - see include/strata/kernels/dequant_bf16.hpp.
 //
 // Arithmetic transcribed from ggml/src/ggml-quants.c at the pinned llama.cpp (MIT License, Copyright (c) 2023-2026
@@ -5,8 +6,8 @@
 #include "strata/kernels/dequant_bf16.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
+#include <hip/hip_fp16.h>
+#include <hip/hip_runtime.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -187,7 +188,7 @@ void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t co
     const int64_t row_bytes = cols / be * bb, gpr = cols / 32, total = rows * gpr;
     const unsigned grid = (unsigned) ((total + 255) / 256);
     const uint8_t* p = (const uint8_t*) blocks;
-    cudaStream_t st = (cudaStream_t) stream;
+    hipStream_t st = (hipStream_t) stream;
 #define STRATA_DQ(TY) dequant_kernel<TY, T><<<grid, 256, 0, st>>>(p, row_bytes, row0, rows, gpr, out); break
     switch (type) {
     case 2: STRATA_DQ(2);
@@ -202,8 +203,8 @@ void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t co
     case 42: STRATA_DQ(42);
     }
 #undef STRATA_DQ
-    const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) { std::fprintf(stderr, "dequant launch: %s\n", cudaGetErrorString(e)); std::exit(1); }
+    const hipError_t e = hipGetLastError();
+    if (e != hipSuccess) { std::fprintf(stderr, "dequant launch: %s\n", hipGetErrorString(e)); std::exit(1); }
 }
 
 }  // namespace

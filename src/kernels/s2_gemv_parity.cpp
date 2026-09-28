@@ -1,3 +1,4 @@
+﻿#include "hip/hip_runtime.h"
 // src/kernels/s2_gemv_parity.cpp - P2.S2's parity test for the S2 GEMV.
 //
 // The reference is the same CHAIN as the decode test: `strata::dequantize_q2_0` is a scalar transcription that
@@ -12,7 +13,7 @@
 #include "strata/artifact/dequant.hpp"
 #include "strata/kernels/s2_gemv.hpp"
 
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
 
 #include <cmath>
 #include <cstdint>
@@ -25,9 +26,9 @@ namespace {
 
 constexpr int QK = 64;
 
-void check(cudaError_t e, const char* what) {
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e));
+void check(hipError_t e, const char* what) {
+    if (e != hipSuccess) {
+        std::fprintf(stderr, "%s: %s\n", what, hipGetErrorString(e));
         std::exit(1);
     }
 }
@@ -115,19 +116,19 @@ int main(int argc, char** argv) {
     uint16_t* d_x = nullptr;
     uint8_t* d_codes = nullptr;
     float *d_scales = nullptr, *d_y = nullptr;
-    check(cudaMalloc(&d_x, x.size() * sizeof(uint16_t)), "cudaMalloc x");
-    check(cudaMalloc(&d_codes, codes.size()), "cudaMalloc codes");
-    check(cudaMalloc(&d_scales, scales.size() * sizeof(float)), "cudaMalloc scales");
-    check(cudaMalloc(&d_y, (size_t) n_out * sizeof(float)), "cudaMalloc y");
-    check(cudaMemcpy(d_x, x.data(), x.size() * sizeof(uint16_t), cudaMemcpyHostToDevice), "copy x");
-    check(cudaMemcpy(d_codes, codes.data(), codes.size(), cudaMemcpyHostToDevice), "copy codes");
-    check(cudaMemcpy(d_scales, scales.data(), scales.size() * sizeof(float), cudaMemcpyHostToDevice),
+    check(hipMalloc(&d_x, x.size() * sizeof(uint16_t)), "hipMalloc x");
+    check(hipMalloc(&d_codes, codes.size()), "hipMalloc codes");
+    check(hipMalloc(&d_scales, scales.size() * sizeof(float)), "hipMalloc scales");
+    check(hipMalloc(&d_y, (size_t) n_out * sizeof(float)), "hipMalloc y");
+    check(hipMemcpy(d_x, x.data(), x.size() * sizeof(uint16_t), hipMemcpyHostToDevice), "copy x");
+    check(hipMemcpy(d_codes, codes.data(), codes.size(), hipMemcpyHostToDevice), "copy codes");
+    check(hipMemcpy(d_scales, scales.data(), scales.size() * sizeof(float), hipMemcpyHostToDevice),
           "copy scales");
 
     strata::kernels::s2_gemv(d_x, d_codes, d_scales, d_y, n_in, n_out);
 
     std::vector<float> got((size_t) n_out);
-    check(cudaMemcpy(got.data(), d_y, got.size() * sizeof(float), cudaMemcpyDeviceToHost), "copy back");
+    check(hipMemcpy(got.data(), d_y, got.size() * sizeof(float), hipMemcpyDeviceToHost), "copy back");
 
     long long bad = 0, first_bad = -1;
     double worst = 0.0;
@@ -165,9 +166,10 @@ int main(int argc, char** argv) {
     std::printf("  agrees with the scalar decode that dequant_xcheck proved equal to ggml\n");
     if (selftest) std::printf("s2_gemv_parity OK\n");
 
-    cudaFree(d_x);
-    cudaFree(d_codes);
-    cudaFree(d_scales);
-    cudaFree(d_y);
+    hipFree(d_x);
+    hipFree(d_codes);
+    hipFree(d_scales);
+    hipFree(d_y);
     return 0;
 }
+

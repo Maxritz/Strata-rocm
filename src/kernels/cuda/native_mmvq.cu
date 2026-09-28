@@ -1,3 +1,4 @@
+#include "hip/hip_runtime.h"
 // Adapted from llama.cpp 3cf03257f219afbe7334045ff7c6a06ac68c627d:
 // ggml/src/ggml-cuda/{quantize.cu,vecdotq.cuh,mmvq.cu,common.cuh}
 // and ggml/src/ggml-common.h. See docs/native-mmvq.md for exact scope.
@@ -26,8 +27,9 @@
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
+#include <hip/hip_fp16.h>
+#include <hip/hip_runtime.h>
+#include "strata/hip_compat.h"
 
 #include <cstdint>
 #include <limits>
@@ -123,7 +125,7 @@ static_assert(sizeof(IQ4NLBlock) == 18 && alignof(IQ4NLBlock) == 2 && offsetof(I
 __device__ __forceinline__ float warp_sum(float x) {
 #pragma unroll
     for (int offset = WARP / 2; offset > 0; offset >>= 1) {
-        x += __shfl_xor_sync(0xffffffff, x, offset, WARP);
+        x += __shfl_xor_sync(0xFFFFFFFFFFFFFFFFull, x, offset, WARP);
     }
     return x;
 }
@@ -131,7 +133,7 @@ __device__ __forceinline__ float warp_sum(float x) {
 __device__ __forceinline__ float warp_max(float x) {
 #pragma unroll
     for (int offset = WARP / 2; offset > 0; offset >>= 1) {
-        x = fmaxf(x, __shfl_xor_sync(0xffffffff, x, offset, WARP));
+        x = fmaxf(x, __shfl_xor_sync(0xFFFFFFFFFFFFFFFFull, x, offset, WARP));
     }
     return x;
 }
@@ -1042,7 +1044,7 @@ __global__ void native_mmvq_multi_kernel(const typename F::Block* __restrict__ w
 }
 
 template<typename F, int NCOLS>
-void launch_multi_n(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, cudaStream_t s) {
+void launch_multi_n(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, hipStream_t s) {
     const auto* w = static_cast<const typename F::Block*>(weights);
     const auto* x = static_cast<const Q81Block*>(x_q8_1);
     if (!g_multi_exact) {
@@ -1063,7 +1065,7 @@ void launch_multi_n(const void* weights, const void* x_q8_1, float* y, int n_in,
 template<typename F>
 void launch_multi(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols,
                   void* stream) {
-    const auto s = static_cast<cudaStream_t>(stream);
+    const auto s = static_cast<hipStream_t>(stream);
     switch (ncols) {
         case 2: launch_multi_n<F, 2>(weights, x_q8_1, y, n_in, n_out, s); break;
         case 3: launch_multi_n<F, 3>(weights, x_q8_1, y, n_in, n_out, s); break;
@@ -1091,9 +1093,9 @@ void validate_stream(void* stream) {
     if (!stream) throw std::invalid_argument("native MMVQ requires an explicit non-null CUDA stream");
 }
 void launch_check() {
-    const auto error = cudaGetLastError();
-    if (error != cudaSuccess) {
-        throw std::runtime_error(std::string("native MMVQ launch: ") + cudaGetErrorString(error));
+    const auto error = hipGetLastError();
+    if (error != hipSuccess) {
+        throw std::runtime_error(std::string("native MMVQ launch: ") + hipGetErrorString(error));
     }
 }
 
@@ -1113,7 +1115,7 @@ void small_mmvq(const void* weights, const void* x_q8_1, float* y,
     }
     const auto* w = static_cast<const Weight*>(weights);
     const auto* x = static_cast<const Q81Block*>(x_q8_1);
-    const auto s = static_cast<cudaStream_t>(stream);
+    const auto s = static_cast<hipStream_t>(stream);
     const dim3 threads(WARP, WARPS);
     if (n_in / 32 < 2 * WARPS * WARP / Qi) {
         const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
@@ -1158,7 +1160,7 @@ void native_quantize_q8_1(const float* x, void* x_q8_1, int n_in, int ncols, voi
     const int n_total = n_in * ncols;
     const unsigned blocks = unsigned((std::size_t(n_total) + QUANT_THREADS - 1) / QUANT_THREADS);
     native_quantize_q8_1_kernel<<<blocks, QUANT_THREADS, 0,
-                                 static_cast<cudaStream_t>(stream)>>>(x, static_cast<Q81Block*>(x_q8_1), n_total);
+                                 static_cast<hipStream_t>(stream)>>>(x, static_cast<Q81Block*>(x_q8_1), n_total);
     launch_check();
 }
 
@@ -1177,7 +1179,7 @@ void native_q5_k_mmvq(const void* weights, const void* x_q8_1, float* y,
     }
     const auto* w = static_cast<const Q5KBlock*>(weights);
     const auto* x = static_cast<const Q81Block*>(x_q8_1);
-    const auto s = static_cast<cudaStream_t>(stream);
+    const auto s = static_cast<hipStream_t>(stream);
     const dim3 threads(WARP, WARPS);
     if (n_in / QK < VDR * WARPS * WARP / QI) {
         const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
@@ -1217,7 +1219,7 @@ void native_q2_0_mmvq(const void* weights, const void* x_q8_1, float* y,
     }
     const auto* w = static_cast<const Q20Block*>(weights);
     const auto* x = static_cast<const Q81Block*>(x_q8_1);
-    const auto s = static_cast<cudaStream_t>(stream);
+    const auto s = static_cast<hipStream_t>(stream);
     const dim3 threads(WARP, WARPS);
     if (n_in / 64 < WARPS * WARP / 2) {
         const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
@@ -1256,7 +1258,7 @@ void native_q3_k_mmvq(const void* weights, const void* x_q8_1, float* y,
     }
     const auto* w = static_cast<const Q3KBlock*>(weights);
     const auto* x = static_cast<const Q81Block*>(x_q8_1);
-    const auto s = static_cast<cudaStream_t>(stream);
+    const auto s = static_cast<hipStream_t>(stream);
     const dim3 threads(WARP, WARPS);
     if (n_in / 256 < WARPS * WARP / 16) {
         const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
@@ -1295,7 +1297,7 @@ void native_iq4_xs_mmvq(const void* weights, const void* x_q8_1, float* y,
     }
     const auto* w = static_cast<const IQ4XSBlock*>(weights);
     const auto* x = static_cast<const Q81Block*>(x_q8_1);
-    const auto s = static_cast<cudaStream_t>(stream);
+    const auto s = static_cast<hipStream_t>(stream);
     const dim3 threads(WARP, WARPS);
     if (n_in / 256 < 4 * WARPS * WARP / 32) {
         const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
@@ -1334,7 +1336,7 @@ void native_q4_k_mmvq(const void* weights, const void* x_q8_1, float* y,
     }
     const auto* w = static_cast<const Q4KBlock*>(weights);
     const auto* x = static_cast<const Q81Block*>(x_q8_1);
-    const auto s = static_cast<cudaStream_t>(stream);
+    const auto s = static_cast<hipStream_t>(stream);
     const dim3 threads(WARP, WARPS);
     if (n_in / 256 < WARPS * WARP / 16) {
         const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
@@ -1373,7 +1375,7 @@ void native_q6_k_mmvq(const void* weights, const void* x_q8_1, float* y,
     }
     const auto* w = static_cast<const Q6KBlock*>(weights);
     const auto* x = static_cast<const Q81Block*>(x_q8_1);
-    const auto s = static_cast<cudaStream_t>(stream);
+    const auto s = static_cast<hipStream_t>(stream);
     const dim3 threads(WARP, WARPS);
     if (n_in / 256 < WARPS * WARP / 32) {
         const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);

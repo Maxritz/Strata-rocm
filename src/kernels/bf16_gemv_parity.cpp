@@ -1,3 +1,4 @@
+﻿#include "hip/hip_runtime.h"
 // src/kernels/bf16_gemv_parity.cpp - P2.S5's test for the BF16 GEMV.
 //
 // THREE THINGS ARE CHECKED, and the third is the one the engine's correctness rests on:
@@ -14,7 +15,7 @@
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/f16_bits.hpp"
 
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
 
 #include <cmath>
 #include <cstdio>
@@ -28,9 +29,9 @@ namespace {
 using strata::kernels::bf16_from_f32;
 using strata::kernels::f32_from_bf16;
 
-void check(cudaError_t e, const char* what) {
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e));
+void check(hipError_t e, const char* what) {
+    if (e != hipSuccess) {
+        std::fprintf(stderr, "%s: %s\n", what, hipGetErrorString(e));
         std::exit(1);
     }
 }
@@ -95,19 +96,19 @@ int main(int argc, char** argv) {
 
         uint16_t *d_x = nullptr, *d_w = nullptr;
         float *d_y = nullptr;
-        check(cudaMalloc(&d_x, x.size() * 2), "x");
-        check(cudaMalloc(&d_w, w.size() * 2), "w");
-        check(cudaMalloc(&d_y, (size_t) s.n_out * 4), "y");
-        check(cudaMemcpy(d_x, x.data(), x.size() * 2, cudaMemcpyHostToDevice), "cx");
-        check(cudaMemcpy(d_w, w.data(), w.size() * 2, cudaMemcpyHostToDevice), "cw");
+        check(hipMalloc(&d_x, x.size() * 2), "x");
+        check(hipMalloc(&d_w, w.size() * 2), "w");
+        check(hipMalloc(&d_y, (size_t) s.n_out * 4), "y");
+        check(hipMemcpy(d_x, x.data(), x.size() * 2, hipMemcpyHostToDevice), "cx");
+        check(hipMemcpy(d_w, w.data(), w.size() * 2, hipMemcpyHostToDevice), "cw");
 
         std::vector<float> naive((size_t) s.n_out), warp((size_t) s.n_out), split((size_t) s.n_out);
         strata::kernels::bf16_gemv(d_x, d_w, d_y, s.n_in, s.n_out, nullptr);
-        check(cudaMemcpy(naive.data(), d_y, naive.size() * 4, cudaMemcpyDeviceToHost), "cy1");
+        check(hipMemcpy(naive.data(), d_y, naive.size() * 4, hipMemcpyDeviceToHost), "cy1");
         strata::kernels::bf16_gemv_split(d_x, d_w, d_y, s.n_in, s.n_out, 32, nullptr);
-        check(cudaMemcpy(warp.data(), d_y, warp.size() * 4, cudaMemcpyDeviceToHost), "cy2");
+        check(hipMemcpy(warp.data(), d_y, warp.size() * 4, hipMemcpyDeviceToHost), "cy2");
         strata::kernels::bf16_gemv_split(d_x, d_w, d_y, s.n_in, s.n_out, 256, nullptr);
-        check(cudaMemcpy(split.data(), d_y, split.size() * 4, cudaMemcpyDeviceToHost), "cy3");
+        check(hipMemcpy(split.data(), d_y, split.size() * 4, hipMemcpyDeviceToHost), "cy3");
 
         const double rn = rel_l1(want, naive), rw = rel_l1(want, warp), rs = rel_l1(want, split);
         std::printf("  %-34s naive %.2e  warp %.2e  split256 %.2e\n", s.what, rn, rw, rs);
@@ -128,17 +129,17 @@ int main(int argc, char** argv) {
             // Round the fp16 value to bf16 - i.e. give the kernel a bf16 activation whose VALUES came through
             // fp16.  That is the whole difference between the two contracts at this call site.
             for (size_t i = 0; i < fp16_as_f32.size(); ++i) x[i] = bf16_from_f32(fp16_as_f32[i]);
-            check(cudaMemcpy(d_x, x.data(), x.size() * 2, cudaMemcpyHostToDevice), "cx2");
+            check(hipMemcpy(d_x, x.data(), x.size() * 2, hipMemcpyHostToDevice), "cx2");
             std::vector<float> rival((size_t) s.n_out);
             strata::kernels::bf16_gemv(d_x, d_w, d_y, s.n_in, s.n_out, nullptr);
-            check(cudaMemcpy(rival.data(), d_y, rival.size() * 4, cudaMemcpyDeviceToHost), "cy4");
+            check(hipMemcpy(rival.data(), d_y, rival.size() * 4, hipMemcpyDeviceToHost), "cy4");
             const double r = rel_l1(want, rival);
             const bool visible = r > 1e-4;
             std::printf("      %-30s %s (%.4f%% apart)\n", "bf16 vs fp16 activation",
                         visible ? "yes" : "*** NO ***", r * 100);
             if (!visible) ++bad;
         }
-        cudaFree(d_x); cudaFree(d_w); cudaFree(d_y);
+        hipFree(d_x); hipFree(d_w); hipFree(d_y);
     }
 
     std::printf("\nbf16_gemv: %d failures\n", bad);
@@ -146,3 +147,4 @@ int main(int argc, char** argv) {
     if (selftest) std::printf("bf16_gemv_parity OK\n");
     return 0;
 }
+

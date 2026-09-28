@@ -1,3 +1,4 @@
+#include "hip/hip_runtime.h"
 // Arithmetic adapted from gated_delta_net.cu at pinned llama.cpp
 // 3cf03257f219afbe7334045ff7c6a06ac68c627d. Only state addressing differs:
 // each warp owns one Strata (head,column) and retains its four rows in registers.
@@ -24,7 +25,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 #include "strata/kernels/native_gdn.hpp"
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
 #include <atomic>
 #include <cmath>
 #include <cstddef>
@@ -39,7 +40,7 @@ constexpr int S = 128;
 __device__ __forceinline__ float warp_sum(float value) {
 #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1)
-        value += __shfl_xor_sync(0xffffffff, value, offset, 32);
+        value += __shfl_xor_sync(0xFFFFFFFFFFFFFFFFull, value, offset, 32);
     return value;
 }
 
@@ -114,9 +115,9 @@ void native_gdn_step(float* state, const float* q, const float* k, const float* 
             throw std::invalid_argument("native GDN requires aligned input spans disjoint from state and output");
     }
     const float scale = 1.0f / sqrtf(float(S));
-    step<<<dim3(unsigned(shape.h_v), 1, S / 4), dim3(32, 4), 0, static_cast<cudaStream_t>(stream)>>>(
+    step<<<dim3(unsigned(shape.h_v), 1, S / 4), dim3(32, 4), 0, static_cast<hipStream_t>(stream)>>>(
         state, q, k, v, gate, beta, output, int(shape.h_k), int(shape.h_v), scale);
-    const auto error = cudaGetLastError();
-    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+    const auto error = hipGetLastError();
+    if (error != hipSuccess) throw std::runtime_error(hipGetErrorString(error));
 }
 } // namespace strata::kernels

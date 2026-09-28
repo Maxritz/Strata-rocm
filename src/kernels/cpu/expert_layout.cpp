@@ -72,13 +72,30 @@ void native_gu_rows(const NativeFmt&, const uint8_t*, const void* const*, int, f
 void native_down_rows(const NativeFmt&, const uint8_t*, const void* const*, int, float* const*, int, int) { std::abort(); }
 #endif
 
+// The canonical Q2_0 pack records its own expert count in `manifest.json`
+// ("n_experts_per_layer").  Read it so a 288-expert Flash-Next artifact is not
+// forced through the engine's 512 default.  Returns 0 when absent/unreadable.
+static int64_t manifest_expert_count(const std::string& pack_dir) {
+    std::ifstream in(pack_dir + "/manifest.json");
+    if (!in) return 0;
+    std::string s((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    const std::string key = "\"n_experts_per_layer\"";
+    const size_t p = s.find(key);
+    if (p == std::string::npos) return 0;
+    const size_t c = s.find(':', p + key.size());
+    if (c == std::string::npos) return 0;
+    return (int64_t) std::strtoll(s.c_str() + c + 1, nullptr, 10);
+}
+
 bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err) {
     ExpertLayout L;
     L.n_layers = n_layers;
     L.n_expert = n_expert;
     std::ifstream in(pack_dir + "/native_experts.txt");
     if (!in) {
-        L.total = (uint64_t) n_layers * (uint64_t) n_expert * (uint64_t) BLOB;
+        const int64_t ne = manifest_expert_count(pack_dir);
+        if (ne > 0) L.n_expert = ne;   // the artifact is authoritative over the engine default
+        L.total = (uint64_t) n_layers * (uint64_t) L.n_expert * (uint64_t) BLOB;
         g_layout = L;
         return true;
     }
@@ -93,7 +110,18 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
     L.max_blob = 0;
     std::string line;
     while (std::getline(in, line)) {
-        if (line.empty() || line[0] == '#') continue;
+        if (line.empty()) continue;
+        if (line[0] == '#') {
+            // The header records the artifact's own expert count: "(n_expert <N>, total <T>; ...)".  The
+            // engine's 512 default is wrong for a 288-expert reap artifact, so the table is authoritative.
+            const std::string tag = "(n_expert ";
+            const size_t p = line.find(tag);
+            if (p != std::string::npos) {
+                const int64_t ne = (int64_t) std::strtoll(line.c_str() + p + tag.size(), nullptr, 10);
+                if (ne > 0) { n_expert = ne; L.n_expert = ne; }
+            }
+            continue;
+        }
         std::istringstream ss(line);
         long long l = -1, gt = -1, dt = -1;
         unsigned long long off = 0, blob = 0, go = 0, uo = 0, dox = 0;

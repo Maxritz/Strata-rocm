@@ -1,3 +1,4 @@
+#include "hip/hip_runtime.h"
 // src/kernels/cuda/s2_gemv_quads.cu - S2 with the code load amortised over four elements.
 //
 // THE HYPOTHESIS THIS TESTS.  L4 measured 66 G weights/s = 0.55 weights/cycle/SM, and at an estimated ~13
@@ -16,8 +17,8 @@
 // generic `s_gemv_split` still serves S4 and S8.
 #include "strata/kernels/s_gemv.hpp"
 
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
+#include <hip/hip_fp16.h>
+#include <hip/hip_runtime.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -83,9 +84,9 @@ void s2_gemv_quads(const uint16_t* x, const uint8_t* codes, const float* scales,
     const size_t smem = (size_t) threads_per_row * sizeof(float);
     s2_gemv_quads_kernel<<<(unsigned) n_out, threads_per_row, smem>>>(x, codes, scales, y, n_in, n_out,
                                                                      threads_per_row);
-    const cudaError_t e = cudaDeviceSynchronize();
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "s2_gemv_quads: %s\n", cudaGetErrorString(e));
+    const hipError_t e = hipDeviceSynchronize();
+    if (e != hipSuccess) {
+        std::fprintf(stderr, "s2_gemv_quads: %s\n", hipGetErrorString(e));
         std::exit(1);
     }
 }

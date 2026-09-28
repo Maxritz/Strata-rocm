@@ -1,10 +1,11 @@
+#include "hip/hip_runtime.h"
 // src/kernels/cuda/gdn.cu - P2.S2: the gated delta-net's non-projection parts.
 //
 // See include/strata/kernels/gdn.hpp for the state layout (S, h_v, S) and for why the recurrence needs no
 // barrier at all: every line of it touches only one (j, h) column, so one thread owns a column end to end.
 #include "strata/kernels/gdn.hpp"
 
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
 
 #include <cmath>
 #include <cstdio>
@@ -121,7 +122,7 @@ __global__ void gdn_l2_kernel(float* __restrict__ x, int cols, float eps) {
     double acc = 0.0;
     for (int i = threadIdx.x; i < cols; i += blockDim.x) acc += (double) p[i] * (double) p[i];
     // warp reduction
-    for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, acc, off, 32);
     __shared__ double ssum;
     if (threadIdx.x == 0) ssum = acc;
     __syncthreads();
@@ -139,7 +140,7 @@ __global__ void gdn_out_norm_kernel(const float* __restrict__ o, const float* __
     float* py = y + (size_t) h * S;
     double acc = 0.0;
     for (int i = threadIdx.x; i < S; i += blockDim.x) acc += (double) po[i] * (double) po[i];
-    for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, acc, off, 32);
     __shared__ double ssum;
     if (threadIdx.x == 0) ssum = acc;
     __syncthreads();
@@ -160,12 +161,12 @@ void gdn_step(float* state, const float* q, const float* k, const float* v, cons
     }
     const dim3 grid((unsigned) ((s.S + JTHREADS - 1) / JTHREADS),
                     (unsigned) ((s.h_v + MAX_H - 1) / MAX_H));
-    gdn_step_kernel<<<grid, JTHREADS, 0, (cudaStream_t) stream>>>(state, q, k, v, gate, beta, o, (int) s.S,
+    gdn_step_kernel<<<grid, JTHREADS, 0, (hipStream_t) stream>>>(state, q, k, v, gate, beta, o, (int) s.S,
                                                                   (int) s.h_k, (int) s.h_v);
     if (stream == nullptr) {
-        const cudaError_t e = cudaDeviceSynchronize();
-        if (e != cudaSuccess) {
-            std::fprintf(stderr, "gdn_step: %s\n", cudaGetErrorString(e));
+        const hipError_t e = hipDeviceSynchronize();
+        if (e != hipSuccess) {
+            std::fprintf(stderr, "gdn_step: %s\n", hipGetErrorString(e));
             std::exit(1);
         }
     }
@@ -175,12 +176,12 @@ void gdn_conv_step(float* conv_state, const float* x, const float* kW, float* ou
                    int64_t d_conv, void* stream) {
     if (channels <= 0 || d_conv < 1) return;
     const int blocks = (int) ((channels + 255) / 256);
-    gdn_conv_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>(conv_state, x, kW, out, (int) channels,
+    gdn_conv_kernel<<<blocks, 256, 0, (hipStream_t) stream>>>(conv_state, x, kW, out, (int) channels,
                                                                (int) d_conv);
     if (stream == nullptr) {
-        const cudaError_t e = cudaDeviceSynchronize();
-        if (e != cudaSuccess) {
-            std::fprintf(stderr, "gdn_conv_step: %s\n", cudaGetErrorString(e));
+        const hipError_t e = hipDeviceSynchronize();
+        if (e != hipSuccess) {
+            std::fprintf(stderr, "gdn_conv_step: %s\n", hipGetErrorString(e));
             std::exit(1);
         }
     }
@@ -192,11 +193,11 @@ void gdn_l2_norm(float* x, int64_t rows, int64_t cols, float eps, void* stream) 
         std::fprintf(stderr, "gdn_l2_norm: cols = %lld exceeds the 1024-wide warp reduction\n", (long long) cols);
         std::exit(1);
     }
-    gdn_l2_kernel<<<(unsigned) rows, 32, 0, (cudaStream_t) stream>>>(x, (int) cols, eps);
+    gdn_l2_kernel<<<(unsigned) rows, 32, 0, (hipStream_t) stream>>>(x, (int) cols, eps);
     if (stream == nullptr) {
-        const cudaError_t e = cudaDeviceSynchronize();
-        if (e != cudaSuccess) {
-            std::fprintf(stderr, "gdn_l2_norm: %s\n", cudaGetErrorString(e));
+        const hipError_t e = hipDeviceSynchronize();
+        if (e != hipSuccess) {
+            std::fprintf(stderr, "gdn_l2_norm: %s\n", hipGetErrorString(e));
             std::exit(1);
         }
     }
@@ -222,11 +223,11 @@ __global__ void gdn_beta_gate_kernel(float* __restrict__ beta, int n) {
 void gdn_beta_gate(float* beta, int64_t h_v, void* stream) {
     if (beta == nullptr || h_v <= 0) return;
     const int n = (int) h_v;
-    gdn_beta_gate_kernel<<<(unsigned) ((n + 127) / 128), 128, 0, (cudaStream_t) stream>>>(beta, n);
+    gdn_beta_gate_kernel<<<(unsigned) ((n + 127) / 128), 128, 0, (hipStream_t) stream>>>(beta, n);
     if (stream == nullptr) {
-        const cudaError_t e = cudaDeviceSynchronize();
-        if (e != cudaSuccess) {
-            std::fprintf(stderr, "gdn_beta_gate: %s\n", cudaGetErrorString(e));
+        const hipError_t e = hipDeviceSynchronize();
+        if (e != hipSuccess) {
+            std::fprintf(stderr, "gdn_beta_gate: %s\n", hipGetErrorString(e));
             std::exit(1);
         }
     }
@@ -235,11 +236,11 @@ void gdn_beta_gate(float* beta, int64_t h_v, void* stream) {
 void gdn_out_norm(const float* o, const float* z, const float* ssm_norm, float* y, int64_t h_v, int64_t S,
                   float eps, void* stream) {
     if (h_v <= 0 || S <= 0) return;
-    gdn_out_norm_kernel<<<(unsigned) h_v, 32, 0, (cudaStream_t) stream>>>(o, z, ssm_norm, y, (int) S, eps);
+    gdn_out_norm_kernel<<<(unsigned) h_v, 32, 0, (hipStream_t) stream>>>(o, z, ssm_norm, y, (int) S, eps);
     if (stream == nullptr) {
-        const cudaError_t e = cudaDeviceSynchronize();
-        if (e != cudaSuccess) {
-            std::fprintf(stderr, "gdn_out_norm: %s\n", cudaGetErrorString(e));
+        const hipError_t e = hipDeviceSynchronize();
+        if (e != hipSuccess) {
+            std::fprintf(stderr, "gdn_out_norm: %s\n", hipGetErrorString(e));
             std::exit(1);
         }
     }

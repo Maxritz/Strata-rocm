@@ -1,3 +1,4 @@
+﻿#include "hip/hip_runtime.h"
 // src/kernels/kv_q4_parity.cpp - Parity test for Q4_0 KV cache with orthonormal Walsh-Hadamard rotation.
 // Validates:
 // 1. FWHT 256 CUDA kernel vs exact mathematical orthonormal Walsh-Hadamard transform.
@@ -10,7 +11,7 @@
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/qsa.hpp"
 
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
 
 #include <algorithm>
 #include <cmath>
@@ -26,9 +27,9 @@ namespace {
 
 int g_fail = 0;
 
-void ck(cudaError_t e, const char* w) {
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "CUDA error in %s: %s\n", w, cudaGetErrorString(e));
+void ck(hipError_t e, const char* w) {
+    if (e != hipSuccess) {
+        std::fprintf(stderr, "CUDA error in %s: %s\n", w, hipGetErrorString(e));
         std::exit(2);
     }
 }
@@ -36,8 +37,8 @@ void ck(cudaError_t e, const char* w) {
 template <typename T>
 T* dalloc(size_t n) {
     T* p = nullptr;
-    ck(cudaMalloc(&p, n * sizeof(T) + 64), "malloc");
-    ck(cudaMemset(p, 0, n * sizeof(T) + 64), "memset");
+    ck(hipMalloc(&p, n * sizeof(T) + 64), "malloc");
+    ck(hipMemset(p, 0, n * sizeof(T) + 64), "memset");
     return p;
 }
 
@@ -114,13 +115,13 @@ int main() {
     // Run GPU kernel
     float* d_src = dalloc<float>(n_vectors * 256);
     float* d_dst = dalloc<float>(n_vectors * 256);
-    ck(cudaMemcpy(d_src, h_in.data(), h_in.size() * sizeof(float), cudaMemcpyHostToDevice), "memcpy H2D");
+    ck(hipMemcpy(d_src, h_in.data(), h_in.size() * sizeof(float), hipMemcpyHostToDevice), "memcpy H2D");
 
     k::fwht256_cuda(d_src, d_dst, n_vectors, nullptr);
-    ck(cudaDeviceSynchronize(), "fwht256_cuda");
+    ck(hipDeviceSynchronize(), "fwht256_cuda");
 
     std::vector<float> h_out(n_vectors * 256);
-    ck(cudaMemcpy(h_out.data(), d_dst, h_out.size() * sizeof(float), cudaMemcpyDeviceToHost), "memcpy D2H");
+    ck(hipMemcpy(h_out.data(), d_dst, h_out.size() * sizeof(float), hipMemcpyDeviceToHost), "memcpy D2H");
 
     double max_fwht_diff = 0.0;
     for (size_t i = 0; i < h_out.size(); ++i) {
@@ -136,8 +137,8 @@ int main() {
 
     // Self-inverse property: H * (H * x) == x
     k::fwht256_inplace_cuda(d_dst, n_vectors, nullptr);
-    ck(cudaDeviceSynchronize(), "fwht256_inplace_cuda");
-    ck(cudaMemcpy(h_out.data(), d_dst, h_out.size() * sizeof(float), cudaMemcpyDeviceToHost), "memcpy D2H");
+    ck(hipDeviceSynchronize(), "fwht256_inplace_cuda");
+    ck(hipMemcpy(h_out.data(), d_dst, h_out.size() * sizeof(float), hipMemcpyDeviceToHost), "memcpy D2H");
 
     double max_inv_diff = 0.0;
     for (size_t i = 0; i < h_out.size(); ++i) {
@@ -193,7 +194,7 @@ int main() {
     std::vector<int32_t> table(pages);
     for (int i = 0; i < pages; ++i) table[i] = (i * 3 + 5) % pages; // permutation
     int32_t* d_table = dalloc<int32_t>(pages);
-    ck(cudaMemcpy(d_table, table.data(), pages * sizeof(int32_t), cudaMemcpyHostToDevice), "memcpy table");
+    ck(hipMemcpy(d_table, table.data(), pages * sizeof(int32_t), hipMemcpyHostToDevice), "memcpy table");
 
     const size_t pool_bytes = (size_t) pages * H * P * k::kv_q4_bytes_per_head(D);
     uint8_t* d_k_q4 = dalloc<uint8_t>(pool_bytes);
@@ -223,18 +224,18 @@ int main() {
         host_v[pos] = vv;
 
         int32_t hstep[k::kStepCount] = {pos, pos + 1, 0, 0};
-        ck(cudaMemcpy(d_step, hstep, sizeof(hstep), cudaMemcpyHostToDevice), "memcpy step");
-        ck(cudaMemcpy(d_kcur, kv.data(), kv.size() * sizeof(float), cudaMemcpyHostToDevice), "memcpy k");
-        ck(cudaMemcpy(d_vcur, vv.data(), vv.size() * sizeof(float), cudaMemcpyHostToDevice), "memcpy v");
+        ck(hipMemcpy(d_step, hstep, sizeof(hstep), hipMemcpyHostToDevice), "memcpy step");
+        ck(hipMemcpy(d_kcur, kv.data(), kv.size() * sizeof(float), hipMemcpyHostToDevice), "memcpy k");
+        ck(hipMemcpy(d_vcur, vv.data(), vv.size() * sizeof(float), hipMemcpyHostToDevice), "memcpy v");
 
         k::kv_append_q4_step(d_k_q4, d_v_q4, d_table, d_step, d_kcur, d_vcur, s, nullptr);
-        ck(cudaDeviceSynchronize(), "kv_append_q4_step");
+        ck(hipDeviceSynchronize(), "kv_append_q4_step");
     }
 
     // Verify written Q4_0 blocks bitwise against host quantizer
     std::vector<uint8_t> h_k_q4(pool_bytes), h_v_q4(pool_bytes);
-    ck(cudaMemcpy(h_k_q4.data(), d_k_q4, pool_bytes, cudaMemcpyDeviceToHost), "memcpy d2h k_q4");
-    ck(cudaMemcpy(h_v_q4.data(), d_v_q4, pool_bytes, cudaMemcpyDeviceToHost), "memcpy d2h v_q4");
+    ck(hipMemcpy(h_k_q4.data(), d_k_q4, pool_bytes, hipMemcpyDeviceToHost), "memcpy d2h k_q4");
+    ck(hipMemcpy(h_v_q4.data(), d_v_q4, pool_bytes, hipMemcpyDeviceToHost), "memcpy d2h v_q4");
 
     long bad_blocks = 0;
     const int blocks_per_head = D / k::QK4_0; // 8
@@ -292,18 +293,18 @@ int main() {
     for (int i = 0; i < max_ids; ++i) {
         ids[i] = positions[rng() % n_fill];
     }
-    ck(cudaMemcpy(d_ids, ids.data(), max_ids * sizeof(int32_t), cudaMemcpyHostToDevice), "memcpy ids");
+    ck(hipMemcpy(d_ids, ids.data(), max_ids * sizeof(int32_t), hipMemcpyHostToDevice), "memcpy ids");
 
     int32_t hstep[k::kStepCount] = {0, 0, 0, max_ids};
-    ck(cudaMemcpy(d_step, hstep, sizeof(hstep), cudaMemcpyHostToDevice), "memcpy step");
+    ck(hipMemcpy(d_step, hstep, sizeof(hstep), hipMemcpyHostToDevice), "memcpy step");
 
     k::kv_gather_q4_step(d_k_q4, d_v_q4, d_table, d_ids, d_step, max_ids, s, d_k_scratch, d_v_scratch, nullptr);
-    ck(cudaDeviceSynchronize(), "kv_gather_q4_step");
+    ck(hipDeviceSynchronize(), "kv_gather_q4_step");
 
     std::vector<uint16_t> h_k_scratch((size_t) max_ids * H * D);
     std::vector<uint16_t> h_v_scratch((size_t) max_ids * H * D);
-    ck(cudaMemcpy(h_k_scratch.data(), d_k_scratch, h_k_scratch.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost), "memcpy d2h k_scratch");
-    ck(cudaMemcpy(h_v_scratch.data(), d_v_scratch, h_v_scratch.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost), "memcpy d2h v_scratch");
+    ck(hipMemcpy(h_k_scratch.data(), d_k_scratch, h_k_scratch.size() * sizeof(uint16_t), hipMemcpyDeviceToHost), "memcpy d2h k_scratch");
+    ck(hipMemcpy(h_v_scratch.data(), d_v_scratch, h_v_scratch.size() * sizeof(uint16_t), hipMemcpyDeviceToHost), "memcpy d2h v_scratch");
 
     double worst_quant_err = 0.0;
     for (int i = 0; i < max_ids; ++i) {
@@ -324,17 +325,17 @@ int main() {
     }
     std::printf("  -> Max reconstruction error after 4-bit quant + dequant: %.4f (OK)\n", worst_quant_err);
 
-    cudaFree(d_src);
-    cudaFree(d_dst);
-    cudaFree(d_table);
-    cudaFree(d_k_q4);
-    cudaFree(d_v_q4);
-    cudaFree(d_kcur);
-    cudaFree(d_vcur);
-    cudaFree(d_step);
-    cudaFree(d_ids);
-    cudaFree(d_k_scratch);
-    cudaFree(d_v_scratch);
+    hipFree(d_src);
+    hipFree(d_dst);
+    hipFree(d_table);
+    hipFree(d_k_q4);
+    hipFree(d_v_q4);
+    hipFree(d_kcur);
+    hipFree(d_vcur);
+    hipFree(d_step);
+    hipFree(d_ids);
+    hipFree(d_k_scratch);
+    hipFree(d_v_scratch);
 
     if (g_fail == 0) {
         std::printf("=== kv_q4_parity: ALL TESTS PASSED SUCCESSFULLY! ===\n");
@@ -344,3 +345,4 @@ int main() {
         return 1;
     }
 }
+

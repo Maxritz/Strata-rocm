@@ -1,3 +1,4 @@
+#include "hip/hip_runtime.h"
 // Numerical contract: pinned ggml/src/ggml-cuda/rope.cu, rope_multi/rope_yarn.
 // Text positions are equal across the four IMRoPE sections, so section routing
 // reduces to the one position associated with each contiguous row.
@@ -24,7 +25,7 @@
 // SOFTWARE.
 #include "strata/kernels/native_rope.hpp"
 #include "strata/kernels/mrope.hpp"
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
@@ -81,8 +82,8 @@ void native_rope_apply(const float* x, float* out, int rows, int head_dim,
     // Match pinned host-side float powf before device fast powf/trigonometry.
     const float theta_scale = powf(freq_base, -2.0f / n_rot);
     apply<<<dim3((head_dim / 2 + 127) / 128, rows), 128, 0,
-              static_cast<cudaStream_t>(stream)>>>(x, out, rows, head_dim, n_rot, theta_scale, positions, mrope_table());
-    const auto error = cudaGetLastError();
-    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+              static_cast<hipStream_t>(stream)>>>(x, out, rows, head_dim, n_rot, theta_scale, positions, mrope_table());
+    const auto error = hipGetLastError();
+    if (error != hipSuccess) throw std::runtime_error(hipGetErrorString(error));
 }
 }

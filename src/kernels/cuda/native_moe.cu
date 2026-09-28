@@ -1,3 +1,4 @@
+#include "hip/hip_runtime.h"
 // Arithmetic adapted from the MIT-licensed pinned ggml CUDA
 // moe-weighted-reduction.cu at 3cf03257f219afbe7334045ff7c6a06ac68c627d.
 // MIT License
@@ -21,7 +22,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 #include "strata/kernels/native_moe.hpp"
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -66,9 +67,9 @@ void native_moe_combine(const float* parts, const float* weights, const float* s
             || overlap(output, row_bytes, weights, weight_bytes)
             || (shared && overlap(output, row_bytes, shared, row_bytes)))
         throw std::invalid_argument("native MoE combine requires aligned spans and disjoint output");
-    combine<<<unsigned((n_embd + 255) / 256), 256, 0, static_cast<cudaStream_t>(stream)>>>(
+    combine<<<unsigned((n_embd + 255) / 256), 256, 0, static_cast<hipStream_t>(stream)>>>(
         parts, weights, shared, output, n_embd, int(k));
-    const auto error = cudaGetLastError();
-    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+    const auto error = hipGetLastError();
+    if (error != hipSuccess) throw std::runtime_error(hipGetErrorString(error));
 }
 }

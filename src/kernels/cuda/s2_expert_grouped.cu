@@ -1,3 +1,4 @@
+#include "hip/hip_runtime.h"
 // src/kernels/cuda/s2_expert_grouped.cu - R4's grouped GPU expert.  Read the header first.
 //
 // THE ARITHMETIC IS `src/kernels/cpu/expert.cpp`'s, over the same bytes, one warp per output row.
@@ -17,8 +18,9 @@
 
 #include "strata/kernels/quantize_act.hpp"
 
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
+#include <hip/hip_fp16.h>
+#include <hip/hip_runtime.h>
+#include "strata/hip_compat.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -100,7 +102,7 @@ __device__ __forceinline__ float row_dot_s2_q8(const uint8_t* __restrict__ codes
 
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xFFFFFFFFu, v, off);
+    for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, v, off, 32);
     return v;
 }
 
@@ -231,7 +233,7 @@ __device__ __forceinline__ float row_dot_cpu_order(const uint8_t* codes, const u
     }
     // _mm_add_ps(low128, high128), then two _mm_hadd_ps. The pair order is 4, 1, 2;
     // a standard shuffle tree in the order 4, 2, 1 is a different floating-point expression.
-    constexpr unsigned mask = 0xffffffffu;
+    constexpr unsigned long long mask = 0xffffffffffffffffull;
     acc = __fadd_rn(acc, __shfl_down_sync(mask, acc, 4, 8));
     acc = __fadd_rn(acc, __shfl_down_sync(mask, acc, 1, 8));
     acc = __fadd_rn(acc, __shfl_down_sync(mask, acc, 2, 8));
@@ -300,9 +302,9 @@ __global__ void cpu_order_quantize_kernel(const float* x, uint8_t* blocks, float
 constexpr int THREADS = 256;
 
 void check(const char* who, void* stream) {
-    const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "%s launch: %s\n", who, cudaGetErrorString(e));
+    const hipError_t e = hipGetLastError();
+    if (e != hipSuccess) {
+        std::fprintf(stderr, "%s launch: %s\n", who, hipGetErrorString(e));
         std::exit(1);
     }
     // Deliberately NOT synchronising for a non-null stream: this is called once per layer from a captured
@@ -328,7 +330,7 @@ void moe_hit_grouped_s2(const uint8_t* blob_base, const int32_t* slot_index, con
                         int64_t n_hits, int64_t blob_bytes, const uint8_t* x_q8_0, void* scratch, float* out,
                         void* stream, const float* x_scales) {
     if (n_hits <= 0) return;
-    cudaStream_t cs = (cudaStream_t) stream;
+    hipStream_t cs = (hipStream_t) stream;
     const int warps = THREADS / 32;
 
     const uint64_t gu_bytes = ((uint64_t) n_hits * (uint64_t) (2 * FF) * 4 + 15) & ~15ull;
@@ -381,7 +383,7 @@ __global__ void hit_select_kernel(const int32_t* __restrict__ ids, const int32_t
         const int e = ids[lane];
         if (e >= 0 && e < n_expert) s = res_row[e];
     }
-    const unsigned hit = __ballot_sync(0xffffffffu, s >= 0);
+    const unsigned hit = __ballot_sync(0xffffffffffffffffull, s >= 0);
     if (s >= 0) {
         const int at = __popc(hit & ((1u << lane) - 1u));
         slot[at] = s;
@@ -402,7 +404,7 @@ __global__ void hit_select_multi_kernel(const int32_t* __restrict__ ids, const i
         const int e = ids[i];
         if (e >= 0 && e < n_expert) s = res_row[e];
     }
-    const unsigned hit = __ballot_sync(0xffffffffu, s >= 0);
+    const unsigned hit = __ballot_sync(0xffffffffffffffffull, s >= 0);
     if (lane == 0) warp_count[warp] = __popc(hit);
     __syncthreads();
     int before = 0;
@@ -428,7 +430,7 @@ __global__ void add_hits_kernel(float* __restrict__ parts, const float* __restri
 void moe_hit_select(const int32_t* ids, const int32_t* res_row, int k, int n_expert, int32_t* slot, int32_t* dst,
                     int32_t* count, void* stream) {
     if (k < 1 || k > 32) { std::fprintf(stderr, "moe_hit_select: k must be 1..32\n"); std::exit(1); }
-    hit_select_kernel<<<1, 32, 0, (cudaStream_t) stream>>>(ids, res_row, k, n_expert, slot, dst, count);
+    hit_select_kernel<<<1, 32, 0, (hipStream_t) stream>>>(ids, res_row, k, n_expert, slot, dst, count);
     check("moe_hit_select", stream);
 }
 
@@ -436,7 +438,7 @@ void moe_hit_grouped_s2_dev(const uint8_t* blob_base, const int32_t* slot_index,
                             const int32_t* d_count, int64_t cap, int64_t blob_bytes, const uint8_t* x_q8_0,
                             void* scratch, float* out, void* stream, const float* x_scales) {
     if (cap <= 0) return;
-    cudaStream_t cs = (cudaStream_t) stream;
+    hipStream_t cs = (hipStream_t) stream;
     const int warps = THREADS / 32;
     const uint64_t gu_bytes = ((uint64_t) cap * (uint64_t) (2 * FF) * 4 + 15) & ~15ull;
     const uint64_t q8_bytes = ((uint64_t) cap * (uint64_t) (FF / 32) * 34 + 15) & ~15ull;
@@ -468,7 +470,7 @@ void moe_hit_grouped_s2_dev(const uint8_t* blob_base, const int32_t* slot_index,
 void moe_hit_select_multi(const int32_t* ids, const int32_t* res_row, int n, int n_expert, int32_t* slot, int32_t* dst,
                           int32_t* count, void* stream) {
     if (n < 1 || n > 128) { std::fprintf(stderr, "moe_hit_select_multi: n must be 1..128\n"); std::exit(1); }
-    hit_select_multi_kernel<<<1, 128, 0, (cudaStream_t) stream>>>(ids, res_row, n, n_expert, slot, dst, count);
+    hit_select_multi_kernel<<<1, 128, 0, (hipStream_t) stream>>>(ids, res_row, n, n_expert, slot, dst, count);
     check("moe_hit_select_multi", stream);
 }
 
@@ -476,7 +478,7 @@ void moe_hit_grouped_s2_multi(const uint8_t* blob_base, const int32_t* slot_inde
                               const int32_t* d_count, int64_t cap, int64_t blob_bytes, const uint8_t* x_q8_0,
                               const float* x_scales, int k_per_token, void* scratch, float* out, void* stream) {
     if (cap <= 0) return;
-    cudaStream_t cs = (cudaStream_t) stream;
+    hipStream_t cs = (hipStream_t) stream;
     const int warps = THREADS / 32;
     const uint64_t gu_bytes = ((uint64_t) cap * (uint64_t) (2 * FF) * 4 + 15) & ~15ull;
     const uint64_t q8_bytes = ((uint64_t) cap * (uint64_t) (FF / 32) * 34 + 15) & ~15ull;
@@ -696,7 +698,7 @@ void moe_group_resident(const int32_t* ids, int n, int k_per_tok, const uint8_t*
                         unsigned long long* grp_ptr, int32_t* grp_start, int32_t* counts, int32_t* ent_dst,
                         int32_t* ent_tok, void* stream) {
     if (n < 1 || n > 128) { std::fprintf(stderr, "moe_group_resident: n must be 1..128\n"); std::exit(1); }
-    group_resident_kernel<<<1, 128, 0, (cudaStream_t) stream>>>(ids, n, k_per_tok, base, (long long) blob, grp_ptr,
+    group_resident_kernel<<<1, 128, 0, (hipStream_t) stream>>>(ids, n, k_per_tok, base, (long long) blob, grp_ptr,
                                                                grp_start, counts, ent_dst, ent_tok);
     check("moe_group_resident", stream);
 }
@@ -705,7 +707,7 @@ void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start,
                     const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups, int64_t cap_entries,
                     const uint8_t* x_q8_0, const float* x_scales, void* scratch, float* out, void* stream) {
     if (cap_groups <= 0 || cap_entries <= 0) return;
-    cudaStream_t cs = (cudaStream_t) stream;
+    hipStream_t cs = (hipStream_t) stream;
     const uint64_t gu_bytes = ((uint64_t) cap_entries * (uint64_t) (2 * FF) * 4 + 15) & ~15ull;
     const uint64_t q8_bytes = ((uint64_t) cap_entries * (uint64_t) (FF / 32) * 34 + 15) & ~15ull;
     float* gate_up = (float*) scratch;
@@ -734,7 +736,7 @@ void moe_hit_add(float* parts, const float* hit_out, const int32_t* dst, const i
                  int64_t n_embd, void* stream) {
     if (cap <= 0) return;
     const dim3 grid((unsigned) ((n_embd + 255) / 256 < 8 ? (n_embd + 255) / 256 : 8), (unsigned) cap);
-    add_hits_kernel<<<grid, 256, 0, (cudaStream_t) stream>>>(parts, hit_out, dst, count, (int) n_embd);
+    add_hits_kernel<<<grid, 256, 0, (hipStream_t) stream>>>(parts, hit_out, dst, count, (int) n_embd);
     check("moe_hit_add", stream);
 }
 
@@ -747,7 +749,7 @@ void moe_hit_grouped_s2_cpu_order(const uint8_t* blob_base, const int32_t* slot_
         std::fprintf(stderr, "moe_hit_grouped_s2_cpu_order requires fp32 activation scales\n");
         std::exit(1);
     }
-    cudaStream_t cs = (cudaStream_t) stream;
+    hipStream_t cs = (hipStream_t) stream;
     const uint64_t gu_bytes = ((uint64_t) n_hits * 2 * FF * 4 + 15) & ~15ull;
     const uint64_t q8_bytes = ((uint64_t) n_hits * (FF / 32) * 34 + 15) & ~15ull;
     const uint64_t scale_bytes = ((uint64_t) n_hits * (FF / 32) * 4 + 15) & ~15ull;
@@ -765,8 +767,8 @@ void moe_hit_grouped_s2_cpu_order(const uint8_t* blob_base, const int32_t* slot_
         blob_base, slot_index, dst_index, blob_bytes, x_q8_0, x_scales, xh, gu, (int) n_hits);
     check("cpu_order/gate_up", stream);
     if (gate_up_trace != nullptr &&
-        cudaMemcpyAsync(gate_up_trace, gu, (size_t) n_hits * 2 * FF * sizeof(float),
-                        cudaMemcpyDeviceToDevice, cs) != cudaSuccess) {
+        hipMemcpyAsync(gate_up_trace, gu, (size_t) n_hits * 2 * FF * sizeof(float),
+                        hipMemcpyDeviceToDevice, cs) != hipSuccess) {
         std::fprintf(stderr, "cpu_order/gate_up_trace copy failed\n");
         std::exit(1);
     }

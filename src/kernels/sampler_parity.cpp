@@ -1,3 +1,4 @@
+﻿#include "hip/hip_runtime.h"
 // src/kernels/sampler_parity.cpp - P2.S2's test for the sampler chain.
 //
 // THE CHECK THAT MATTERS IS THAT THE ORDER IS OBSERVABLE.  A sampler in the wrong order still returns a valid
@@ -10,7 +11,7 @@
 // pass against either order.
 #include "strata/kernels/sampler.hpp"
 
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
 
 #include <algorithm>
 #include <cmath>
@@ -23,9 +24,9 @@
 
 namespace {
 
-void check(cudaError_t e, const char* what) {
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e));
+void check(hipError_t e, const char* what) {
+    if (e != hipSuccess) {
+        std::fprintf(stderr, "%s: %s\n", what, hipGetErrorString(e));
         std::exit(1);
     }
 }
@@ -104,26 +105,26 @@ int run(const char* name, const std::vector<float>& logits, int n_tokens, const 
         const std::vector<int>& want, const std::vector<int>& hist = {}, int hist_len = 0) {
     float* d_l = nullptr;
     int* d_o = nullptr;
-    check(cudaMalloc(&d_l, logits.size() * sizeof(float)), "malloc logits");
-    check(cudaMalloc(&d_o, (size_t) n_tokens * sizeof(int)), "malloc out");
-    check(cudaMemcpy(d_l, logits.data(), logits.size() * sizeof(float), cudaMemcpyHostToDevice), "copy");
+    check(hipMalloc(&d_l, logits.size() * sizeof(float)), "malloc logits");
+    check(hipMalloc(&d_o, (size_t) n_tokens * sizeof(int)), "malloc out");
+    check(hipMemcpy(d_l, logits.data(), logits.size() * sizeof(float), hipMemcpyHostToDevice), "copy");
     int* d_h = nullptr;
     if (hist_len > 0) {
-        check(cudaMalloc(&d_h, hist.size() * sizeof(int)), "malloc hist");
-        check(cudaMemcpy(d_h, hist.data(), hist.size() * sizeof(int), cudaMemcpyHostToDevice), "copy hist");
+        check(hipMalloc(&d_h, hist.size() * sizeof(int)), "malloc hist");
+        check(hipMemcpy(d_h, hist.data(), hist.size() * sizeof(int), hipMemcpyHostToDevice), "copy hist");
     }
     strata::kernels::sample_tokens(d_l, n_tokens, (int) (logits.size() / n_tokens), d_h, hist_len, p, d_o,
                                    nullptr);
     std::vector<int> got((size_t) n_tokens);
-    check(cudaMemcpy(got.data(), d_o, got.size() * sizeof(int), cudaMemcpyDeviceToHost), "back");
+    check(hipMemcpy(got.data(), d_o, got.size() * sizeof(int), hipMemcpyDeviceToHost), "back");
     int bad = 0;
     for (int t = 0; t < n_tokens; ++t) if (got[(size_t) t] != want[(size_t) t]) ++bad;
     std::printf("  %-34s %s (%d of %d differ)", name, bad ? "*** WRONG ***" : "matches", bad, n_tokens);
     if (bad) std::printf("   first: want %d got %d", want[0], got[0]);
     std::printf("\n");
-    cudaFree(d_l);
-    cudaFree(d_o);
-    if (d_h) cudaFree(d_h);
+    hipFree(d_l);
+    hipFree(d_o);
+    if (d_h) hipFree(d_h);
     return bad;
 }
 
@@ -321,7 +322,7 @@ int main(int argc, char** argv) {
     }
 
     // ---- fixture 3: greedy consumes NO random number.  Two runs with different seeds must agree, or the
-    // seeded streams diverge between greedy and sampled runs - which docs/sampling.md §3 calls out.
+    // seeded streams diverge between greedy and sampled runs - which docs/sampling.md ┬º3 calls out.
     {
         strata::kernels::SamplerParams a; a.top_k = 20; a.top_p = 0.95f; a.temperature = 1.0f; a.greedy = true; a.seed = 1;
         strata::kernels::SamplerParams b = a; b.seed = 999999;
@@ -331,15 +332,15 @@ int main(int argc, char** argv) {
         std::vector<int> wa((size_t) NT);
         for (int t = 0; t < NT; ++t) wa[(size_t) t] = reference_pick({l.begin() + (size_t) t * NV, l.begin() + (size_t) (t + 1) * NV}, a, false);
         float* d_l = nullptr; int *d_a = nullptr, *d_b = nullptr;
-        check(cudaMalloc(&d_l, l.size() * sizeof(float)), "m1");
-        check(cudaMalloc(&d_a, (size_t) NT * sizeof(int)), "m2");
-        check(cudaMalloc(&d_b, (size_t) NT * sizeof(int)), "m3");
-        check(cudaMemcpy(d_l, l.data(), l.size() * sizeof(float), cudaMemcpyHostToDevice), "c1");
+        check(hipMalloc(&d_l, l.size() * sizeof(float)), "m1");
+        check(hipMalloc(&d_a, (size_t) NT * sizeof(int)), "m2");
+        check(hipMalloc(&d_b, (size_t) NT * sizeof(int)), "m3");
+        check(hipMemcpy(d_l, l.data(), l.size() * sizeof(float), hipMemcpyHostToDevice), "c1");
         strata::kernels::sample_tokens(d_l, NT, NV, nullptr, 0, a, d_a, nullptr);
         strata::kernels::sample_tokens(d_l, NT, NV, nullptr, 0, b, d_b, nullptr);
         std::vector<int> ga((size_t) NT), gb((size_t) NT);
-        check(cudaMemcpy(ga.data(), d_a, ga.size() * sizeof(int), cudaMemcpyDeviceToHost), "g1");
-        check(cudaMemcpy(gb.data(), d_b, gb.size() * sizeof(int), cudaMemcpyDeviceToHost), "g2");
+        check(hipMemcpy(ga.data(), d_a, ga.size() * sizeof(int), hipMemcpyDeviceToHost), "g1");
+        check(hipMemcpy(gb.data(), d_b, gb.size() * sizeof(int), hipMemcpyDeviceToHost), "g2");
         int mismatch = 0, wrong = 0;
         for (int t = 0; t < NT; ++t) {
             if (ga[(size_t) t] != gb[(size_t) t]) ++mismatch;
@@ -349,7 +350,7 @@ int main(int argc, char** argv) {
                     "greedy ignores the seed", (!mismatch && !wrong) ? "matches" : "*** WRONG ***", mismatch,
                     wrong);
         bad += mismatch + wrong;
-        cudaFree(d_l); cudaFree(d_a); cudaFree(d_b);
+        hipFree(d_l); hipFree(d_a); hipFree(d_b);
     }
 
 
@@ -576,27 +577,27 @@ int main(int argc, char** argv) {
         std::vector<float> uniform(count * vocab, 0.0f);
         float* input = nullptr;
         int* output = nullptr;
-        check(cudaMalloc(&input, uniform.size() * sizeof(float)), "counter logits");
-        check(cudaMalloc(&output, count * sizeof(int)), "counter output");
-        check(cudaMemcpy(input, uniform.data(), uniform.size() * sizeof(float), cudaMemcpyHostToDevice), "counter upload");
+        check(hipMalloc(&input, uniform.size() * sizeof(float)), "counter logits");
+        check(hipMalloc(&output, count * sizeof(int)), "counter output");
+        check(hipMemcpy(input, uniform.data(), uniform.size() * sizeof(float), hipMemcpyHostToDevice), "counter upload");
         strata::kernels::SamplerParams p;
         p.top_k = vocab; p.top_p = 1.0f; p.seed = 123; p.counter = (uint64_t(1) << 32) + 7;
         strata::kernels::sample_tokens(input, count, vocab, nullptr, 0, p, output, nullptr);
         std::vector<int> batch(count), singles(count), repeated(count);
-        check(cudaMemcpy(batch.data(), output, count * sizeof(int), cudaMemcpyDeviceToHost), "counter batch");
+        check(hipMemcpy(batch.data(), output, count * sizeof(int), hipMemcpyDeviceToHost), "counter batch");
         for (int i = 0; i < count; ++i) {
             auto one = p; one.counter += i;
             strata::kernels::sample_tokens(input, 1, vocab, nullptr, 0, one, output + i, nullptr);
         }
-        check(cudaMemcpy(singles.data(), output, count * sizeof(int), cudaMemcpyDeviceToHost), "counter singles");
+        check(hipMemcpy(singles.data(), output, count * sizeof(int), hipMemcpyDeviceToHost), "counter singles");
         strata::kernels::sample_tokens(input, count, vocab, nullptr, 0, p, output, nullptr);
-        check(cudaMemcpy(repeated.data(), output, count * sizeof(int), cudaMemcpyDeviceToHost), "counter repeated");
+        check(hipMemcpy(repeated.data(), output, count * sizeof(int), hipMemcpyDeviceToHost), "counter repeated");
         bool varies = false;
         for (int i = 1; i < count; ++i) varies |= batch[i] != batch[0];
         const bool valid = batch == singles && batch == repeated && varies;
         std::printf("  sampler draw counter segmentation/repeat: %s\n", valid ? "PASS" : "FAIL");
         bad += !valid;
-        cudaFree(input); cudaFree(output);
+        hipFree(input); hipFree(output);
     }
 
     std::printf("\nsampler: %d failures\n", bad);
@@ -604,3 +605,4 @@ int main(int argc, char** argv) {
     if (selftest) std::printf("sampler_parity OK\n");
     return 0;
 }
+

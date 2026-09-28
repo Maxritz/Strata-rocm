@@ -1,3 +1,4 @@
+﻿#include "hip/hip_runtime.h"
 // src/kernels/cvec_parity.cpp - the control vector kernel (strata/kernels/cvec.hpp) against a host reference.
 //   1. project: h - s (h.v) v per stream and token, against double precision; the steered component is gone.
 //   2. add: h + d.
@@ -8,7 +9,7 @@
 #include "strata/kernels/cvec.hpp"
 #include "strata/kernels/fused_gr.hpp"
 
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
 
 #include <cmath>
 #include <cstdio>
@@ -23,9 +24,9 @@ namespace {
 
 int g_fail = 0;
 
-void ck(cudaError_t e, const char* w) {
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "CUDA error in %s: %s\n", w, cudaGetErrorString(e));
+void ck(hipError_t e, const char* w) {
+    if (e != hipSuccess) {
+        std::fprintf(stderr, "CUDA error in %s: %s\n", w, hipGetErrorString(e));
         std::exit(2);
     }
 }
@@ -33,16 +34,16 @@ void ck(cudaError_t e, const char* w) {
 template <typename T>
 T* dalloc(size_t n) {
     T* p = nullptr;
-    ck(cudaMalloc(&p, n * sizeof(T)), "malloc");
+    ck(hipMalloc(&p, n * sizeof(T)), "malloc");
     return p;
 }
 
 template <typename T>
-void up(T* d, const std::vector<T>& h) { ck(cudaMemcpy(d, h.data(), h.size() * sizeof(T), cudaMemcpyHostToDevice), "up"); }
+void up(T* d, const std::vector<T>& h) { ck(hipMemcpy(d, h.data(), h.size() * sizeof(T), hipMemcpyHostToDevice), "up"); }
 template <typename T>
 std::vector<T> down(const T* d, size_t n) {
     std::vector<T> h(n);
-    ck(cudaMemcpy(h.data(), d, n * sizeof(T), cudaMemcpyDeviceToHost), "down");
+    ck(hipMemcpy(h.data(), d, n * sizeof(T), hipMemcpyDeviceToHost), "down");
     return h;
 }
 
@@ -87,7 +88,7 @@ int main() {
     std::printf("project\n");
     up(dR, R);
     k::cvec_apply(dR, kLayer, T, D, nullptr, 0, nullptr, 0, false, nullptr);
-    ck(cudaDeviceSynchronize(), "project");
+    ck(hipDeviceSynchronize(), "project");
     {
         const auto got = down(dR, R.size());
         double worst = 0.0, worst_dot = 0.0;
@@ -116,7 +117,7 @@ int main() {
     if (!k::cvec_upload(dir, s, 0, 4, 44, N, HC, err)) return 2;
     up(dR, R);
     k::cvec_apply(dR, kLayer, T, D, nullptr, 0, nullptr, 0, false, nullptr);
-    ck(cudaDeviceSynchronize(), "project s=1");
+    ck(hipDeviceSynchronize(), "project s=1");
     {
         const auto got = down(dR, R.size());
         double worst = 0.0;
@@ -133,7 +134,7 @@ int main() {
     // ---- 4. a layer without a direction
     up(dR, R);
     k::cvec_apply(dR, kOff, T, D, nullptr, 0, nullptr, 0, false, nullptr);
-    ck(cudaDeviceSynchronize(), "off layer");
+    ck(hipDeviceSynchronize(), "off layer");
     check(std::memcmp(down(dR, R.size()).data(), R.data(), R.size() * 4) == 0, "a layer without a direction is untouched");
 
     // ---- 3. switched off
@@ -142,7 +143,7 @@ int main() {
     check(!k::cvec_enabled(), "cvec_enabled() follows the switch");
     up(dR, R);
     k::cvec_apply(dR, kLayer, T, D, nullptr, 0, nullptr, 0, false, nullptr);
-    ck(cudaDeviceSynchronize(), "off");
+    ck(hipDeviceSynchronize(), "off");
     check(std::memcmp(down(dR, R.size()).data(), R.data(), R.size() * 4) == 0, "off, no pending write: R unchanged");
     {
         // the fused read's folded write, one token at a time, against the kernel's write-only pass
@@ -174,7 +175,7 @@ int main() {
         }
         up(dR, R);
         k::cvec_apply(dR, kLayer, T, D, dbo, N, dinj, HC, true, nullptr);
-        ck(cudaDeviceSynchronize(), "write only");
+        ck(hipDeviceSynchronize(), "write only");
         const auto fused = down(dF, R.size()), mine = down(dR, R.size());
         check(std::memcmp(fused.data(), mine.data(), R.size() * 4) == 0,
               "off, pending write: bitwise the fused read's folded write");
@@ -182,7 +183,7 @@ int main() {
         // on, with the write: the write, then the projection (reference from the fused result)
         up(dR, R);
         k::cvec_apply(dR, kLayer, T, D, dbo, N, dinj, HC, true, nullptr);
-        ck(cudaDeviceSynchronize(), "write+project");
+        ck(hipDeviceSynchronize(), "write+project");
         const auto both = down(dR, R.size());
         double worst = 0.0;
         for (int64_t t = 0; t < T; ++t)
@@ -205,7 +206,7 @@ int main() {
     if (!k::cvec_upload(dir, s, /*add*/ 1, 4, 44, N, HC, err)) return 2;
     up(dR, R);
     k::cvec_apply(dR, kLayer, T, D, nullptr, 0, nullptr, 0, false, nullptr);
-    ck(cudaDeviceSynchronize(), "add");
+    ck(hipDeviceSynchronize(), "add");
     {
         const auto got = down(dR, R.size());
         bool same = true;
@@ -221,3 +222,4 @@ int main() {
     std::printf(g_fail ? "cvec_parity: %d FAILED\n" : "cvec_parity: all passed\n", g_fail);
     return g_fail ? 1 : 0;
 }
+

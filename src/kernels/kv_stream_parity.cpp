@@ -1,3 +1,4 @@
+﻿#include "hip/hip_runtime.h"
 // src/kernels/kv_stream_parity.cpp - KV streaming (kv_stream.hpp) against a fully resident pool (GPU, no model).
 //
 // Decodes a synthetic sequence twice: into a fully resident pool with the identity page table, and into a streamed
@@ -15,7 +16,7 @@
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
 
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
 
 #include <algorithm>
 #include <cstdio>
@@ -29,21 +30,21 @@ namespace k = strata::kernels;
 
 namespace {
 int g_fail = 0;
-void ck(cudaError_t e, const char* w) {
-    if (e != cudaSuccess) { std::fprintf(stderr, "%s: %s\n", w, cudaGetErrorString(e)); std::exit(2); }
+void ck(hipError_t e, const char* w) {
+    if (e != hipSuccess) { std::fprintf(stderr, "%s: %s\n", w, hipGetErrorString(e)); std::exit(2); }
 }
 template <typename T> T* dalloc(size_t n) {
     T* p = nullptr;
-    ck(cudaMalloc(&p, n * sizeof(T) + 64), "malloc");
-    ck(cudaMemset(p, 0, n * sizeof(T) + 64), "memset");
+    ck(hipMalloc(&p, n * sizeof(T) + 64), "malloc");
+    ck(hipMemset(p, 0, n * sizeof(T) + 64), "memset");
     return p;
 }
 template <typename T> T* halloc(size_t n) {   // pinned, mapped; returns the device pointer
     void* h = nullptr;
     void* d = nullptr;
-    ck(cudaHostAlloc(&h, n * sizeof(T) + 64, cudaHostAllocMapped), "hostalloc");
+    ck(hipHostAlloc(&h, n * sizeof(T) + 64, hipHostMallocMapped), "hostalloc");
     std::memset(h, 0, n * sizeof(T) + 64);
-    ck(cudaHostGetDevicePointer(&d, h, 0), "devptr");
+    ck(hipHostGetDevicePointer(&d, h, 0), "devptr");
     return (T*) d;
 }
 
@@ -119,7 +120,7 @@ bool run(int fmt) {
     {
         std::vector<int32_t> t(n_blocks);
         for (int64_t i = 0; i < n_blocks; ++i) t[i] = (int32_t) i;
-        ck(cudaMemcpy(ident, t.data(), n_blocks * 4, cudaMemcpyHostToDevice), "ident");
+        ck(hipMemcpy(ident, t.data(), n_blocks * 4, hipMemcpyHostToDevice), "ident");
     }
     k::KvStreamMap m;
     m.page_table = dalloc<int32_t>(n_blocks);
@@ -147,9 +148,9 @@ bool run(int fmt) {
         for (auto& x : hk) x = nd(rng) * ((pos % 17 == 0) ? 30.f : 1.f);
         for (auto& x : hv) x = nd(rng);
         const int32_t st[4] = {(int32_t) pos, (int32_t) (pos + 1), (int32_t) ((pos + 1) / 4), 0};
-        ck(cudaMemcpy(kc, hk.data(), hk.size() * 4, cudaMemcpyHostToDevice), "k");
-        ck(cudaMemcpy(vc, hv.data(), hv.size() * 4, cudaMemcpyHostToDevice), "v");
-        ck(cudaMemcpy(step, st, sizeof(st), cudaMemcpyHostToDevice), "step");
+        ck(hipMemcpy(kc, hk.data(), hk.size() * 4, hipMemcpyHostToDevice), "k");
+        ck(hipMemcpy(vc, hv.data(), hv.size() * 4, hipMemcpyHostToDevice), "v");
+        ck(hipMemcpy(step, st, sizeof(st), hipMemcpyHostToDevice), "step");
         append(ref, ident, step, kc, vc, s, fmt, nullptr);
         append(slots, m.page_table, step, kc, vc, s, fmt, &host.p);
         if (pos % 131 != 130 && pos != N - 1) continue;
@@ -166,21 +167,21 @@ bool run(int fmt) {
             hst[t * 4 + 3] = (int32_t) width;
         }
         for (auto& x : hq) x = nd(rng);
-        ck(cudaMemcpy(ids, hids.data(), hids.size() * 4, cudaMemcpyHostToDevice), "ids");
-        ck(cudaMemcpy(steps, hst.data(), hst.size() * 4, cudaMemcpyHostToDevice), "steps");
-        ck(cudaMemcpy(q, hq.data(), hq.size() * 4, cudaMemcpyHostToDevice), "q");
+        ck(hipMemcpy(ids, hids.data(), hids.size() * 4, hipMemcpyHostToDevice), "ids");
+        ck(hipMemcpy(steps, hst.data(), hst.size() * 4, hipMemcpyHostToDevice), "steps");
+        ck(hipMemcpy(q, hq.data(), hq.size() * 4, hipMemcpyHostToDevice), "q");
         k::qsa_decode_attn_batch(q, ref.attn(ident), ids, steps, cap, s, scratch, out_ref, n_q, nullptr);
         k::kv_stream_resolve(m, slots.attn(m.page_table), host.p, fmt, ids, steps, n_q, cap, s, nullptr);
         k::qsa_decode_attn_batch(q, slots.attn(m.page_table), ids, steps, cap, s, scratch, out_str, n_q, nullptr);
-        ck(cudaDeviceSynchronize(), "batch");
-        ck(cudaMemcpy(a.data(), out_ref, (size_t) n_q * NH * D * 4, cudaMemcpyDeviceToHost), "a");
-        ck(cudaMemcpy(b2.data(), out_str, (size_t) n_q * NH * D * 4, cudaMemcpyDeviceToHost), "b");
+        ck(hipDeviceSynchronize(), "batch");
+        ck(hipMemcpy(a.data(), out_ref, (size_t) n_q * NH * D * 4, hipMemcpyDeviceToHost), "a");
+        ck(hipMemcpy(b2.data(), out_str, (size_t) n_q * NH * D * 4, hipMemcpyDeviceToHost), "b");
         if (std::memcmp(a.data(), b2.data(), (size_t) n_q * NH * D * 4) != 0) {
             if (bad++ < 5) std::fprintf(stderr, "  %s pos %lld n_q %d: streamed attention differs\n", name, (long long) pos, n_q);
         }
         // the map inverts itself
-        ck(cudaMemcpy(pt.data(), m.page_table, n_blocks * 4, cudaMemcpyDeviceToHost), "pt");
-        ck(cudaMemcpy(sb.data(), m.slot_block, n_slots * 4, cudaMemcpyDeviceToHost), "sb");
+        ck(hipMemcpy(pt.data(), m.page_table, n_blocks * 4, hipMemcpyDeviceToHost), "pt");
+        ck(hipMemcpy(sb.data(), m.slot_block, n_slots * 4, hipMemcpyDeviceToHost), "sb");
         int64_t resident = 0;
         for (int64_t bk = 0; bk < n_blocks; ++bk) {
             if (pt[bk] < -1 || pt[bk] >= n_slots || (pt[bk] >= 0 && sb[pt[bk]] != bk)) {
@@ -210,13 +211,13 @@ bool run(int fmt) {
         const int64_t width = cap;
         std::vector<int32_t> hids((size_t) cap), hst = {(int32_t) (N - 1), (int32_t) N, (int32_t) (N / 4), (int32_t) width};
         for (int64_t i = 0; i < width; ++i) hids[i] = (int32_t) (N - width + i);   // the window's last cells
-        ck(cudaMemcpy(ids, hids.data(), hids.size() * 4, cudaMemcpyHostToDevice), "ids");
-        ck(cudaMemcpy(steps, hst.data(), 16, cudaMemcpyHostToDevice), "steps");
+        ck(hipMemcpy(ids, hids.data(), hids.size() * 4, hipMemcpyHostToDevice), "ids");
+        ck(hipMemcpy(steps, hst.data(), 16, hipMemcpyHostToDevice), "steps");
         k::qsa_decode_attn_batch(q, ref.attn(ident), ids, steps, cap, s, scratch, out_ref, 1, nullptr);
         k::qsa_decode_attn_batch(q, ring.attn(rt), ids, steps, cap, s, scratch, out_str, 1, nullptr);
-        ck(cudaDeviceSynchronize(), "ring");
-        ck(cudaMemcpy(a.data(), out_ref, (size_t) NH * D * 4, cudaMemcpyDeviceToHost), "a");
-        ck(cudaMemcpy(b2.data(), out_str, (size_t) NH * D * 4, cudaMemcpyDeviceToHost), "b");
+        ck(hipDeviceSynchronize(), "ring");
+        ck(hipMemcpy(a.data(), out_ref, (size_t) NH * D * 4, hipMemcpyDeviceToHost), "a");
+        ck(hipMemcpy(b2.data(), out_str, (size_t) NH * D * 4, hipMemcpyDeviceToHost), "b");
         const bool ok = std::memcmp(a.data(), b2.data(), (size_t) NH * D * 4) == 0;
         std::printf("  %s ring restore: %s\n", name, ok ? "identical" : "DIFFERS");
         if (!ok) ++bad;
@@ -232,3 +233,4 @@ int main() {
     std::printf(g_fail ? "FAIL\n" : "PASS\n");
     return g_fail ? 1 : 0;
 }
+

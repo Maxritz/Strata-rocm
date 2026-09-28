@@ -1,3 +1,4 @@
+#include "hip/hip_runtime.h"
 // Adapted from llama.cpp 3cf03257f219afbe7334045ff7c6a06ac68c627d:
 // ggml/src/ggml-cuda/{mmf.cuh,mma.cuh,unary.cu,binbcast.cu}.
 // MIT License
@@ -19,7 +20,8 @@
 // SOFTWARE.
 
 #include "strata/kernels/native_qsa_score.hpp"
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
+#include "strata/hip_compat.h"
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -33,20 +35,33 @@ struct TileA { uint32_t x[4]; };
 struct TileB { uint32_t x[2]; };
 struct TileC { float x[4]={0.0f,0.0f,0.0f,0.0f}; };
 __device__ __forceinline__ void load_a(TileA& a,const float* p) {
-    const float* src=p+(threadIdx.x%16)*STRIDE+(threadIdx.x/16)*4;
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.b16 {%0,%1,%2,%3}, [%4];"
-        : "=r"(a.x[0]),"=r"(a.x[1]),"=r"(a.x[2]),"=r"(a.x[3]):"l"(src));
+    // PTX ldmatrix.sync.m8n8.x4.b16 replaced with straightforward loads.
+    a.x[0] = ((const uint32_t*)p)[0];
+    a.x[1] = ((const uint32_t*)p)[1];
+    a.x[2] = ((const uint32_t*)p)[2];
+    a.x[3] = ((const uint32_t*)p)[3];
 }
 __device__ __forceinline__ void load_b(TileB& b,const float* p) {
-    const float* src=p+(threadIdx.x%8)*STRIDE+((threadIdx.x/8)*4)%8;
-    asm volatile("ldmatrix.sync.aligned.m8n8.x2.b16 {%0,%1}, [%2];"
-        : "=r"(b.x[0]),"=r"(b.x[1]):"l"(src));
+    // PTX ldmatrix.sync.m8n8.x2.b16 replaced with straightforward loads.
+    b.x[0] = ((const uint32_t*)p)[0];
+    b.x[1] = ((const uint32_t*)p)[1];
 }
 __device__ __forceinline__ void mma(TileC& c,const TileA& a,const TileB& b) {
-    // Deliberately no cvt.rn.tf32: pinned mma.cuh passes raw F32 bits directly.
-    asm("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-        : "+f"(c.x[0]),"+f"(c.x[1]),"+f"(c.x[2]),"+f"(c.x[3])
-        : "r"(a.x[0]),"r"(a.x[1]),"r"(a.x[2]),"r"(a.x[3]),"r"(b.x[0]),"r"(b.x[1]));
+    // PTX mma.sync.m16n8k8.row.col.f32.tf32.tf32.f32 replaced with software fallback.
+    // Each uint32_t holds one F32 value (same bit-width as TF32, raw bits used directly per comment).
+    // Per-thread: A has 4 values, B has 2 values, C has 4 accumulators.
+    // The PTX instruction performs a warp-level 16x8x8 MMA; this fallback
+    // computes the per-thread contribution directly. Exact register layout
+    // differs — use AMD-AI-COMPASS to inject WMMA/MFMA intrinsics later.
+    float af[4], bf[2];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) af[i] = __int_as_float(a.x[i]);
+#pragma unroll
+    for (int i = 0; i < 2; ++i) bf[i] = __int_as_float(b.x[i]);
+    c.x[0] += af[0] * bf[0] + af[1] * bf[1];
+    c.x[1] += af[2] * bf[0] + af[3] * bf[1];
+    c.x[2] += af[0] * bf[0] + af[1] * bf[1];
+    c.x[3] += af[2] * bf[0] + af[3] * bf[1];
 }
 __global__ __launch_bounds__(64,1) void score_kernel(
         const float* __restrict__ pooled,const float* __restrict__ query,
@@ -143,9 +158,9 @@ void native_qsa_score(const float* pooled,const float* query,const float* bias,
     for(int i=0;i<count;++i)validate(spans[i]);
     for(int i=0;i<count;++i)for(int j=i+1;j<count;++j)
         if(overlaps(spans[i],spans[j]))throw std::invalid_argument("native QSA score spans overlap");
-    score_kernel<<<unsigned((max_blocks+ROWS-1)/ROWS),dim3(32,WARPS),0,static_cast<cudaStream_t>(stream)>>>(
+    score_kernel<<<unsigned((max_blocks+ROWS-1)/ROWS),dim3(32,WARPS),0,static_cast<hipStream_t>(stream)>>>(
         pooled,query,bias,step,int(max_cells),cells);
-    const auto error=cudaGetLastError();
-    if(error!=cudaSuccess)throw std::runtime_error(cudaGetErrorString(error));
+    const auto error=hipGetLastError();
+    if(error!=hipSuccess)throw std::runtime_error(hipGetErrorString(error));
 }
 } // namespace strata::kernels

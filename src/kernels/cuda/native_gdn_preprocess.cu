@@ -1,3 +1,4 @@
+#include "hip/hip_runtime.h"
 // Adapted from llama.cpp 3cf03257f219afbe7334045ff7c6a06ac68c627d:
 // ggml/src/ggml-cuda/{norm.cu,common.cuh,unary.cu,unary.cuh,ssm-conv.cu,scale.cu}.
 // Compile with --use_fast_math, as the pinned backend does.
@@ -23,7 +24,8 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 #include "strata/kernels/native_gdn_preprocess.hpp"
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
+#include "strata/hip_compat.h"
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -37,7 +39,7 @@ constexpr int S = 128;
 __device__ __forceinline__ float warp_sum(float value) {
 #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1)
-        value += __shfl_xor_sync(0xffffffffu, value, offset, 32);
+        value += __shfl_xor_sync(0xffffffffffffffffull, value, offset, 32);
     return value;
 }
 __device__ __forceinline__ float norm_sum(float value, float* sums) {
@@ -134,8 +136,8 @@ void norm_geometry(int64_t rows, int64_t cols, float epsilon, void* stream) {
         throw std::invalid_argument("native GDN norm requires width 128 and finite nonnegative epsilon");
 }
 void check_launch() {
-    const auto error = cudaGetLastError();
-    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+    const auto error = hipGetLastError();
+    if (error != hipSuccess) throw std::runtime_error(hipGetErrorString(error));
 }
 }
 
@@ -153,20 +155,20 @@ void native_gdn_conv_silu(float* history, const float* input, const float* weigh
         for (int j = 0; j < i; ++j) disjoint(writable[i], writable[j]);
         for (auto span : inputs) disjoint(writable[i], span);
     }
-    conv_silu<<<unsigned((channels + 255) / 256), 256, 0, static_cast<cudaStream_t>(stream)>>>(
+    conv_silu<<<unsigned((channels + 255) / 256), 256, 0, static_cast<hipStream_t>(stream)>>>(
         history, input, weights, raw_output, silu_output, int(channels));
     check_launch();
 }
 void native_gdn_l2_norm(float* input, int64_t rows, int64_t cols, float epsilon, void* stream) {
     norm_geometry(rows, cols, epsilon, stream);
     valid({input, size_t(rows) * S * sizeof(float)});
-    l2_norm<<<unsigned(rows), 256, 0, static_cast<cudaStream_t>(stream)>>>(input, epsilon / S, 1.0f / sqrtf(float(S)));
+    l2_norm<<<unsigned(rows), 256, 0, static_cast<hipStream_t>(stream)>>>(input, epsilon / S, 1.0f / sqrtf(float(S)));
     check_launch();
 }
 void native_gdn_beta_gate(float* beta, int64_t heads, void* stream) {
     count_and_stream(heads, stream);
     valid({beta, size_t(heads) * sizeof(float)});
-    beta_sigmoid<<<unsigned((heads + 255) / 256), 256, 0, static_cast<cudaStream_t>(stream)>>>(beta, int(heads));
+    beta_sigmoid<<<unsigned((heads + 255) / 256), 256, 0, static_cast<hipStream_t>(stream)>>>(beta, int(heads));
     check_launch();
 }
 void native_gdn_gate(const float* alpha, const float* dt, const float* ssm_a,
@@ -179,7 +181,7 @@ void native_gdn_gate(const float* alpha, const float* dt, const float* ssm_a,
         valid(input);
         disjoint(output, input);
     }
-    gate_softplus<<<unsigned((heads + 255) / 256), 256, 0, static_cast<cudaStream_t>(stream)>>>(alpha, dt, ssm_a, gate, int(heads));
+    gate_softplus<<<unsigned((heads + 255) / 256), 256, 0, static_cast<hipStream_t>(stream)>>>(alpha, dt, ssm_a, gate, int(heads));
     check_launch();
 }
 void native_gdn_out_norm(const float* output, const float* z, const float* gamma,
@@ -193,7 +195,7 @@ void native_gdn_out_norm(const float* output, const float* z, const float* gamma
         valid(input);
         disjoint(writable, input);
     }
-    out_norm<<<unsigned(heads), 256, 0, static_cast<cudaStream_t>(stream)>>>(output, z, gamma, destination, epsilon);
+    out_norm<<<unsigned(heads), 256, 0, static_cast<hipStream_t>(stream)>>>(output, z, gamma, destination, epsilon);
     check_launch();
 }
 } // namespace strata::kernels

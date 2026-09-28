@@ -1,3 +1,4 @@
+#include "hip/hip_runtime.h"
 // Adapted from llama.cpp 3cf03257f219afbe7334045ff7c6a06ac68c627d:
 // ggml/src/ggml-cuda/{norm.cu,common.cuh}. Scope: contiguous weighted F32 RMSNorm.
 //
@@ -24,7 +25,7 @@
 
 #include "strata/kernels/native_gr_norm.hpp"
 
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -37,7 +38,7 @@ namespace {
 __device__ __forceinline__ float norm_warp_sum(float value) {
 #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
-        value += __shfl_xor_sync(0xffffffffu, value, offset, 32);
+        value += __shfl_xor_sync(0xffffffffffffffffull, value, offset, 32);
     }
     return value;
 }
@@ -89,14 +90,14 @@ void native_gr_rms_norm_weighted(const float* input, const float* gamma, float* 
     check_pointer(input);
     check_pointer(gamma);
     check_pointer(output);
-    const auto cuda_stream = static_cast<cudaStream_t>(stream);
+    const auto cuda_stream = static_cast<hipStream_t>(stream);
     if (n_cols < 1024)
         weighted_rms_norm<256><<<unsigned(n_rows), 256, 0, cuda_stream>>>(input, gamma, output, n_cols, epsilon);
     else
         weighted_rms_norm<1024><<<unsigned(n_rows), 1024, 0, cuda_stream>>>(input, gamma, output, n_cols, epsilon);
-    const auto error = cudaGetLastError();
-    if (error != cudaSuccess)
-        throw std::runtime_error(std::string("native GR RMSNorm launch: ") + cudaGetErrorString(error));
+    const auto error = hipGetLastError();
+    if (error != hipSuccess)
+        throw std::runtime_error(std::string("native GR RMSNorm launch: ") + hipGetErrorString(error));
 }
 
 } // namespace strata::kernels

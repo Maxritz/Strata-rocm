@@ -1,3 +1,4 @@
+﻿#include "hip/hip_runtime.h"
 // src/kernels/qsa_parity.cpp - P2.S2's test for the QSA cache, indexer, selection and attention.
 //
 // `ref/qsa.py` carries eleven PROPERTY checks and `ref/model.py::_qsa` is the layer as the model runs it.  The
@@ -51,7 +52,7 @@
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/rope.hpp"
 
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
 
 #include <algorithm>
 #include <cmath>
@@ -68,9 +69,9 @@ namespace {
 using strata::kernels::f16_from_f32;
 using strata::kernels::f32_from_f16;
 
-void check(cudaError_t e, const char* what) {
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e));
+void check(hipError_t e, const char* what) {
+    if (e != hipSuccess) {
+        std::fprintf(stderr, "%s: %s\n", what, hipGetErrorString(e));
         std::exit(1);
     }
 }
@@ -82,20 +83,20 @@ struct Dev {
     T* p = nullptr;
     Dev() = default;
     explicit Dev(size_t n) { alloc(n); }
-    ~Dev() { if (p) cudaFree(p); }
+    ~Dev() { if (p) hipFree(p); }
     Dev(const Dev&) = delete;
     Dev& operator=(const Dev&) = delete;
     void alloc(size_t n) {
-        if (p) { cudaFree(p); p = nullptr; }
-        if (n) check(cudaMalloc(&p, n * sizeof(T)), "cudaMalloc");
+        if (p) { hipFree(p); p = nullptr; }
+        if (n) check(hipMalloc(&p, n * sizeof(T)), "hipMalloc");
     }
     void put(const std::vector<T>& v) {
         if (!p) alloc(v.size());
-        check(cudaMemcpy(p, v.data(), v.size() * sizeof(T), cudaMemcpyHostToDevice), "H2D");
+        check(hipMemcpy(p, v.data(), v.size() * sizeof(T), hipMemcpyHostToDevice), "H2D");
     }
     std::vector<T> get(size_t n) const {
         std::vector<T> v(n);
-        check(cudaMemcpy(v.data(), p, n * sizeof(T), cudaMemcpyDeviceToHost), "D2H");
+        check(hipMemcpy(v.data(), p, n * sizeof(T), hipMemcpyDeviceToHost), "D2H");
         return v;
     }
 };
@@ -573,10 +574,10 @@ int main(int argc, char** argv) {
         strata::kernels::QsaIndexerBuffers bufs{dtail.p, ddead.p, dpooled.p, dblockpos.p};
         Dev<float> draw((size_t) IDXD);
         for (int64_t t = 0; t < NT; ++t) {      // one cell at a time: the tail is a ring and the spare row MOVES
-            check(cudaMemcpy(draw.p, &raw_flat[(size_t) t * IDXD], (size_t) IDXD * 4, cudaMemcpyHostToDevice),
+            check(hipMemcpy(draw.p, &raw_flat[(size_t) t * IDXD], (size_t) IDXD * 4, hipMemcpyHostToDevice),
                   "raw");
             const int32_t tpos = (int32_t) t;
-            check(cudaMemcpy(dpos.p, &tpos, 4, cudaMemcpyHostToDevice), "pos");
+            check(hipMemcpy(dpos.p, &tpos, 4, hipMemcpyHostToDevice), "pos");
             strata::kernels::indexer_key_append(draw.p, dpos.p, POS_BASE, dw_kn.p, EPS, bufs, S, dcos.p, dsin.p,
                                                 nullptr);
         }
@@ -767,15 +768,15 @@ int main(int argc, char** argv) {
         pooled.put(std::vector<float>((size_t) max_blocks * IDXD, 0.0f));
         query.put(std::vector<float>((size_t) IDXN * IDXD, 0.0f));
 
-        cudaStream_t stream;
-        cudaGraph_t graph;
-        cudaGraphExec_t exec;
-        check(cudaStreamCreate(&stream), "tail stream");
-        check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "tail capture begin");
+        hipStream_t stream;
+        hipGraph_t graph;
+        hipGraphExec_t exec;
+        check(hipStreamCreate(&stream), "tail stream");
+        check(hipStreamBeginCapture(stream, hipStreamCaptureModeThreadLocal), "tail capture begin");
         strata::kernels::qsa_index_step(pooled.p, query.p, nullptr, S, step.p, max_blocks, scores.p, stream);
         strata::kernels::topk_512_step(scores.p, S, cap, step.p, ids.p, stream);
-        check(cudaStreamEndCapture(stream, &graph), "tail capture end");
-        check(cudaGraphInstantiate(&exec, graph, 0), "tail instantiate");
+        check(hipStreamEndCapture(stream, &graph), "tail capture end");
+        check(hipGraphInstantiateWithFlags(&exec, graph, 0), "tail instantiate");
 
         const std::vector<int64_t> counts = {
             1, 2, 3, 4, 511, 512, 513, 2046, 2047, 2048, 2049, 2050, 2051,
@@ -795,8 +796,8 @@ int main(int argc, char** argv) {
             std::vector<int32_t> values(strata::kernels::kStepCount);
             strata::kernels::qsa_step_fill(values.data(), n - 1, S);
             step.put(values);
-            check(cudaGraphLaunch(exec, stream), "tail replay");
-            check(cudaStreamSynchronize(stream), "tail replay sync");
+            check(hipGraphLaunch(exec, stream), "tail replay");
+            check(hipStreamSynchronize(stream), "tail replay sync");
             require("tail captured n=" + std::to_string(n), ids.get((size_t) width) == want);
             const auto actual_scores = scores.get((size_t) n);
             bool exact_scores = true;
@@ -806,9 +807,9 @@ int main(int argc, char** argv) {
             }
             require("  only incomplete cells receive the bias", exact_scores);
         }
-        check(cudaGraphExecDestroy(exec), "tail exec destroy");
-        check(cudaGraphDestroy(graph), "tail graph destroy");
-        check(cudaStreamDestroy(stream), "tail stream destroy");
+        check(hipGraphExecDestroy(exec), "tail exec destroy");
+        check(hipGraphDestroy(graph), "tail graph destroy");
+        check(hipStreamDestroy(stream), "tail stream destroy");
     }
 
     // ================= 4. topk_512, against an independent sort =================
@@ -1028,9 +1029,9 @@ int main(int argc, char** argv) {
         Dev<float> draw((size_t) IDXD);
         strata::kernels::QsaIndexerBuffers bufs{dptail.p, dpdead.p, dpp.p, dblockpos2.p};
         for (int64_t t = 0; t < T; ++t) {
-            check(cudaMemcpy(draw.p, &praw[(size_t) t * IDXD], (size_t) IDXD * 4, cudaMemcpyHostToDevice), "raw");
+            check(hipMemcpy(draw.p, &praw[(size_t) t * IDXD], (size_t) IDXD * 4, hipMemcpyHostToDevice), "raw");
             const int32_t tpos = (int32_t) t;
-            check(cudaMemcpy(dpos2.p, &tpos, 4, cudaMemcpyHostToDevice), "pos2");
+            check(hipMemcpy(dpos2.p, &tpos, 4, hipMemcpyHostToDevice), "pos2");
             strata::kernels::indexer_key_append(draw.p, dpos2.p, 0, dw_kn.p, EPS, bufs, S, dcos.p, dsin.p,
                                                 nullptr);
         }
@@ -1248,20 +1249,20 @@ int main(int argc, char** argv) {
         dq.put(qv);
 
         auto timeit = [&](const std::string& name, int reps, const std::function<void()>& fn) {
-            cudaEvent_t a, b;
-            cudaEventCreate(&a);
-            cudaEventCreate(&b);
+            hipEvent_t a, b;
+            hipEventCreate(&a);
+            hipEventCreate(&b);
             fn();
-            cudaDeviceSynchronize();
-            cudaEventRecord(a);
+            hipDeviceSynchronize();
+            hipEventRecord(a);
             for (int i = 0; i < reps; ++i) fn();
-            cudaEventRecord(b);
-            cudaEventSynchronize(b);
+            hipEventRecord(b);
+            hipEventSynchronize(b);
             float ms = 0;
-            cudaEventElapsedTime(&ms, a, b);
+            hipEventElapsedTime(&ms, a, b);
             std::printf("  %-48s %8.1f us\n", name.c_str(), ms * 1000.0f / (float) reps);
-            cudaEventDestroy(a);
-            cudaEventDestroy(b);
+            hipEventDestroy(a);
+            hipEventDestroy(b);
         };
         const int reps = 20;
         timeit("qsa_index  (8193 pooled rows x 4 heads)", reps,
@@ -1312,36 +1313,36 @@ int main(int argc, char** argv) {
         strata::kernels::QsaIndexerBuffers bufs2{tail2.p, dead2.p, pooled2.p, bpos2.p};
 
         // capture ONE call, on its own stream
-        cudaStream_t cs = nullptr;
-        check(cudaStreamCreate(&cs), "cs");
-        check(cudaStreamBeginCapture(cs, cudaStreamCaptureModeThreadLocal), "begincap");
+        hipStream_t cs = nullptr;
+        check(hipStreamCreate(&cs), "cs");
+        check(hipStreamBeginCapture(cs, hipStreamCaptureModeThreadLocal), "begincap");
         strata::kernels::indexer_key_append(raw2d.p, pos2.p, POS_BASE, dw_kn.p, EPS, bufs2, S, dcos.p, dsin.p,
                                             (void*) cs);
-        cudaGraph_t g2 = nullptr;
-        check(cudaStreamEndCapture(cs, &g2), "endcap");
-        check(cudaStreamDestroy(cs), "csd");
+        hipGraph_t g2 = nullptr;
+        check(hipStreamEndCapture(cs, &g2), "endcap");
+        check(hipStreamDestroy(cs), "csd");
         size_t nodes2 = 0;
-        check(cudaGraphGetNodes(g2, nullptr, &nodes2), "nodes");
-        cudaGraphExec_t ex2 = nullptr;
-        check(cudaGraphInstantiate(&ex2, g2, 0), "inst");
+        check(hipGraphGetNodes(g2, nullptr, &nodes2), "nodes");
+        hipGraphExec_t ex2 = nullptr;
+        check(hipGraphInstantiateWithFlags(&ex2, g2, 0), "inst");
 
         // replay A: cells 0..3, which completes block 0
         for (int t = 0; t < 4; ++t) {
-            check(cudaMemcpy(raw2d.p, &raw2[(size_t) t * IDXD2], IDXD2 * 4, cudaMemcpyHostToDevice), "r2");
+            check(hipMemcpy(raw2d.p, &raw2[(size_t) t * IDXD2], IDXD2 * 4, hipMemcpyHostToDevice), "r2");
             const int32_t tp = t;
-            check(cudaMemcpy(pos2.p, &tp, 4, cudaMemcpyHostToDevice), "p2");
-            check(cudaGraphLaunch(ex2, nullptr), "launchA");
+            check(hipMemcpy(pos2.p, &tp, 4, hipMemcpyHostToDevice), "p2");
+            check(hipGraphLaunch(ex2, nullptr), "launchA");
         }
         const std::vector<float> afterA = pooled2.get((size_t) (nb2 + 2) * IDXD2);
 
         // replay B: cells 4..7 through the SAME graph, which completes block 1
         for (int t = 4; t < 8; ++t) {
-            check(cudaMemcpy(raw2d.p, &raw2[(size_t) t * IDXD2], IDXD2 * 4, cudaMemcpyHostToDevice), "r3");
+            check(hipMemcpy(raw2d.p, &raw2[(size_t) t * IDXD2], IDXD2 * 4, hipMemcpyHostToDevice), "r3");
             const int32_t tp = t;
-            check(cudaMemcpy(pos2.p, &tp, 4, cudaMemcpyHostToDevice), "p3");
-            check(cudaGraphLaunch(ex2, nullptr), "launchB");
+            check(hipMemcpy(pos2.p, &tp, 4, hipMemcpyHostToDevice), "p3");
+            check(hipGraphLaunch(ex2, nullptr), "launchB");
         }
-        check(cudaDeviceSynchronize(), "sync2");
+        check(hipDeviceSynchronize(), "sync2");
         const std::vector<float> afterB = pooled2.get((size_t) (nb2 + 2) * IDXD2);
 
         std::printf("  %-44s %zu nodes for one call\n", "the pooled kernel is capturable", nodes2);
@@ -1372,8 +1373,8 @@ int main(int argc, char** argv) {
         // assertions together are the negative control for the refactor.
         if (rows_differ != (int) IDXD2) ++g_bad;
 
-        check(cudaGraphExecDestroy(ex2), "exd");
-        check(cudaGraphDestroy(g2), "gd");
+        check(hipGraphExecDestroy(ex2), "exd");
+        check(hipGraphDestroy(g2), "gd");
     }
 
     std::printf("\nqsa: %d failures\n", g_bad);
@@ -1381,3 +1382,4 @@ int main(int argc, char** argv) {
     if (selftest) std::printf("qsa_parity OK\n");
     return 0;
 }
+

@@ -1,3 +1,4 @@
+#include "hip/hip_runtime.h"
 // src/kernels/cuda/s_gemv.cu - P2.S2: the S-family GEMV, one thread per output row.
 //
 // Naive per the phase rule: dequantize on the fly, FP32 accumulation inside the row, no shared memory, no
@@ -6,8 +7,8 @@
 // tensor and a 13-way switch inside the inner loop would be the naive-but-wrong kind of naive.
 #include "strata/kernels/s_gemv.hpp"
 
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
+#include <hip/hip_fp16.h>
+#include <hip/hip_runtime.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -288,7 +289,7 @@ __global__ void s_gemv_q8_split_kernel(const uint8_t* __restrict__ x, const uint
     }
     float acc = (((acc0 + acc1) + (acc2 + acc3)) + ((acc4 + acc5) + (acc6 + acc7))) +
                 (((acc8 + acc9) + (acc10 + acc11)) + ((acc12 + acc13) + (acc14 + acc15)));
-    for (int step = 16; step > 0; step >>= 1) acc += __shfl_down_sync(0xFFFFFFFFu, acc, step);
+    for (int step = 16; step > 0; step >>= 1) acc += __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, acc, step, 32);
     if (lane == 0) y[o] = acc;
 }
 
@@ -370,9 +371,9 @@ void s_gemv(const uint16_t* x, const uint8_t* codes, const float* scales, const 
             std::fprintf(stderr, "s_gemv: unsupported code_bits %d\n", form.code_bits);
             std::exit(1);
     }
-    const cudaError_t e = cudaDeviceSynchronize();
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "s_gemv: %s\n", cudaGetErrorString(e));
+    const hipError_t e = hipDeviceSynchronize();
+    if (e != hipSuccess) {
+        std::fprintf(stderr, "s_gemv: %s\n", hipGetErrorString(e));
         std::exit(1);
     }
 }
@@ -471,7 +472,7 @@ __global__ void s_gemv_split_kernel(const uint16_t* __restrict__ x, const uint8_
 
 static void s_gemv_split_impl(const uint16_t* x, const uint8_t* codes, const float* scales,
                                const float* offset, float* y, int64_t n_in, int64_t n_out, const SForm& form,
-                               int threads_per_row, cudaStream_t stream, bool sync) {
+                               int threads_per_row, hipStream_t stream, bool sync) {
     if (n_in <= 0 || n_out <= 0) return;
     if (threads_per_row < 1 || (threads_per_row & (threads_per_row - 1)) != 0 || threads_per_row > 1024) {
         std::fprintf(stderr, "s_gemv_split: threads_per_row must be a power of two in 1..1024, got %d\n",
@@ -516,9 +517,9 @@ static void s_gemv_split_impl(const uint16_t* x, const uint8_t* codes, const flo
             std::exit(1);
     }
     if (sync) {
-        const cudaError_t e = cudaDeviceSynchronize();
-        if (e != cudaSuccess) {
-            std::fprintf(stderr, "s_gemv_split: %s\n", cudaGetErrorString(e));
+        const hipError_t e = hipDeviceSynchronize();
+        if (e != hipSuccess) {
+            std::fprintf(stderr, "s_gemv_split: %s\n", hipGetErrorString(e));
             std::exit(1);
         }
     }
@@ -526,13 +527,13 @@ static void s_gemv_split_impl(const uint16_t* x, const uint8_t* codes, const flo
 
 void s_gemv_split(const uint16_t* x, const uint8_t* codes, const float* scales, const float* offset,
                   float* y, int64_t n_in, int64_t n_out, const SForm& form, int threads_per_row) {
-    s_gemv_split_impl(x, codes, scales, offset, y, n_in, n_out, form, threads_per_row, (cudaStream_t) 0, true);
+    s_gemv_split_impl(x, codes, scales, offset, y, n_in, n_out, form, threads_per_row, (hipStream_t) 0, true);
 }
 
 void s_gemv_split_async(const uint16_t* x, const uint8_t* codes, const float* scales, const float* offset,
                         float* y, int64_t n_in, int64_t n_out, const SForm& form, int threads_per_row,
                         void* stream) {
-    s_gemv_split_impl(x, codes, scales, offset, y, n_in, n_out, form, threads_per_row, (cudaStream_t) stream,
+    s_gemv_split_impl(x, codes, scales, offset, y, n_in, n_out, form, threads_per_row, (hipStream_t) stream,
                       false);
 }
 
@@ -556,15 +557,15 @@ bool q8k_form_ok(const SForm& form, int64_t n_in, const char* who) {
 }
 
 void finish(const char* who, void* stream) {
-    const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "%s launch: %s\n", who, cudaGetErrorString(e));
+    const hipError_t e = hipGetLastError();
+    if (e != hipSuccess) {
+        std::fprintf(stderr, "%s launch: %s\n", who, hipGetErrorString(e));
         std::exit(1);
     }
     if (stream != nullptr) return;
-    const cudaError_t s = cudaDeviceSynchronize();
-    if (s != cudaSuccess) {
-        std::fprintf(stderr, "%s: %s\n", who, cudaGetErrorString(s));
+    const hipError_t s = hipDeviceSynchronize();
+    if (s != hipSuccess) {
+        std::fprintf(stderr, "%s: %s\n", who, hipGetErrorString(s));
         std::exit(1);
     }
 }
@@ -581,11 +582,11 @@ void s_gemv_q8k(const uint8_t* x_q8k, const uint8_t* codes, const float* scales,
     const int ho = form.has_offset ? 1 : 0;
     switch (form.code_bits) {
         case 4:
-            s_gemv_q8k_kernel<4><<<blocks, threads, 0, (cudaStream_t) stream>>>(
+            s_gemv_q8k_kernel<4><<<blocks, threads, 0, (hipStream_t) stream>>>(
                 x_q8k, codes, scales, offset, y, n_in, n_out, form.code_bias, cb, form.group_elems, ho);
             break;
         case 8:
-            s_gemv_q8k_kernel<8><<<blocks, threads, 0, (cudaStream_t) stream>>>(
+            s_gemv_q8k_kernel<8><<<blocks, threads, 0, (hipStream_t) stream>>>(
                 x_q8k, codes, scales, offset, y, n_in, n_out, form.code_bias, cb, form.group_elems, ho);
             break;
         default:
@@ -624,11 +625,11 @@ void s_gemv_q8k_split(const uint8_t* x_q8k, const uint8_t* codes, const float* s
     const int ho = form.has_offset ? 1 : 0;
     switch (form.code_bits) {
         case 4:
-            s_gemv_q8_split_kernel<4, true><<<blocks, threads, 0, (cudaStream_t) stream>>>(
+            s_gemv_q8_split_kernel<4, true><<<blocks, threads, 0, (hipStream_t) stream>>>(
                 x_q8k, codes, scales, offset, y, n_in, n_out, form.code_bias, cb, group_shift, ho);
             break;
         case 8:
-            s_gemv_q8_split_kernel<8, true><<<blocks, threads, 0, (cudaStream_t) stream>>>(
+            s_gemv_q8_split_kernel<8, true><<<blocks, threads, 0, (hipStream_t) stream>>>(
                 x_q8k, codes, scales, offset, y, n_in, n_out, form.code_bias, cb, group_shift, ho);
             break;
         default:
@@ -669,11 +670,11 @@ void s_gemv_q8_0_split(const uint8_t* x_q8_0, const uint8_t* codes, const float*
     const int ho = form.has_offset ? 1 : 0;
     switch (form.code_bits) {
         case 4:
-            s_gemv_q8_split_kernel<4, false><<<blocks, threads, 0, (cudaStream_t) stream>>>(
+            s_gemv_q8_split_kernel<4, false><<<blocks, threads, 0, (hipStream_t) stream>>>(
                 x_q8_0, codes, scales, offset, y, n_in, n_out, form.code_bias, cb, group_shift, ho);
             break;
         case 8:
-            s_gemv_q8_split_kernel<8, false><<<blocks, threads, 0, (cudaStream_t) stream>>>(
+            s_gemv_q8_split_kernel<8, false><<<blocks, threads, 0, (hipStream_t) stream>>>(
                 x_q8_0, codes, scales, offset, y, n_in, n_out, form.code_bias, cb, group_shift, ho);
             break;
         default:

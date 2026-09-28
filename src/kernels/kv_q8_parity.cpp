@@ -1,3 +1,4 @@
+﻿#include "hip/hip_runtime.h"
 // src/kernels/kv_q8_parity.cpp - plan v0.3 P7: INT8 KV append/gather against a host reference (GPU, no model).
 //
 // Appends random K/V cells at scattered positions through a non-identity page table into both the INT8 pools
@@ -10,7 +11,7 @@
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/qsa.hpp"
 
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
 
 #include <algorithm>
 #include <cmath>
@@ -23,10 +24,10 @@ namespace k = strata::kernels;
 
 namespace {
 int g_fail = 0;
-void ck(cudaError_t e, const char* w) {
-    if (e != cudaSuccess) { std::fprintf(stderr, "%s: %s\n", w, cudaGetErrorString(e)); std::exit(2); }
+void ck(hipError_t e, const char* w) {
+    if (e != hipSuccess) { std::fprintf(stderr, "%s: %s\n", w, hipGetErrorString(e)); std::exit(2); }
 }
-template <typename T> T* dalloc(size_t n) { T* p = nullptr; ck(cudaMalloc(&p, n * sizeof(T) + 64), "malloc"); ck(cudaMemset(p, 0, n * sizeof(T) + 64), "memset"); return p; }
+template <typename T> T* dalloc(size_t n) { T* p = nullptr; ck(hipMalloc(&p, n * sizeof(T) + 64), "malloc"); ck(hipMemset(p, 0, n * sizeof(T) + 64), "memset"); return p; }
 }  // namespace
 
 int main() {
@@ -38,7 +39,7 @@ int main() {
     std::vector<int32_t> table(pages);
     for (int i = 0; i < pages; ++i) table[i] = (i * 5 + 3) % pages;            // a non-identity permutation
     int32_t* d_table = dalloc<int32_t>(pages);
-    ck(cudaMemcpy(d_table, table.data(), pages * 4, cudaMemcpyHostToDevice), "table");
+    ck(hipMemcpy(d_table, table.data(), pages * 4, hipMemcpyHostToDevice), "table");
     int8_t *kq = dalloc<int8_t>((size_t) cells * H * D), *vq = dalloc<int8_t>((size_t) cells * H * D);
     uint16_t *ks = dalloc<uint16_t>((size_t) cells * H * G), *vs = dalloc<uint16_t>((size_t) cells * H * G);
     uint16_t *kp = dalloc<uint16_t>((size_t) cells * H * D), *vp = dalloc<uint16_t>((size_t) cells * H * D);
@@ -59,20 +60,20 @@ int main() {
         if (n % 13 == 0) std::fill(kv.begin(), kv.begin() + 64, 0.f);              // an all-zero group
         hk[pos] = kv; hv[pos] = vv;
         int32_t hstep[k::kStepCount] = {pos, pos + 1, 0, 0};
-        ck(cudaMemcpy(step, hstep, sizeof hstep, cudaMemcpyHostToDevice), "step");
-        ck(cudaMemcpy(kcur, kv.data(), kv.size() * 4, cudaMemcpyHostToDevice), "k");
-        ck(cudaMemcpy(vcur, vv.data(), vv.size() * 4, cudaMemcpyHostToDevice), "v");
+        ck(hipMemcpy(step, hstep, sizeof hstep, hipMemcpyHostToDevice), "step");
+        ck(hipMemcpy(kcur, kv.data(), kv.size() * 4, hipMemcpyHostToDevice), "k");
+        ck(hipMemcpy(vcur, vv.data(), vv.size() * 4, hipMemcpyHostToDevice), "v");
         k::kv_append_q8_step(kq, vq, ks, vs, d_table, step, kcur, vcur, s, nullptr);
         k::kv_append_step(kp, vp, d_table, step, kcur, vcur, s, nullptr);
-        ck(cudaDeviceSynchronize(), "append");
+        ck(hipDeviceSynchronize(), "append");
     }
     // 1. codes and scales bitwise vs the host reference
     std::vector<int8_t> hkq((size_t) cells * H * D), hvq(hkq.size());
     std::vector<uint16_t> hks((size_t) cells * H * G), hvs(hks.size());
-    ck(cudaMemcpy(hkq.data(), kq, hkq.size(), cudaMemcpyDeviceToHost), "d2h");
-    ck(cudaMemcpy(hvq.data(), vq, hvq.size(), cudaMemcpyDeviceToHost), "d2h");
-    ck(cudaMemcpy(hks.data(), ks, hks.size() * 2, cudaMemcpyDeviceToHost), "d2h");
-    ck(cudaMemcpy(hvs.data(), vs, hvs.size() * 2, cudaMemcpyDeviceToHost), "d2h");
+    ck(hipMemcpy(hkq.data(), kq, hkq.size(), hipMemcpyDeviceToHost), "d2h");
+    ck(hipMemcpy(hvq.data(), vq, hvq.size(), hipMemcpyDeviceToHost), "d2h");
+    ck(hipMemcpy(hks.data(), ks, hks.size() * 2, hipMemcpyDeviceToHost), "d2h");
+    ck(hipMemcpy(hvs.data(), vs, hvs.size() * 2, hipMemcpyDeviceToHost), "d2h");
     long bad_codes = 0;
     for (int n = 0; n < n_fill; ++n) {
         const int pos = positions[n];
@@ -104,17 +105,17 @@ int main() {
         const int n_ids = 1 + (int) (rng() % max_ids);
         std::vector<int32_t> ids(n_ids);
         for (auto& id : ids) id = positions[rng() % n_fill];
-        ck(cudaMemcpy(d_ids, ids.data(), n_ids * 4, cudaMemcpyHostToDevice), "ids");
+        ck(hipMemcpy(d_ids, ids.data(), n_ids * 4, hipMemcpyHostToDevice), "ids");
         int32_t hstep[k::kStepCount] = {0, 0, 0, n_ids};
-        ck(cudaMemcpy(step, hstep, sizeof hstep, cudaMemcpyHostToDevice), "step");
+        ck(hipMemcpy(step, hstep, sizeof hstep, hipMemcpyHostToDevice), "step");
         k::kv_gather_q8_step(kq, vq, ks, vs, d_table, d_ids, step, max_ids, s, k8, v8, nullptr);
         k::kv_gather_step(kp, vp, d_table, d_ids, step, max_ids, s, k16, v16, nullptr);
-        ck(cudaDeviceSynchronize(), "gather");
+        ck(hipDeviceSynchronize(), "gather");
         std::vector<uint16_t> a8((size_t) n_ids * H * D), b8(a8.size()), a16(a8.size()), b16(a8.size());
-        ck(cudaMemcpy(a8.data(), k8, a8.size() * 2, cudaMemcpyDeviceToHost), "d2h");
-        ck(cudaMemcpy(b8.data(), v8, b8.size() * 2, cudaMemcpyDeviceToHost), "d2h");
-        ck(cudaMemcpy(a16.data(), k16, a16.size() * 2, cudaMemcpyDeviceToHost), "d2h");
-        ck(cudaMemcpy(b16.data(), v16, b16.size() * 2, cudaMemcpyDeviceToHost), "d2h");
+        ck(hipMemcpy(a8.data(), k8, a8.size() * 2, hipMemcpyDeviceToHost), "d2h");
+        ck(hipMemcpy(b8.data(), v8, b8.size() * 2, hipMemcpyDeviceToHost), "d2h");
+        ck(hipMemcpy(a16.data(), k16, a16.size() * 2, hipMemcpyDeviceToHost), "d2h");
+        ck(hipMemcpy(b16.data(), v16, b16.size() * 2, hipMemcpyDeviceToHost), "d2h");
         for (int j = 0; j < n_ids; ++j)
             for (int h = 0; h < H; ++h) {
                 const long long row = ((long long) table[ids[j] / P] * H + h) * P + ids[j] % P;
@@ -139,3 +140,4 @@ int main() {
     std::printf("kv_q8_parity: %s (worst INT8-vs-FP16 error %.3f quantization steps)\n", g_fail ? "FAILED" : "OK", worst);
     return g_fail ? 1 : 0;
 }
+

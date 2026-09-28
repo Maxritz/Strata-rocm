@@ -1,8 +1,9 @@
+#include "hip/hip_runtime.h"
 // src/kernels/cuda/kv_q8.cu - see include/strata/kernels/kv_q8.hpp.
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/f16_bits.hpp"
 
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -11,9 +12,9 @@ namespace strata::kernels {
 namespace {
 
 void check(const char* what) {
-    const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "kv_q8: %s: %s\n", what, cudaGetErrorString(e));
+    const hipError_t e = hipGetLastError();
+    if (e != hipSuccess) {
+        std::fprintf(stderr, "kv_q8: %s: %s\n", what, hipGetErrorString(e));
         std::exit(1);
     }
 }
@@ -39,7 +40,7 @@ __global__ void kv_append_q8_kernel(int8_t* __restrict__ k_q, int8_t* __restrict
     const float x = (is_v ? vcur : kcur)[h * head_dim + g * KV_Q8_GROUP + t];
     // max |x| over the 64 values: two warps, then combine through shared memory in a fixed order
     float a = fabsf(x);
-    for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, o));
+    for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffffffffffull, a, o, 32));
     __shared__ float warp_max[2];
     if ((t & 31) == 0) warp_max[t >> 5] = a;
     __syncthreads();
@@ -105,7 +106,7 @@ void kv_append_q8_step(int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_
                        const KvHostPools* host) {
     validate(s, "kv_append_q8");
     const dim3 grid((unsigned) s.n_head_kv, (unsigned) (s.head_dim / KV_Q8_GROUP), 2);
-    kv_append_q8_kernel<<<grid, KV_Q8_GROUP, 0, (cudaStream_t) stream>>>(
+    kv_append_q8_kernel<<<grid, KV_Q8_GROUP, 0, (hipStream_t) stream>>>(
         k_q, v_q, k_scale, v_scale, page_table, step, kcur, vcur, (int) s.n_head_kv, (int) s.head_dim,
         (int) s.page_size, host ? *host : KvHostPools{});
     check("kv_append_q8 launch");
@@ -118,7 +119,7 @@ void kv_gather_q8_step(const int8_t* k_q, const int8_t* v_q, const uint16_t* k_s
     if (max_ids <= 0) return;
     const long long total = max_ids * s.n_head_kv * (s.head_dim / 4);
     const unsigned blocks = (unsigned) ((total + 255) / 256);
-    kv_gather_q8_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>(
+    kv_gather_q8_kernel<<<blocks, 256, 0, (hipStream_t) stream>>>(
         k_q, v_q, k_scale, v_scale, page_table, ids, step, (int) s.n_head_kv, (int) s.head_dim, (int) s.page_size,
         k_scratch, v_scratch);
     check("kv_gather_q8 launch");

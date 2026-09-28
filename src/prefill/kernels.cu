@@ -1,9 +1,10 @@
+#include "hip/hip_runtime.h"
 // src/prefill/kernels.cu - see include/strata/prefill/kernels.hpp.
 #include "strata/prefill/kernels.hpp"
 #include "strata/kernels/mrope.hpp"
 
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
+#include <hip/hip_fp16.h>
+#include <hip/hip_runtime.h>
 
 #include <cfloat>
 #include <cmath>
@@ -18,12 +19,12 @@ constexpr int S = 128, HK = 16, HV = 48, C = 10240;
 
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffffffffffull, v, o, 32);
     return v;
 }
 __device__ __forceinline__ float warp_max(float v) {
 #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffffffffffull, v, o, 32));
     return v;
 }
 __device__ __forceinline__ uint16_t bf(float f) {
@@ -48,8 +49,8 @@ __device__ float block_sum(float v, float* sh) {
     return sh[0];
 }
 void check(const char* what) {
-    const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) { std::fprintf(stderr, "prefill %s: %s\n", what, cudaGetErrorString(e)); std::exit(1); }
+    const hipError_t e = hipGetLastError();
+    if (e != hipSuccess) { std::fprintf(stderr, "prefill %s: %s\n", what, hipGetErrorString(e)); std::exit(1); }
 }
 unsigned blocks_for(int64_t n, int t = 256) { return (unsigned) ((n + t - 1) / t); }
 
@@ -228,8 +229,8 @@ __global__ void route_kernel(const float* __restrict__ logits, int32_t* __restri
         for (int i = 1; i < 16; ++i) if (v[i] > best) { best = v[i]; ex = lane + i * 32; }
 #pragma unroll
         for (int m = 16; m; m >>= 1) {
-            const float ob = __shfl_xor_sync(0xffffffffu, best, m);
-            const int oi = __shfl_xor_sync(0xffffffffu, ex, m);
+            const float ob = __shfl_xor_sync(0xffffffffffffffffull, best, m, 32);
+            const int oi = __shfl_xor_sync(0xffffffffffffffffull, ex, m, 32);
             if (ob > best || (ob == best && oi < ex)) { best = ob; ex = oi; }
         }
         if ((ex & 31) == lane) { v[ex / 32] = -INFINITY; selected_sum += best; }
@@ -358,7 +359,7 @@ __global__ void kv_append_kernel(const float* __restrict__ K, const float* __res
         return;
     }
     float a = fabsf(x);
-    for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, o));
+    for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffffffffffull, a, o, 32));
     __shared__ float wm[2];
     if ((threadIdx.x & 31) == 0) wm[threadIdx.x >> 5] = a;
     __syncthreads();
@@ -399,109 +400,109 @@ void kv_append(const float* K, const float* V, int64_t T, int64_t pos0, const in
                uint16_t* k_pool, uint16_t* v_pool, int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_scale,
                void* stream, const strata::kernels::KvHostPools* host, const strata::kernels::KvHostPools* stage) {
     if (T <= 0) return;
-    kv_append_kernel<<<dim3((unsigned) T, 2, 8), 64, 0, (cudaStream_t) stream>>>(
+    kv_append_kernel<<<dim3((unsigned) T, 2, 8), 64, 0, (hipStream_t) stream>>>(
         K, V, pos0, page_table, page_size, k_pool, v_pool, k_q, v_q, k_scale, v_scale,
         host ? *host : strata::kernels::KvHostPools{}, stage ? *stage : strata::kernels::KvHostPools{});
     check("kv_append");
 }
 void to_f16(const float* x, uint16_t* y, int64_t n, void* stream) {
     if (n <= 0) return;
-    to_f16_kernel<<<(unsigned) ((n + 255) / 256 < 4096 ? (n + 255) / 256 : 4096), 256, 0, (cudaStream_t) stream>>>(x, y, n);
+    to_f16_kernel<<<(unsigned) ((n + 255) / 256 < 4096 ? (n + 255) / 256 : 4096), 256, 0, (hipStream_t) stream>>>(x, y, n);
     check("to_f16");
 }
 void round_f16(const float* x, float* y, int64_t n, void* stream) {
     if (n <= 0) return;
-    round_f16_kernel<<<(unsigned) ((n + 255) / 256 < 4096 ? (n + 255) / 256 : 4096), 256, 0, (cudaStream_t) stream>>>(x, y, n);
+    round_f16_kernel<<<(unsigned) ((n + 255) / 256 < 4096 ? (n + 255) / 256 : 4096), 256, 0, (hipStream_t) stream>>>(x, y, n);
     check("round_f16");
 }
 void to_bf16(const float* x, uint16_t* y, int64_t n, void* stream) {
     if (n <= 0) return;
-    to_bf16_kernel<<<(unsigned) ((n + 255) / 256 < 4096 ? (n + 255) / 256 : 4096), 256, 0, (cudaStream_t) stream>>>(x, y, n);
+    to_bf16_kernel<<<(unsigned) ((n + 255) / 256 < 4096 ? (n + 255) / 256 : 4096), 256, 0, (hipStream_t) stream>>>(x, y, n);
     check("to_bf16");
 }
 
 void gr_norm(const float* R, const float* w_norm, float eps, float* xn, uint16_t* xn16, int64_t T, void* stream) {
-    gr_norm_kernel<<<(unsigned) (T * HC), 256, 0, (cudaStream_t) stream>>>(R, w_norm, eps, xn, xn16);
+    gr_norm_kernel<<<(unsigned) (T * HC), 256, 0, (hipStream_t) stream>>>(R, w_norm, eps, xn, xn16);
     check("gr_norm");
 }
 void gr_silu(const float* lo, uint16_t* lo16, int64_t T, void* stream) {
-    gr_silu_kernel<<<blocks_for(T * LR), 256, 0, (cudaStream_t) stream>>>(lo, lo16, T * LR);
+    gr_silu_kernel<<<blocks_for(T * LR), 256, 0, (hipStream_t) stream>>>(lo, lo16, T * LR);
     check("gr_silu");
 }
 void gr_mix(const float* xn, const float* gated, float* mixed, uint16_t* mixed16, int64_t T, void* stream,
             uint16_t* mixed_h) {
-    gr_mix_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(xn, gated, mixed, mixed16, T, mixed_h);
+    gr_mix_kernel<<<blocks_for(T * N), 256, 0, (hipStream_t) stream>>>(xn, gated, mixed, mixed16, T, mixed_h);
     check("gr_mix");
 }
 void gr_write(float* R, const float* bo, const float* inj, int64_t inj_ld, int64_t T, void* stream) {
-    gr_write_kernel<<<blocks_for(T * D), 256, 0, (cudaStream_t) stream>>>(R, bo, inj, inj_ld, T);
+    gr_write_kernel<<<blocks_for(T * D), 256, 0, (hipStream_t) stream>>>(R, bo, inj, inj_ld, T);
     check("gr_write");
 }
 void gr_broadcast(const float* e, float* R, int64_t T, void* stream) {
-    gr_broadcast_kernel<<<blocks_for(T * D), 256, 0, (cudaStream_t) stream>>>(e, R, T);
+    gr_broadcast_kernel<<<blocks_for(T * D), 256, 0, (hipStream_t) stream>>>(e, R, T);
     check("gr_broadcast");
 }
 void gdn_gates(const float* ab, const float* dt, const float* ssm_a, float* gate, float* beta, int64_t T, void* stream) {
-    gdn_gates_kernel<<<blocks_for(T * HV), 256, 0, (cudaStream_t) stream>>>(ab, dt, ssm_a, gate, beta, T);
+    gdn_gates_kernel<<<blocks_for(T * HV), 256, 0, (hipStream_t) stream>>>(ab, dt, ssm_a, gate, beta, T);
     check("gdn_gates");
 }
 void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, int64_t T, float eps, void* stream) {
-    gdn_conv_kernel<<<C / 128, 128, 0, (cudaStream_t) stream>>>(history, qkv, conv_w, h, T);
-    gdn_l2_kernel<<<dim3(2 * HK, (unsigned) T), S, 0, (cudaStream_t) stream>>>(h, eps);
+    gdn_conv_kernel<<<C / 128, 128, 0, (hipStream_t) stream>>>(history, qkv, conv_w, h, T);
+    gdn_l2_kernel<<<dim3(2 * HK, (unsigned) T), S, 0, (hipStream_t) stream>>>(h, eps);
     check("gdn_conv");
 }
 void gdn_recurrence(float* state, const float* h, const float* gate, const float* beta, const float* z,
                     const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, void* stream) {
-    gdn_rec_kernel<<<HV, dim3(S, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, z, gamma, eps, y, y16, T);
+    gdn_rec_kernel<<<HV, dim3(S, RG), 0, (hipStream_t) stream>>>(state, h, gate, beta, z, gamma, eps, y, y16, T);
     check("gdn_recurrence");
 }
 void route(const float* logits, int32_t* ids, float* weights, int64_t T, void* stream) {
-    route_kernel<<<(unsigned) ((T + 7) / 8), 256, 0, (cudaStream_t) stream>>>(logits, ids, weights, T);
+    route_kernel<<<(unsigned) ((T + 7) / 8), 256, 0, (hipStream_t) stream>>>(logits, ids, weights, T);
     check("route");
 }
 void blob_dequant(const uint8_t* blob, uint16_t* gu16, uint16_t* down16, void* stream) {
-    blob_dequant_kernel<false><<<blocks_for(1280LL * 640 + 2560LL * 160), 256, 0, (cudaStream_t) stream>>>(blob, gu16, down16);
+    blob_dequant_kernel<false><<<blocks_for(1280LL * 640 + 2560LL * 160), 256, 0, (hipStream_t) stream>>>(blob, gu16, down16);
     check("blob_dequant");
 }
 void blob_dequant_f16(const uint8_t* blob, uint16_t* gu16, uint16_t* down16, void* stream) {
-    blob_dequant_kernel<true><<<blocks_for(1280LL * 640 + 2560LL * 160), 256, 0, (cudaStream_t) stream>>>(blob, gu16, down16);
+    blob_dequant_kernel<true><<<blocks_for(1280LL * 640 + 2560LL * 160), 256, 0, (hipStream_t) stream>>>(blob, gu16, down16);
     check("blob_dequant_f16");
 }
 void swiglu_interleaved(const float* gu, uint16_t* h16, int64_t n, void* stream) {
     if (n <= 0) return;
-    swiglu_il_kernel<<<blocks_for(n * 640), 256, 0, (cudaStream_t) stream>>>(gu, h16, n);
+    swiglu_il_kernel<<<blocks_for(n * 640), 256, 0, (hipStream_t) stream>>>(gu, h16, n);
     check("swiglu_interleaved");
 }
 void swiglu_pair(const float* g, const float* u, uint16_t* h16, int64_t n, void* stream) {
-    swiglu_pair_kernel<<<blocks_for(n * 640), 256, 0, (cudaStream_t) stream>>>(g, u, h16, n);
+    swiglu_pair_kernel<<<blocks_for(n * 640), 256, 0, (hipStream_t) stream>>>(g, u, h16, n);
     check("swiglu_pair");
 }
 void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int64_t n, int64_t width, void* stream) {
     if (n <= 0) return;
-    gather_rows16_kernel<<<blocks_for(n * (width / 8)), 256, 0, (cudaStream_t) stream>>>(x16, src, dst16, n, width);
+    gather_rows16_kernel<<<blocks_for(n * (width / 8)), 256, 0, (hipStream_t) stream>>>(x16, src, dst16, n, width);
     check("gather_rows16");
 }
 void moe_combine(const float* Dm, const int32_t* slot, const float* w, const float* shared, const float* sg, float* bo,
                  int64_t T, void* stream) {
-    moe_combine_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(Dm, slot, w, shared, sg, bo, T);
+    moe_combine_kernel<<<blocks_for(T * N), 256, 0, (hipStream_t) stream>>>(Dm, slot, w, shared, sg, bo, T);
     check("moe_combine");
 }
 void rms_rows(float* x, const float* w, int64_t rows, int64_t cols, int64_t ld, float eps, void* stream) {
     if (rows <= 0) return;
-    rms_rows_kernel<<<(unsigned) rows, 256, 0, (cudaStream_t) stream>>>(x, w, cols, ld, eps);
+    rms_rows_kernel<<<(unsigned) rows, 256, 0, (hipStream_t) stream>>>(x, w, cols, ld, eps);
     check("rms_rows");
 }
 void rope(float* x, int64_t T, int64_t heads, int64_t dim, int64_t ld, int64_t pos0, float freq_base, void* stream) {
     const float theta_scale = powf(freq_base, -2.0f / 64.0f);
-    rope_kernel<<<(unsigned) (T * heads), 32, 0, (cudaStream_t) stream>>>(x, heads, dim, ld, pos0, theta_scale, strata::kernels::mrope_table());
+    rope_kernel<<<(unsigned) (T * heads), 32, 0, (hipStream_t) stream>>>(x, heads, dim, ld, pos0, theta_scale, strata::kernels::mrope_table());
     check("rope");
 }
 void split_q(const float* q_full, float* q, int64_t T, void* stream) {
-    split_q_kernel<<<blocks_for(T * 24 * 256), 256, 0, (cudaStream_t) stream>>>(q_full, q, T);
+    split_q_kernel<<<blocks_for(T * 24 * 256), 256, 0, (hipStream_t) stream>>>(q_full, q, T);
     check("split_q");
 }
 void gate_attn(const float* attn, const float* q_full, uint16_t* out16, int64_t T, void* stream) {
-    gate_attn_kernel<<<blocks_for(T * 24 * 256), 256, 0, (cudaStream_t) stream>>>(attn, q_full, out16, T);
+    gate_attn_kernel<<<blocks_for(T * 24 * 256), 256, 0, (hipStream_t) stream>>>(attn, q_full, out16, T);
     check("gate_attn");
 }
 

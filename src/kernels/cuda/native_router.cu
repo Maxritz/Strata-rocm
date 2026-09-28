@@ -1,3 +1,4 @@
+#include "hip/hip_runtime.h"
 // Adapted from topk-moe.cu/common.cuh in llama.cpp
 // 3cf03257f219afbe7334045ff7c6a06ac68c627d; finite F32, 512-expert/10-output path.
 // MIT License
@@ -21,7 +22,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 #include "strata/kernels/native_router.hpp"
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
 #include <atomic>
 #include <cfloat>
 #include <cstddef>
@@ -33,12 +34,12 @@ namespace {
 std::atomic<bool> enabled{false};
 __device__ __forceinline__ float warp_sum(float value) {
 #pragma unroll
-    for (int mask = 16; mask; mask >>= 1) value += __shfl_xor_sync(0xffffffffu, value, mask, 32);
+    for (int mask = 16; mask; mask >>= 1) value += __shfl_xor_sync(0xffffffffffffffffull, value, mask, 32);
     return value;
 }
 __device__ __forceinline__ float warp_max(float value) {
 #pragma unroll
-    for (int mask = 16; mask; mask >>= 1) value = fmaxf(value, __shfl_xor_sync(0xffffffffu, value, mask, 32));
+    for (int mask = 16; mask; mask >>= 1) value = fmaxf(value, __shfl_xor_sync(0xffffffffffffffffull, value, mask, 32));
     return value;
 }
 __launch_bounds__(256, 1)
@@ -77,8 +78,8 @@ __global__ void route(const float* __restrict__ logits, int32_t* __restrict__ id
         }
 #pragma unroll
         for (int mask = 16; mask; mask >>= 1) {
-            const float other = __shfl_xor_sync(0xffffffffu, best, mask, 32);
-            const int other_id = __shfl_xor_sync(0xffffffffu, expert, mask, 32);
+            const float other = __shfl_xor_sync(0xffffffffffffffffull, best, mask, 32);
+            const int other_id = __shfl_xor_sync(0xffffffffffffffffull, expert, mask, 32);
             if (other > best || (other == best && other_id < expert)) { best = other; expert = other_id; }
         }
         if ((expert & 31) == lane) {
@@ -110,8 +111,8 @@ void native_router_top10(const float* logits, int32_t* ids, float* weights, void
         || overlap(logits, 512 * 4, ids, 10 * 4) || overlap(logits, 512 * 4, weights, 10 * 4)
         || overlap(ids, 10 * 4, weights, 10 * 4))
         throw std::invalid_argument("native router requires a stream, aligned spans, and disjoint outputs");
-    route<<<1, dim3(32, 8), 0, static_cast<cudaStream_t>(stream)>>>(logits, ids, weights);
-    const auto error = cudaGetLastError();
-    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+    route<<<1, dim3(32, 8), 0, static_cast<hipStream_t>(stream)>>>(logits, ids, weights);
+    const auto error = hipGetLastError();
+    if (error != hipSuccess) throw std::runtime_error(hipGetErrorString(error));
 }
 }

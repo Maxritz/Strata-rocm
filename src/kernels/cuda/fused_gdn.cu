@@ -1,7 +1,8 @@
+#include "hip/hip_runtime.h"
 // src/kernels/cuda/fused_gdn.cu - see include/strata/kernels/fused_gdn.hpp.
 #include "strata/kernels/fused_gdn.hpp"
 
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -59,7 +60,7 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_kernel(float* __restrict
         sq_part = oc * oc;
     }
     // RMS over the head's 128 outputs: warps of row group 0 are threads 0..127.
-    for (int o2 = 16; o2 > 0; o2 >>= 1) sq_part += __shfl_xor_sync(0xffffffffu, sq_part, o2);
+    for (int o2 = 16; o2 > 0; o2 >>= 1) sq_part += __shfl_xor_sync(0xffffffffffffffffull, sq_part, o2, 32);
     if ((tid & 31) == 0) wsum[tid >> 5] = sq_part;
     __syncthreads();
     if (rg == 0) {
@@ -83,7 +84,7 @@ __global__ void __launch_bounds__(S) gdn_conv_l2_kernel(float* __restrict__ hist
     float y = sum / (1.0f + __expf(-sum));
     if ((int) blockIdx.x < qk_heads) {
         float sq = y * y;
-        for (int o = 16; o > 0; o >>= 1) sq += __shfl_xor_sync(0xffffffffu, sq, o);
+        for (int o = 16; o > 0; o >>= 1) sq += __shfl_xor_sync(0xffffffffffffffffull, sq, o, 32);
         if ((threadIdx.x & 31) == 0) part[threadIdx.x >> 5] = sq;
         __syncthreads();
         const float ss = part[0] + part[1] + part[2] + part[3];
@@ -111,7 +112,7 @@ __global__ void __launch_bounds__(256) gdn_ab_kernel(const float* __restrict__ x
         acc = fmaf(__uint_as_float(wv.z << 16), xb.x, acc); acc = fmaf(__uint_as_float(wv.z & 0xffff0000u), xb.y, acc);
         acc = fmaf(__uint_as_float(wv.w << 16), xb.z, acc); acc = fmaf(__uint_as_float(wv.w & 0xffff0000u), xb.w, acc);
     }
-    for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffffffffffull, acc, o, 32);
     if (lane != 0) return;
     if (is_beta) {
         beta[r] = 1.0f / (1.0f + __expf(-acc));
@@ -130,9 +131,9 @@ void fused_gdn_conv_l2(float* history, const float* qkv, const float* conv_w, fl
         std::fprintf(stderr, "fused_gdn_conv_l2: invalid arguments\n");
         std::exit(1);
     }
-    gdn_conv_l2_kernel<<<(unsigned) (channels / S), S, 0, (cudaStream_t) stream>>>(history, qkv, conv_w, h, qk_heads, eps);
-    const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) { std::fprintf(stderr, "fused_gdn_conv_l2: %s\n", cudaGetErrorString(e)); std::exit(1); }
+    gdn_conv_l2_kernel<<<(unsigned) (channels / S), S, 0, (hipStream_t) stream>>>(history, qkv, conv_w, h, qk_heads, eps);
+    const hipError_t e = hipGetLastError();
+    if (e != hipSuccess) { std::fprintf(stderr, "fused_gdn_conv_l2: %s\n", hipGetErrorString(e)); std::exit(1); }
 }
 
 void fused_gdn_ab(const float* x, const uint16_t* w_alpha, const uint16_t* w_beta, const float* dt, const float* ssm_a,
@@ -141,10 +142,10 @@ void fused_gdn_ab(const float* x, const uint16_t* w_alpha, const uint16_t* w_bet
         std::fprintf(stderr, "fused_gdn_ab: invalid arguments\n");
         std::exit(1);
     }
-    gdn_ab_kernel<<<(unsigned) ((2 * h_v + 7) / 8), 256, 0, (cudaStream_t) stream>>>(x, w_alpha, w_beta, dt, ssm_a, gate,
+    gdn_ab_kernel<<<(unsigned) ((2 * h_v + 7) / 8), 256, 0, (hipStream_t) stream>>>(x, w_alpha, w_beta, dt, ssm_a, gate,
                                                                                      beta, n_embd, h_v);
-    const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) { std::fprintf(stderr, "fused_gdn_ab: %s\n", cudaGetErrorString(e)); std::exit(1); }
+    const hipError_t e = hipGetLastError();
+    if (e != hipSuccess) { std::fprintf(stderr, "fused_gdn_ab: %s\n", hipGetErrorString(e)); std::exit(1); }
 }
 
 void fused_gdn_step_norm(float* state, const float* q, const float* k, const float* v, const float* gate,
@@ -154,11 +155,11 @@ void fused_gdn_step_norm(float* state, const float* q, const float* k, const flo
         std::fprintf(stderr, "fused_gdn_step_norm: invalid arguments\n");
         std::exit(1);
     }
-    gdn_step_norm_kernel<<<(unsigned) h_v, dim3(S, RG), 0, (cudaStream_t) stream>>>(state, q, k, v, gate, beta, z,
+    gdn_step_norm_kernel<<<(unsigned) h_v, dim3(S, RG), 0, (hipStream_t) stream>>>(state, q, k, v, gate, beta, z,
                                                                                    gamma, eps, y, h_k, h_v);
-    const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "fused_gdn_step_norm: %s\n", cudaGetErrorString(e));
+    const hipError_t e = hipGetLastError();
+    if (e != hipSuccess) {
+        std::fprintf(stderr, "fused_gdn_step_norm: %s\n", hipGetErrorString(e));
         std::exit(1);
     }
 }

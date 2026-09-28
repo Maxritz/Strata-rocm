@@ -1,4 +1,4 @@
-// src/kernels/dequant_s2_parity.cpp - P2.S2's parity test for the S2 decode.
+﻿// src/kernels/dequant_s2_parity.cpp - P2.S2's parity test for the S2 decode.
 //
 // THE REFERENCE IS THE CHAIN, NOT A SECOND OPINION.  `strata::dequantize_q2_0` (include/strata/artifact/
 // dequant.hpp) is a scalar transcription that `bench/micro/dequant_xcheck` checks against **ggml's own**
@@ -9,7 +9,7 @@
 #include "strata/artifact/dequant.hpp"
 #include "strata/kernels/dequant_s2.hpp"
 
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
 
 #include <cstdint>
 #include <cstdio>
@@ -21,9 +21,9 @@ namespace {
 
 constexpr int QK = 64;
 
-void check(cudaError_t e, const char* what) {
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e));
+void check(hipError_t e, const char* what) {
+    if (e != hipSuccess) {
+        std::fprintf(stderr, "%s: %s\n", what, hipGetErrorString(e));
         std::exit(1);
     }
 }
@@ -80,17 +80,17 @@ int main(int argc, char** argv) {
 
     uint8_t* d_codes = nullptr;
     float *d_scales = nullptr, *d_out = nullptr;
-    check(cudaMalloc(&d_codes, codes.size()), "cudaMalloc codes");
-    check(cudaMalloc(&d_scales, scales.size() * sizeof(float)), "cudaMalloc scales");
-    check(cudaMalloc(&d_out, cpu.size() * sizeof(float)), "cudaMalloc out");
-    check(cudaMemcpy(d_codes, codes.data(), codes.size(), cudaMemcpyHostToDevice), "copy codes");
-    check(cudaMemcpy(d_scales, scales.data(), scales.size() * sizeof(float), cudaMemcpyHostToDevice),
+    check(hipMalloc(&d_codes, codes.size()), "hipMalloc codes");
+    check(hipMalloc(&d_scales, scales.size() * sizeof(float)), "hipMalloc scales");
+    check(hipMalloc(&d_out, cpu.size() * sizeof(float)), "hipMalloc out");
+    check(hipMemcpy(d_codes, codes.data(), codes.size(), hipMemcpyHostToDevice), "copy codes");
+    check(hipMemcpy(d_scales, scales.data(), scales.size() * sizeof(float), hipMemcpyHostToDevice),
           "copy scales");
 
     strata::kernels::dequant_s2(d_codes, d_scales, d_out, n_blocks);
 
     std::vector<float> gpu(cpu.size());
-    check(cudaMemcpy(gpu.data(), d_out, gpu.size() * sizeof(float), cudaMemcpyDeviceToHost), "copy back");
+    check(hipMemcpy(gpu.data(), d_out, gpu.size() * sizeof(float), hipMemcpyDeviceToHost), "copy back");
 
     long long bad = 0, first_bad = -1;
     for (size_t i = 0; i < cpu.size(); ++i) {
@@ -136,8 +136,9 @@ int main(int argc, char** argv) {
     std::printf("  bit-exact against the scalar dequantizer that dequant_xcheck proved equal to ggml\n");
     if (selftest) std::printf("dequant_s2_parity OK\n");
 
-    cudaFree(d_codes);
-    cudaFree(d_scales);
-    cudaFree(d_out);
+    hipFree(d_codes);
+    hipFree(d_scales);
+    hipFree(d_out);
     return 0;
 }
+

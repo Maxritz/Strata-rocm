@@ -1,3 +1,4 @@
+﻿#include "hip/hip_runtime.h"
 // src/kernels/rope_parity.cpp - P2.S2's parity test for NEOX partial RoPE.
 //
 // TWO CHECKS, deliberately separated so each can be tight:
@@ -14,7 +15,7 @@
 // happily accept.
 #include "strata/kernels/rope.hpp"
 
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
 
 #include <cmath>
 #include <cstdio>
@@ -26,9 +27,9 @@
 
 namespace {
 
-void check(cudaError_t e, const char* what) {
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e));
+void check(hipError_t e, const char* what) {
+    if (e != hipSuccess) {
+        std::fprintf(stderr, "%s: %s\n", what, hipGetErrorString(e));
         std::exit(1);
     }
 }
@@ -94,18 +95,18 @@ int main(int argc, char** argv) {
 
     float *d_x = nullptr, *d_out = nullptr, *d_cos = nullptr, *d_sin = nullptr;
     int* d_pos = nullptr;
-    check(cudaMalloc(&d_x, x.size() * sizeof(float)), "malloc x");
-    check(cudaMalloc(&d_out, ref.size() * sizeof(float)), "malloc out");
-    check(cudaMalloc(&d_cos, hcos.size() * sizeof(float)), "malloc cos");
-    check(cudaMalloc(&d_sin, hsin.size() * sizeof(float)), "malloc sin");
-    check(cudaMalloc(&d_pos, pos.size() * sizeof(int)), "malloc pos");
-    check(cudaMemcpy(d_x, x.data(), x.size() * sizeof(float), cudaMemcpyHostToDevice), "copy x");
-    check(cudaMemcpy(d_cos, hcos.data(), hcos.size() * sizeof(float), cudaMemcpyHostToDevice), "copy cos");
-    check(cudaMemcpy(d_sin, hsin.data(), hsin.size() * sizeof(float), cudaMemcpyHostToDevice), "copy sin");
-    check(cudaMemcpy(d_pos, pos.data(), pos.size() * sizeof(int), cudaMemcpyHostToDevice), "copy pos");
+    check(hipMalloc(&d_x, x.size() * sizeof(float)), "malloc x");
+    check(hipMalloc(&d_out, ref.size() * sizeof(float)), "malloc out");
+    check(hipMalloc(&d_cos, hcos.size() * sizeof(float)), "malloc cos");
+    check(hipMalloc(&d_sin, hsin.size() * sizeof(float)), "malloc sin");
+    check(hipMalloc(&d_pos, pos.size() * sizeof(int)), "malloc pos");
+    check(hipMemcpy(d_x, x.data(), x.size() * sizeof(float), hipMemcpyHostToDevice), "copy x");
+    check(hipMemcpy(d_cos, hcos.data(), hcos.size() * sizeof(float), hipMemcpyHostToDevice), "copy cos");
+    check(hipMemcpy(d_sin, hsin.data(), hsin.size() * sizeof(float), hipMemcpyHostToDevice), "copy sin");
+    check(hipMemcpy(d_pos, pos.data(), pos.size() * sizeof(int), hipMemcpyHostToDevice), "copy pos");
     strata::kernels::rope_neox_apply(d_x, d_out, rows, head_dim, n_rot, d_cos, d_sin, d_pos, nullptr);
     std::vector<float> got(ref.size());
-    check(cudaMemcpy(got.data(), d_out, got.size() * sizeof(float), cudaMemcpyDeviceToHost), "back");
+    check(hipMemcpy(got.data(), d_out, got.size() * sizeof(float), hipMemcpyDeviceToHost), "back");
 
     // A RELATIVE TOLERANCE, NOT BIT EQUALITY.  *c - b*s is one of the expressions the compiler is free to
     // contract into an FMA, and the host and device compilers choose differently - so a handful of values
@@ -145,13 +146,13 @@ int main(int argc, char** argv) {
         std::vector<float> e((size_t) head_dim, 0.0f);
         e[0] = 1.0f;
         std::vector<float> o((size_t) head_dim, 0.0f);
-        check(cudaMemcpy(d_x, e.data(), e.size() * sizeof(float), cudaMemcpyHostToDevice), "copy e");
+        check(hipMemcpy(d_x, e.data(), e.size() * sizeof(float), hipMemcpyHostToDevice), "copy e");
         // position 7, NOT position 0: at pos 0 sin is exactly 0, so dim half legitimately does not move and
         // the check would report the correct kernel as wrong.  The first version made exactly that mistake.
         int p7 = 7;
-        check(cudaMemcpy(d_pos, &p7, sizeof(int), cudaMemcpyHostToDevice), "copy p7");
+        check(hipMemcpy(d_pos, &p7, sizeof(int), hipMemcpyHostToDevice), "copy p7");
         strata::kernels::rope_neox_apply(d_x, d_out, 1, head_dim, n_rot, d_cos, d_sin, d_pos, nullptr);
-        check(cudaMemcpy(o.data(), d_out, o.size() * sizeof(float), cudaMemcpyDeviceToHost), "back e");
+        check(hipMemcpy(o.data(), d_out, o.size() * sizeof(float), hipMemcpyDeviceToHost), "back e");
         int moved[4] = {0, 0, 0, 0};       // dims 0, 1, half, half+1
         const float* chk[4] = {&e[0], &e[1], &e[half], &e[half + 1]};
         (void) chk;
@@ -169,3 +170,4 @@ int main(int argc, char** argv) {
     if (selftest) std::printf("rope_parity OK\n");
     return 0;
 }
+

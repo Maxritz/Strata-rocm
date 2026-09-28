@@ -1,3 +1,4 @@
+#include "hip/hip_runtime.h"
 // include/strata/kernels/f16_bits.hpp - the fp16 conversions, written out, as bits.
 //
 // WHY THIS IS NOT `__float2half`.  Round 193 found `__float2half` producing 0x2600 for a value whose correct
@@ -25,7 +26,7 @@
 #include <cstdint>
 #include <cstring>
 
-#if defined(__CUDACC__)
+#if defined(__HIPCC__)
 #define STRATA_HD __host__ __device__
 #else
 #define STRATA_HD
@@ -36,7 +37,7 @@ namespace strata::kernels {
 /// Round-to-nearest-even f32 -> fp16, returned as raw bits.
 STRATA_HD inline uint16_t f16_from_f32(float f) {
     uint32_t x;
-    std::memcpy(&x, &f, 4);
+    __builtin_memcpy(&x, &f, 4);
     const uint32_t sign = (x >> 16) & 0x8000u;
     const uint32_t rawexp = (x >> 23) & 0xFFu;
     int exp = (int) rawexp - 127 + 15;
@@ -89,7 +90,7 @@ STRATA_HD inline float f32_from_f16(uint16_t h) {
         out = sign | ((ex - 15 + 127) << 23) | (man << 13);
     }
     float f;
-    std::memcpy(&f, &out, 4);
+    __builtin_memcpy(&f, &out, 4);
     return f;
 }
 

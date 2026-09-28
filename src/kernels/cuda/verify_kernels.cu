@@ -1,10 +1,12 @@
+#include "hip/hip_runtime.h"
 // src/kernels/cuda/verify_kernels.cu - see include/strata/kernels/verify_kernels.hpp.
 //
 // The per-token arithmetic of every kernel here is transcribed from its single-token original (fused_gdn.cu,
 // elementwise.cu) with the same operation order, so a verify window reproduces plain decode bit for bit.
 #include "strata/kernels/verify_kernels.hpp"
 
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
+#include "strata/hip_compat.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -17,8 +19,8 @@ constexpr int RG = 4;
 constexpr int RPG = S / RG;
 
 void check(const char* what) {
-    const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) { std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e)); std::exit(1); }
+    const hipError_t e = hipGetLastError();
+    if (e != hipSuccess) { std::fprintf(stderr, "%s: %s\n", what, hipGetErrorString(e)); std::exit(1); }
 }
 
 __global__ void __launch_bounds__(S) gdn_conv_l2_multi_kernel(const float* __restrict__ hist,
@@ -40,7 +42,7 @@ __global__ void __launch_bounds__(S) gdn_conv_l2_multi_kernel(const float* __res
     float y = sum / (1.0f + __expf(-sum));
     if ((int) blockIdx.x < qk_heads) {
         float sq = y * y;
-        for (int o = 16; o > 0; o >>= 1) sq += __shfl_xor_sync(0xffffffffu, sq, o);
+        for (int o = 16; o > 0; o >>= 1) sq += __shfl_xor_sync(0xffffffffffffffffull, sq, o, 32);
         if ((threadIdx.x & 31) == 0) part[threadIdx.x >> 5] = sq;
         __syncthreads();
         const float ss = part[0] + part[1] + part[2] + part[3];
@@ -99,7 +101,7 @@ __global__ void __launch_bounds__(256) gdn_ab_multi_kernel(const float* __restri
     for (int t = 0; t < kVerifyMaxT; ++t) {
         if (t >= T) break;
         float a = acc[t];
-        for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
+        for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffffffffffull, a, o, 32);
         if (lane != 0) continue;
         if (is_beta) {
             beta[(size_t) t * h_v + r] = 1.0f / (1.0f + __expf(-a));
@@ -163,7 +165,7 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __re
             sq_part = oc * oc;
         }
         if (t < t_out_begin) continue;   // a replayed token: its state update is needed, its output is not
-        for (int o2 = 16; o2 > 0; o2 >>= 1) sq_part += __shfl_xor_sync(0xffffffffu, sq_part, o2);
+        for (int o2 = 16; o2 > 0; o2 >>= 1) sq_part += __shfl_xor_sync(0xffffffffffffffffull, sq_part, o2, 32);
         if ((tid & 31) == 0) wsum[tid >> 5] = sq_part;
         __syncthreads();
         if (rg == 0) {
@@ -268,7 +270,7 @@ __global__ void row_top_prob_kernel(const float* __restrict__ logits, int n_voca
     const float m = l[ids[t]];
     float s = 0.0f;
     for (int i = threadIdx.x; i < n_vocab; i += blockDim.x) s += __expf(l[i] - m);
-    for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
+    for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffffffffffffull, s, o, 32);
     if ((threadIdx.x & 31) == 0) part[threadIdx.x >> 5] = s;
     __syncthreads();
     if (threadIdx.x == 0) {
@@ -307,36 +309,36 @@ __global__ void dense_steps_kernel(const int32_t* __restrict__ cells, int n, int
 void fetch_blobs(const unsigned long long* src, const int32_t* n, uint8_t* dst, int64_t blob_bytes, int cap, void* stream) {
     if (cap <= 0) return;
     if (blob_bytes % 16 != 0) { std::fprintf(stderr, "fetch_blobs: blob size must be a multiple of 16\n"); std::exit(1); }
-    fetch_blobs_kernel<<<48 * 8, 256, 0, (cudaStream_t) stream>>>(src, n, (uint4*) dst, (long long) (blob_bytes / 16));
+    fetch_blobs_kernel<<<48 * 8, 256, 0, (hipStream_t) stream>>>(src, n, (uint4*) dst, (long long) (blob_bytes / 16));
     check("fetch_blobs");
 }
 
 void rebase_ptrs(unsigned long long* ptr, const int32_t* n, uint8_t* base, int64_t blob_bytes, void* stream) {
-    rebase_ptrs_kernel<<<1, 128, 0, (cudaStream_t) stream>>>(ptr, n, (unsigned long long) base, (long long) blob_bytes);
+    rebase_ptrs_kernel<<<1, 128, 0, (hipStream_t) stream>>>(ptr, n, (unsigned long long) base, (long long) blob_bytes);
     check("rebase_ptrs");
 }
 
 void add_streams_broadcast(const float* h, const float* e, float* R, int64_t n_embd, int hc, int n_tok, void* stream) {
     add_streams_broadcast_kernel<<<dim3((unsigned) ((n_embd * hc + 255) / 256), (unsigned) n_tok), 256, 0,
-                                   (cudaStream_t) stream>>>(h, e, R, n_embd, hc);
+                                   (hipStream_t) stream>>>(h, e, R, n_embd, hc);
     check("add_streams_broadcast");
 }
 
 void ident_hits(const int32_t* ids, int n, int32_t* slot, int32_t* dst, int32_t* count, void* stream) {
     if (n < 1 || n > 1024) { std::fprintf(stderr, "ident_hits: n out of range\n"); std::exit(1); }
-    ident_hits_kernel<<<1, 1024, 0, (cudaStream_t) stream>>>(ids, n, slot, dst, count);
+    ident_hits_kernel<<<1, 1024, 0, (hipStream_t) stream>>>(ids, n, slot, dst, count);
     check("ident_hits");
 }
 
 void mtp_select(const float* R_src, int64_t R_stride, const int32_t* ids, const int32_t* row_dev, float* R_dst,
                 int32_t* tok_dst, int32_t* out, int j, void* stream, const float* probs, float* out_p) {
-    mtp_select_kernel<<<16, 256, 0, (cudaStream_t) stream>>>(R_src, R_stride, ids, row_dev, R_dst, tok_dst, out, j,
+    mtp_select_kernel<<<16, 256, 0, (hipStream_t) stream>>>(R_src, R_stride, ids, row_dev, R_dst, tok_dst, out, j,
                                                              probs, out_p);
     check("mtp_select");
 }
 
 void gather_rows(const uint8_t* src, int64_t row_bytes, const int32_t* ids, int64_t n, uint8_t* dst, void* stream) {
-    cudaStream_t s = (cudaStream_t) stream;
+    hipStream_t s = (hipStream_t) stream;
     if (row_bytes % 16 == 0)
         gather_rows_kernel<<<48 * 8, 256, 0, s>>>((const uint4*) src, row_bytes / 16, ids, n, (uint4*) dst);
     else if (row_bytes % 4 == 0)
@@ -347,12 +349,12 @@ void gather_rows(const uint8_t* src, int64_t row_bytes, const int32_t* ids, int6
 }
 
 void map_ids(int32_t* ids, const int32_t* table, int n, void* stream) {
-    map_ids_kernel<<<1, 64, 0, (cudaStream_t) stream>>>(ids, table, n);
+    map_ids_kernel<<<1, 64, 0, (hipStream_t) stream>>>(ids, table, n);
     check("map_ids");
 }
 
 void row_top_prob(const float* logits, int n_rows, int n_vocab, const int32_t* ids, float* probs, void* stream) {
-    row_top_prob_kernel<<<n_rows, 1024, 0, (cudaStream_t) stream>>>(logits, n_vocab, ids, probs);
+    row_top_prob_kernel<<<n_rows, 1024, 0, (hipStream_t) stream>>>(logits, n_vocab, ids, probs);
     check("row_top_prob");
 }
 
@@ -371,12 +373,12 @@ __global__ void window_ids_kernel(int32_t* steps, int window, int32_t* ids, long
 }  // namespace
 
 void window_ids(int32_t* steps, int n, int window, int32_t* ids, int64_t ids_stride, void* stream) {
-    window_ids_kernel<<<dim3(8, (unsigned) n), 256, 0, (cudaStream_t) stream>>>(steps, window, ids, (long long) ids_stride);
+    window_ids_kernel<<<dim3(8, (unsigned) n), 256, 0, (hipStream_t) stream>>>(steps, window, ids, (long long) ids_stride);
     check("window_ids");
 }
 
 void dense_steps(const int32_t* cells, int n, int32_t* steps, void* stream) {
-    dense_steps_kernel<<<1, 64, 0, (cudaStream_t) stream>>>(cells, n, steps);
+    dense_steps_kernel<<<1, 64, 0, (hipStream_t) stream>>>(cells, n, steps);
     check("dense_steps");
 }
 
@@ -386,13 +388,13 @@ void gdn_conv_l2_multi(const float* history, const float* qkv, const float* conv
         std::fprintf(stderr, "gdn_conv_l2_multi: invalid arguments\n");
         std::exit(1);
     }
-    gdn_conv_l2_multi_kernel<<<dim3((unsigned) (channels / S), (unsigned) n_tok), S, 0, (cudaStream_t) stream>>>(
+    gdn_conv_l2_multi_kernel<<<dim3((unsigned) (channels / S), (unsigned) n_tok), S, 0, (hipStream_t) stream>>>(
         history, qkv, conv_w, h, channels, qk_heads, eps, t_begin);
     check("gdn_conv_l2_multi");
 }
 
 void gdn_conv_commit(float* history, const float* qkv, int channels, const int32_t* n_keep, void* stream) {
-    gdn_conv_commit_kernel<<<(unsigned) ((channels + 255) / 256), 256, 0, (cudaStream_t) stream>>>(history, qkv,
+    gdn_conv_commit_kernel<<<(unsigned) ((channels + 255) / 256), 256, 0, (hipStream_t) stream>>>(history, qkv,
                                                                                                  channels, n_keep);
     check("gdn_conv_commit");
 }
@@ -403,7 +405,7 @@ void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_bet
         std::fprintf(stderr, "gdn_ab_multi: invalid arguments\n");
         std::exit(1);
     }
-    gdn_ab_multi_kernel<<<(unsigned) ((2 * h_v + 7) / 8), 256, 0, (cudaStream_t) stream>>>(
+    gdn_ab_multi_kernel<<<(unsigned) ((2 * h_v + 7) / 8), 256, 0, (hipStream_t) stream>>>(
         x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok);
     check("gdn_ab_multi");
 }
@@ -416,7 +418,7 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
         std::fprintf(stderr, "gdn_step_norm_multi: invalid arguments\n");
         std::exit(1);
     }
-    gdn_step_norm_multi_kernel<<<(unsigned) h_v, dim3(S, RG), 0, (cudaStream_t) stream>>>(
+    gdn_step_norm_multi_kernel<<<(unsigned) h_v, dim3(S, RG), 0, (hipStream_t) stream>>>(
         state, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, n_keep, t_out_begin);
     check("gdn_step_norm_multi");
 }
@@ -429,7 +431,7 @@ __global__ void wait_flag_ge_kernel(const volatile uint32_t* flag, uint32_t valu
 }  // namespace
 
 void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream) {
-    wait_flag_ge_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value);
+    wait_flag_ge_kernel<<<1, 1, 0, (hipStream_t) stream>>>(flag, value);
     check("wait_flag_ge");
 }
 
@@ -437,20 +439,20 @@ void embedding_gather_dev(const uint8_t* codes, const float* scales, const float
                           int n_tok, int64_t n, int code_bits, int code_bias, int group_elems, uint64_t row_codes,
                           uint64_t row_groups, float* out, void* stream) {
     embedding_gather_dev_kernel<<<dim3((unsigned) ((n + 255) / 256), (unsigned) n_tok), 256, 0,
-                                  (cudaStream_t) stream>>>(codes, scales, offsets, tokens, n, code_bits, code_bias,
+                                  (hipStream_t) stream>>>(codes, scales, offsets, tokens, n, code_bits, code_bias,
                                                            group_elems, row_codes, row_groups, out);
     check("embedding_gather_dev");
 }
 
 void broadcast_streams(const float* x, float* R, int64_t n_embd, int hc, int n_tok, void* stream) {
     broadcast_streams_kernel<<<dim3((unsigned) ((n_embd * hc + 255) / 256), (unsigned) n_tok), 256, 0,
-                               (cudaStream_t) stream>>>(x, R, n_embd, hc);
+                               (hipStream_t) stream>>>(x, R, n_embd, hc);
     check("broadcast_streams");
 }
 
 void copy_indexed(float* dst, const float* src, int64_t stride, const int32_t* index, int64_t n, void* stream) {
     const unsigned blocks = (unsigned) ((n + 255) / 256 < 64 ? (n + 255) / 256 : 64);
-    copy_indexed_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>(dst, src, stride, index, n);
+    copy_indexed_kernel<<<blocks, 256, 0, (hipStream_t) stream>>>(dst, src, stride, index, n);
     check("copy_indexed");
 }
 

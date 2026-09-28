@@ -1,7 +1,8 @@
+#include "hip/hip_runtime.h"
 // src/kernels/cuda/qsa_select.cu - see include/strata/kernels/qsa_select.hpp.
 #include "strata/kernels/qsa_select.hpp"
 
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
 
 #include <cfloat>
 #include <cstdio>
@@ -41,7 +42,7 @@ __global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_kernel(const fl
         const float4 q4 = *reinterpret_cast<const float4*>(q + h * IDX_DIM);
         float d = k4.x * q4.x + k4.y * q4.y + k4.z * q4.z + k4.w * q4.w;
 #pragma unroll
-        for (int o = 16; o > 0; o >>= 1) d += __shfl_xor_sync(0xffffffffu, d, o);
+        for (int o = 16; o > 0; o >>= 1) d += __shfl_xor_sync(0xffffffffffffffffull, d, o, 32);
         score += d > 0.0f ? d : 0.0f;
     }
     if (lane == 0) {
@@ -76,7 +77,7 @@ __global__ void __launch_bounds__(TOPK_T) block_topk_kernel(const float* __restr
     for (int shift = 24; shift >= 0; shift -= 8) {
         for (int i = t; i < 256; i += TOPK_T) hist[i] = 0;
         __syncthreads();
-        const uint32_t hi_mask = shift == 24 ? 0u : (0xffffffffu << (shift + 8));
+        const uint32_t hi_mask = shift == 24 ? 0u : (0xffffffffffffffffull << (shift + 8));
         for (int64_t b = b0; b < b1; ++b) {
             const int w = weight(b);
             if (w == 0) continue;
@@ -158,10 +159,10 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
         std::exit(1);
     }
     const dim3 grid((unsigned) ((max_blocks + SCORE_WARPS - 1) / SCORE_WARPS), (unsigned) nq);
-    block_scores_kernel<<<grid, SCORE_WARPS * 32, 0, (cudaStream_t) stream>>>(pooled, dead, q_idx, steps, max_blocks,
+    block_scores_kernel<<<grid, SCORE_WARPS * 32, 0, (hipStream_t) stream>>>(pooled, dead, q_idx, steps, max_blocks,
                                                                               scores);
-    const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores: %s\n", cudaGetErrorString(e)); std::exit(1); }
+    const hipError_t e = hipGetLastError();
+    if (e != hipSuccess) { std::fprintf(stderr, "qsa_block_scores: %s\n", hipGetErrorString(e)); std::exit(1); }
 }
 
 void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
@@ -171,9 +172,9 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
         std::fprintf(stderr, "qsa_block_topk: unsupported geometry or cap\n");
         std::exit(1);
     }
-    block_topk_kernel<<<(unsigned) nq, TOPK_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids);
-    const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_topk: %s\n", cudaGetErrorString(e)); std::exit(1); }
+    block_topk_kernel<<<(unsigned) nq, TOPK_T, 0, (hipStream_t) stream>>>(scores, steps, max_blocks, cap, ids);
+    const hipError_t e = hipGetLastError();
+    if (e != hipSuccess) { std::fprintf(stderr, "qsa_block_topk: %s\n", hipGetErrorString(e)); std::exit(1); }
 }
 
 }  // namespace strata::kernels

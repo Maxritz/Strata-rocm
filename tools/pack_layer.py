@@ -37,7 +37,8 @@ REPO = pathlib.Path(__file__).resolve().parents[1]
 STRATA = REPO.parents[min(1, len(REPO.parents) - 1)]   # the dev layout's default shards (setup.py passes --gguf)
 SHARD1 = STRATA / "Q2_0" / "Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf"
 
-H, FF, NE = 2560, 640, 512
+H, FF = 2560, 640
+NE = 512     # the artifact's `qwen4exp.expert_count`; overridden from the GGUF in build()
 QK, BLOCK_BYTES = 64, 18          # Q2_0
 ROW_BYTES_GU = H * 2 // 8         # 640 B of codes for one 2,560-wide row
 ROW_BYTES_D = FF * 2 // 8         # 160 B of codes for one 640-wide row
@@ -67,6 +68,9 @@ OFF = blob_offsets()
 
 def build(n_layers: int, out_path: pathlib.Path) -> dict:
     g = GGUFFile(SHARD1)
+    global NE
+    NE = int(g.metadata.get("qwen4exp.expert_count", NE))
+    assert NE > 0, NE
     by_name = {t.name: t for t in g.tensors}
     src = open(SHARD1, "rb")
     manifest = {"blob_bytes": BLOB_BYTES, "offsets": OFF, "layers": [], "n_layers": n_layers}

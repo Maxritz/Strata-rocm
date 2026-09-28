@@ -1,7 +1,8 @@
+#include "hip/hip_runtime.h"
 // src/core/device.cu - P2.S1: the CUDA side of the runtime core.
 #include "strata/core/device.hpp"
 
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
 
 #include <cstdio>
 #include <cstring>
@@ -10,9 +11,9 @@ namespace strata::core {
 
 namespace {
 
-void check(cudaError_t e, const char* what) {
-    if (e != cudaSuccess) {
-        throw CudaError(std::string(what) + ": " + cudaGetErrorString(e), (int) e);
+void check(hipError_t e, const char* what) {
+    if (e != hipSuccess) {
+        throw CudaError(std::string(what) + ": " + hipGetErrorString(e), (int) e);
     }
 }
 
@@ -28,7 +29,7 @@ __global__ void poison_kernel(float* p, uint64_t n_floats) {
 
 DeviceInfo device_info(int ordinal) {
     int count = 0;
-    check(cudaGetDeviceCount(&count), "cudaGetDeviceCount");
+    check(hipGetDeviceCount(&count), "hipGetDeviceCount");
     if (count == 0) {
         throw CudaError("no CUDA device is present; Strata targets sm_120 (RTX 5000 series)", -1);
     }
@@ -39,22 +40,22 @@ DeviceInfo device_info(int ordinal) {
     }
     DeviceInfo d;
     d.ordinal = ordinal;
-    check(cudaSetDevice(ordinal), "cudaSetDevice");
+    check(hipSetDevice(ordinal), "hipSetDevice");
 
-    cudaDeviceProp p{};
-    check(cudaGetDeviceProperties(&p, ordinal), "cudaGetDeviceProperties");
+    hipDeviceProp_t p{};
+    check(hipGetDeviceProperties(&p, ordinal), "hipGetDeviceProperties");
     d.name = p.name;
     d.cc_major = p.major;
     d.cc_minor = p.minor;
     d.multi_processor_count = p.multiProcessorCount;
 
     size_t free_b = 0, total_b = 0;
-    check(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
+    check(hipMemGetInfo(&free_b, &total_b), "hipMemGetInfo");
     d.free_bytes = free_b;
     d.total_bytes = total_b;
 
-    check(cudaDriverGetVersion(&d.driver_version), "cudaDriverGetVersion");
-    check(cudaRuntimeGetVersion(&d.runtime_version), "cudaRuntimeGetVersion");
+    check(hipDriverGetVersion(&d.driver_version), "hipDriverGetVersion");
+    check(hipRuntimeGetVersion(&d.runtime_version), "hipRuntimeGetVersion");
 
     // The engine is written against sm_120.  Compiling for it is enforced by CMake; RUNNING on something else
     // is caught here, because a binary can be carried to a machine with an older card and would otherwise
@@ -71,10 +72,10 @@ DeviceInfo device_info(int ordinal) {
 DeviceArena::DeviceArena(uint64_t bytes, int ordinal, bool poison)
     : capacity_(bytes), ordinal_(ordinal), poison_(poison) {
     if (bytes == 0) throw CudaError("DeviceArena of 0 bytes", -1);
-    check(cudaSetDevice(ordinal), "cudaSetDevice");
+    check(hipSetDevice(ordinal), "hipSetDevice");
     // One allocation for the whole region.  cudaMalloc of a large block is the thing that can fail late, so it
     // happens once, here, before anything depends on it.
-    check(cudaMalloc(&base_, (size_t) bytes), "cudaMalloc");
+    check(hipMalloc(&base_, (size_t) bytes), "hipMalloc");
     if (poison_) {
         const int threads = 256;
         const uint64_t n = bytes / sizeof(float);
@@ -85,14 +86,14 @@ DeviceArena::DeviceArena(uint64_t bytes, int ordinal, bool poison)
         for (uint64_t b = 0; b < blocks; b += max_blocks) {
             const uint64_t chunk = (blocks - b < max_blocks) ? (blocks - b) : max_blocks;
             poison_kernel<<<(unsigned) chunk, threads>>>((float*) base_ + b * threads, n - b * threads);
-            check(cudaGetLastError(), "poison_kernel");
+            check(hipGetLastError(), "poison_kernel");
         }
-        check(cudaDeviceSynchronize(), "poison sync");
+        check(hipDeviceSynchronize(), "poison sync");
     }
 }
 
 DeviceArena::~DeviceArena() {
-    if (base_) cudaFree(base_);          // best effort: a destructor must not throw
+    if (base_) hipFree(base_);          // best effort: a destructor must not throw
 }
 
 void* DeviceArena::alloc(uint64_t bytes, uint64_t align) {

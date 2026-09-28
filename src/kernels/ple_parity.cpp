@@ -1,3 +1,4 @@
+﻿#include "hip/hip_runtime.h"
 // src/kernels/ple_parity.cpp - P2.S4's test: the n-gram hash, the IQ4_NL table read, and the PLE block.
 //
 // THREE PARTS, THREE DIFFERENT ORACLES, and none of them is this project's own code:
@@ -16,7 +17,7 @@
 #include "strata/kernels/native_mmvq.hpp"
 #include "ple_oracle_vectors.inc"
 
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
 
 #include <algorithm>
 #include <cmath>
@@ -32,9 +33,9 @@ namespace o = strata::kernels::ple_oracle;
 
 namespace {
 
-void ck(cudaError_t e, const char* what) {
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e));
+void ck(hipError_t e, const char* what) {
+    if (e != hipSuccess) {
+        std::fprintf(stderr, "%s: %s\n", what, hipGetErrorString(e));
         std::exit(1);
     }
 }
@@ -192,21 +193,21 @@ int history_advance_regression() {
     for (size_t c = 0; c < channels; ++c)
         for (size_t r = 0; r < rows; ++r) expected[c * rows + r] = -float(c * 16 + r + 1);
     float *history_storage = nullptr, *norm_storage = nullptr;
-    ck(cudaMalloc(&history_storage, (count + 2 * guard) * sizeof(float)), "history regression allocation");
-    ck(cudaMalloc(&norm_storage, (channels + 2 * guard) * sizeof(float)), "history norm allocation");
-    ck(cudaMemset(history_storage, 0xa5, (count + 2 * guard) * sizeof(float)), "history guard init");
-    ck(cudaMemset(norm_storage, 0xa5, (channels + 2 * guard) * sizeof(float)), "history norm guard init");
+    ck(hipMalloc(&history_storage, (count + 2 * guard) * sizeof(float)), "history regression allocation");
+    ck(hipMalloc(&norm_storage, (channels + 2 * guard) * sizeof(float)), "history norm allocation");
+    ck(hipMemset(history_storage, 0xa5, (count + 2 * guard) * sizeof(float)), "history guard init");
+    ck(hipMemset(norm_storage, 0xa5, (channels + 2 * guard) * sizeof(float)), "history norm guard init");
     float* history = history_storage + guard;
     float* norm = norm_storage + guard;
-    ck(cudaMemcpy(history, expected.data(), count * sizeof(float), cudaMemcpyHostToDevice), "history initial values");
-    cudaStream_t stream;
-    cudaGraph_t graph;
-    cudaGraphExec_t executable;
-    ck(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "history regression stream");
-    ck(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "history regression capture");
+    ck(hipMemcpy(history, expected.data(), count * sizeof(float), hipMemcpyHostToDevice), "history initial values");
+    hipStream_t stream;
+    hipGraph_t graph;
+    hipGraphExec_t executable;
+    ck(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), "history regression stream");
+    ck(hipStreamBeginCapture(stream, hipStreamCaptureModeThreadLocal), "history regression capture");
     k::ple_history_advance(history, norm, stream);
-    ck(cudaStreamEndCapture(stream, &graph), "history regression capture end");
-    ck(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0), "history regression instantiate");
+    ck(hipStreamEndCapture(stream, &graph), "history regression capture end");
+    ck(hipGraphInstantiateWithFlags(&executable, graph, 0), "history regression instantiate");
     int bad = 0;
     for (int token = 0; token < 12; ++token) {
         for (size_t c = 0; c < channels; ++c) {
@@ -214,10 +215,10 @@ int history_advance_regression() {
             for (size_t r = 0; r + 1 < rows; ++r) expected[c * rows + r] = expected[c * rows + r + 1];
             expected[c * rows + rows - 1] = normalized[c];
         }
-        ck(cudaMemcpyAsync(norm, normalized.data(), channels * sizeof(float), cudaMemcpyHostToDevice, stream), "history new normalized row");
-        ck(cudaGraphLaunch(executable, stream), "history captured advance");
-        ck(cudaStreamSynchronize(stream), "history captured advance sync");
-        ck(cudaMemcpy(actual.data(), history, count * sizeof(float), cudaMemcpyDeviceToHost), "history readback");
+        ck(hipMemcpyAsync(norm, normalized.data(), channels * sizeof(float), hipMemcpyHostToDevice, stream), "history new normalized row");
+        ck(hipGraphLaunch(executable, stream), "history captured advance");
+        ck(hipStreamSynchronize(stream), "history captured advance sync");
+        ck(hipMemcpy(actual.data(), history, count * sizeof(float), hipMemcpyDeviceToHost), "history readback");
         if (std::memcmp(actual.data(), expected.data(), count * sizeof(float)) != 0) {
             std::printf("  history advance mismatch after token %d\n", token);
             ++bad;
@@ -231,17 +232,17 @@ int history_advance_regression() {
     if (!overlap_refused || !null_refused) ++bad;
     auto guard_ok = [&](float* storage, size_t payload) {
         uint8_t before[64], after[64];
-        ck(cudaMemcpy(before, storage, sizeof(before), cudaMemcpyDeviceToHost), "history prefix guard");
-        ck(cudaMemcpy(after, storage + guard + payload, sizeof(after), cudaMemcpyDeviceToHost), "history suffix guard");
+        ck(hipMemcpy(before, storage, sizeof(before), hipMemcpyDeviceToHost), "history prefix guard");
+        ck(hipMemcpy(after, storage + guard + payload, sizeof(after), hipMemcpyDeviceToHost), "history suffix guard");
         return std::all_of(before, before + 64, [](uint8_t b) { return b == 0xa5; }) &&
                std::all_of(after, after + 64, [](uint8_t b) { return b == 0xa5; });
     };
     if (!guard_ok(history_storage, count) || !guard_ok(norm_storage, channels)) ++bad;
     std::printf("  PLE history 12 captured steps, row-fastest state and guards: %s\n", bad == 0 ? "pass" : "FAIL");
-    ck(cudaGraphExecDestroy(executable), "history graph exec destroy");
-    ck(cudaGraphDestroy(graph), "history graph destroy");
-    ck(cudaStreamDestroy(stream), "history stream destroy");
-    cudaFree(history_storage); cudaFree(norm_storage);
+    ck(hipGraphExecDestroy(executable), "history graph exec destroy");
+    ck(hipGraphDestroy(graph), "history graph destroy");
+    ck(hipStreamDestroy(stream), "history stream destroy");
+    hipFree(history_storage); hipFree(norm_storage);
     return bad;
 }
 
@@ -657,30 +658,30 @@ int main(int argc, char** argv) {
     uint8_t* d_kc = nullptr;
     uint16_t *d_vb = nullptr, *d_c1 = nullptr;
     float *d_g = nullptr, *d_v = nullptr, *d_gd = nullptr, *d_nm = nullptr, *d_co = nullptr;
-    ck(cudaMalloc(&d_emb, nd * 4), "emb");
-    ck(cudaMalloc(&d_hid, hcd * 4), "hid");
-    ck(cudaMalloc(&d_hist, (size_t) k::NG_HIST * hcd * 4), "hist");
-    ck(cudaMalloc(&d_nk, hcd * 4), "nk");
-    ck(cudaMalloc(&d_nq, hcd * 4), "nq");
-    ck(cudaMalloc(&d_nc, hcd * 4), "nc");
-    ck(cudaMalloc(&d_kc, key_codes.size()), "kc");
-    ck(cudaMalloc(&d_vb, value_bf16.size() * 2), "vb");
-    ck(cudaMalloc(&d_c1, conv1d_f16.size() * 2), "c1");
-    ck(cudaMalloc(&d_g, k::NG_HC * 4), "g");
-    ck(cudaMalloc(&d_v, nd * 4), "v");
-    ck(cudaMalloc(&d_gd, hcd * 4), "gd");
-    ck(cudaMalloc(&d_nm, hcd * 4), "nm");
-    ck(cudaMalloc(&d_co, hcd * 4), "co");
-    ck(cudaMalloc(&d_ck, hcd * 4), "ck");
-    ck(cudaMalloc(&d_cv, nd * 4), "cv");
-    ck(cudaMalloc(&d_cn, hcd * 4), "cn");
-    ck(cudaMalloc(&d_cr, hcd * 4), "cr");
-    ck(cudaMemcpy(d_nk, cap.w_nk.data(), hcd * 4, cudaMemcpyHostToDevice), "cnk");
-    ck(cudaMemcpy(d_nq, cap.w_nq.data(), hcd * 4, cudaMemcpyHostToDevice), "cnq");
-    ck(cudaMemcpy(d_nc, cap.w_nc.data(), hcd * 4, cudaMemcpyHostToDevice), "cnc");
-    ck(cudaMemcpy(d_kc, key_codes.data(), key_codes.size(), cudaMemcpyHostToDevice), "ckc");
-    ck(cudaMemcpy(d_vb, value_bf16.data(), value_bf16.size() * 2, cudaMemcpyHostToDevice), "cvb");
-    ck(cudaMemcpy(d_c1, conv1d_f16.data(), conv1d_f16.size() * 2, cudaMemcpyHostToDevice), "cc1");
+    ck(hipMalloc(&d_emb, nd * 4), "emb");
+    ck(hipMalloc(&d_hid, hcd * 4), "hid");
+    ck(hipMalloc(&d_hist, (size_t) k::NG_HIST * hcd * 4), "hist");
+    ck(hipMalloc(&d_nk, hcd * 4), "nk");
+    ck(hipMalloc(&d_nq, hcd * 4), "nq");
+    ck(hipMalloc(&d_nc, hcd * 4), "nc");
+    ck(hipMalloc(&d_kc, key_codes.size()), "kc");
+    ck(hipMalloc(&d_vb, value_bf16.size() * 2), "vb");
+    ck(hipMalloc(&d_c1, conv1d_f16.size() * 2), "c1");
+    ck(hipMalloc(&d_g, k::NG_HC * 4), "g");
+    ck(hipMalloc(&d_v, nd * 4), "v");
+    ck(hipMalloc(&d_gd, hcd * 4), "gd");
+    ck(hipMalloc(&d_nm, hcd * 4), "nm");
+    ck(hipMalloc(&d_co, hcd * 4), "co");
+    ck(hipMalloc(&d_ck, hcd * 4), "ck");
+    ck(hipMalloc(&d_cv, nd * 4), "cv");
+    ck(hipMalloc(&d_cn, hcd * 4), "cn");
+    ck(hipMalloc(&d_cr, hcd * 4), "cr");
+    ck(hipMemcpy(d_nk, cap.w_nk.data(), hcd * 4, hipMemcpyHostToDevice), "cnk");
+    ck(hipMemcpy(d_nq, cap.w_nq.data(), hcd * 4, hipMemcpyHostToDevice), "cnq");
+    ck(hipMemcpy(d_nc, cap.w_nc.data(), hcd * 4, hipMemcpyHostToDevice), "cnc");
+    ck(hipMemcpy(d_kc, key_codes.data(), key_codes.size(), hipMemcpyHostToDevice), "ckc");
+    ck(hipMemcpy(d_vb, value_bf16.data(), value_bf16.size() * 2, hipMemcpyHostToDevice), "cvb");
+    ck(hipMemcpy(d_c1, conv1d_f16.data(), conv1d_f16.size() * 2, hipMemcpyHostToDevice), "cc1");
 
     k::PleWeights w{};
     w.key_codes = d_kc;
@@ -691,8 +692,8 @@ int main(int argc, char** argv) {
     w.norm_conv = d_nc;
     w.conv1d_f16 = d_c1;
     float* d_ks = nullptr;
-    ck(cudaMalloc(&d_ks, key_scales.size() * 4), "ks");
-    ck(cudaMemcpy(d_ks, key_scales.data(), key_scales.size() * 4, cudaMemcpyHostToDevice), "cks");
+    ck(hipMalloc(&d_ks, key_scales.size() * 4), "ks");
+    ck(hipMemcpy(d_ks, key_scales.data(), key_scales.size() * 4, hipMemcpyHostToDevice), "cks");
     w.key_scales = d_ks;
 
     // Per-stage comparison.  Each stage the oracle records is a separate line, so a mismatch says WHICH part
@@ -714,19 +715,19 @@ int main(int argc, char** argv) {
     // ggml layout for the state is `ne=(hist, hc_dim)`: flat = row + NG_HIST*channel.
     std::vector<float> hist_state = cap.hist;
     for (int t = 0; t < cap.nt; ++t) {
-        ck(cudaMemcpy(d_emb, cap.emb.data() + (size_t) t * nd, nd * 4, cudaMemcpyHostToDevice), "cemb");
-        ck(cudaMemcpy(d_hid, cap.hidden.data() + (size_t) t * hcd, hcd * 4, cudaMemcpyHostToDevice), "chid");
-        ck(cudaMemcpy(d_hist, hist_state.data(), (size_t) k::NG_HIST * hcd * 4, cudaMemcpyHostToDevice),
+        ck(hipMemcpy(d_emb, cap.emb.data() + (size_t) t * nd, nd * 4, hipMemcpyHostToDevice), "cemb");
+        ck(hipMemcpy(d_hid, cap.hidden.data() + (size_t) t * hcd, hcd * 4, hipMemcpyHostToDevice), "chid");
+        ck(hipMemcpy(d_hist, hist_state.data(), (size_t) k::NG_HIST * hcd * 4, hipMemcpyHostToDevice),
            "chist");
         k::PleOut out{};
         out.key = d_ck; out.value = d_cv; out.gate = d_g; out.gated = d_gd;
         out.normalized = d_nm; out.conv = d_co; out.result = d_cr;
         // the workspace is the caller's, and the sync the block used to do is now the caller's too
     void* ple_ws = nullptr;
-    ck(cudaMalloc(&ple_ws, k::ple_block_scratch_bytes()), "ple_block scratch");
+    ck(hipMalloc(&ple_ws, k::ple_block_scratch_bytes()), "ple_block scratch");
     if (t == 0) {
         const size_t bytes = (size_t) k::ple_block_scratch_bytes();
-        ck(cudaMemset(ple_ws, 0xa5, bytes), "PLE prelaunch guard sentinel");
+        ck(hipMemset(ple_ws, 0xa5, bytes), "PLE prelaunch guard sentinel");
         const struct AliasCase { float* k::PleOut::* field; size_t offset; } cases[] = {
             {&k::PleOut::key, 0}, {&k::PleOut::value, hcd}, {&k::PleOut::gate, hcd + nd},
             {&k::PleOut::gated, hcd + nd + (size_t) k::NG_HC},
@@ -740,9 +741,9 @@ int main(int argc, char** argv) {
             try { k::ple_block(d_emb, d_hid, d_hist, w, invalid, ple_ws, nullptr); }
             catch (const std::invalid_argument&) { ++refused; }
         }
-        ck(cudaDeviceSynchronize(), "PLE guard no-launch sync");
+        ck(hipDeviceSynchronize(), "PLE guard no-launch sync");
         std::vector<uint8_t> sentinel(bytes);
-        ck(cudaMemcpy(sentinel.data(), ple_ws, bytes, cudaMemcpyDeviceToHost), "PLE guard sentinel readback");
+        ck(hipMemcpy(sentinel.data(), ple_ws, bytes, hipMemcpyDeviceToHost), "PLE guard sentinel readback");
         const bool unchanged = std::all_of(sentinel.begin(), sentinel.end(), [](uint8_t b) { return b == 0xa5; });
         const bool rejected = refused == 7 && unchanged;
         std::printf("  PLE old caller output offsets rejected before launch: %s (%d/7, scratch %s)\n",
@@ -750,14 +751,14 @@ int main(int argc, char** argv) {
         if (!rejected) ++bad;
     }
     k::ple_block(d_emb, d_hid, d_hist, w, out, ple_ws, nullptr);
-    ck(cudaDeviceSynchronize(), "ple_block sync");
-        ck(cudaMemcpy(dev_key.data(), d_ck, hcd * 4, cudaMemcpyDeviceToHost), "rck");
-        ck(cudaMemcpy(dev_value.data(), d_cv, nd * 4, cudaMemcpyDeviceToHost), "rcv");
-        ck(cudaMemcpy(dev_gate.data(), d_g, k::NG_HC * 4, cudaMemcpyDeviceToHost), "rg");
-        ck(cudaMemcpy(dev_gated.data(), d_gd, hcd * 4, cudaMemcpyDeviceToHost), "rgd");
-        ck(cudaMemcpy(dev_norm.data(), d_nm, hcd * 4, cudaMemcpyDeviceToHost), "rnm");
-        ck(cudaMemcpy(dev_conv.data(), d_co, hcd * 4, cudaMemcpyDeviceToHost), "rco");
-        ck(cudaMemcpy(dev_res.data(), d_cr, hcd * 4, cudaMemcpyDeviceToHost), "rcr");
+    ck(hipDeviceSynchronize(), "ple_block sync");
+        ck(hipMemcpy(dev_key.data(), d_ck, hcd * 4, hipMemcpyDeviceToHost), "rck");
+        ck(hipMemcpy(dev_value.data(), d_cv, nd * 4, hipMemcpyDeviceToHost), "rcv");
+        ck(hipMemcpy(dev_gate.data(), d_g, k::NG_HC * 4, hipMemcpyDeviceToHost), "rg");
+        ck(hipMemcpy(dev_gated.data(), d_gd, hcd * 4, hipMemcpyDeviceToHost), "rgd");
+        ck(hipMemcpy(dev_norm.data(), d_nm, hcd * 4, hipMemcpyDeviceToHost), "rnm");
+        ck(hipMemcpy(dev_conv.data(), d_co, hcd * 4, hipMemcpyDeviceToHost), "rco");
+        ck(hipMemcpy(dev_res.data(), d_cr, hcd * 4, hipMemcpyDeviceToHost), "rcr");
 
         const size_t ok_ = (size_t) t * hcd, ov = (size_t) t * nd, og = (size_t) t * (size_t) k::NG_HC;
         const Stage stages[] = {
@@ -809,18 +810,18 @@ int main(int argc, char** argv) {
                 }
                 reference_value[row] = float(sum);
             }
-            ck(cudaMemcpy(d_emb, witness.data(), nd * sizeof(float), cudaMemcpyHostToDevice), "native PLE witness");
+            ck(hipMemcpy(d_emb, witness.data(), nd * sizeof(float), hipMemcpyHostToDevice), "native PLE witness");
             k::ple_block(d_emb, d_hid, d_hist, w, out, ple_ws, nullptr);
-            ck(cudaDeviceSynchronize(), "legacy PLE witness sync");
+            ck(hipDeviceSynchronize(), "legacy PLE witness sync");
             std::vector<float> legacy_value(nd);
-            ck(cudaMemcpy(legacy_value.data(), d_cv, nd * sizeof(float), cudaMemcpyDeviceToHost), "legacy PLE witness value");
-            cudaStream_t stream;
-            ck(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "native PLE stream");
+            ck(hipMemcpy(legacy_value.data(), d_cv, nd * sizeof(float), hipMemcpyDeviceToHost), "legacy PLE witness value");
+            hipStream_t stream;
+            ck(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), "native PLE stream");
             k::ple_set_native_bf16(true);
             k::ple_block(d_emb, d_hid, d_hist, w, out, ple_ws, stream);
-            ck(cudaStreamSynchronize(stream), "native PLE sync");
-            ck(cudaMemcpy(native_value.data(), d_cv, nd * sizeof(float), cudaMemcpyDeviceToHost), "native PLE value");
-            ck(cudaMemcpy(native_result.data(), d_cr, hcd * sizeof(float), cudaMemcpyDeviceToHost), "native PLE result");
+            ck(hipStreamSynchronize(stream), "native PLE sync");
+            ck(hipMemcpy(native_value.data(), d_cv, nd * sizeof(float), hipMemcpyDeviceToHost), "native PLE value");
+            ck(hipMemcpy(native_result.data(), d_cr, hcd * sizeof(float), hipMemcpyDeviceToHost), "native PLE result");
             long long nf = 0;
             const double rel = rel_l1(reference_value.data(), native_value.data(), nd, nullptr, &nf);
             const double separation = rel_l1(native_value.data(), legacy_value.data(), nd);
@@ -828,26 +829,26 @@ int main(int argc, char** argv) {
             std::printf("  native PLE value: %s (ref rel %.3e, BF16 separation %.3e)\n",
                         correct ? "pass" : "FAIL", rel, separation);
             if (!correct) ++bad;
-            cudaGraph_t graph;
-            cudaGraphExec_t executable;
-            ck(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "native PLE capture");
+            hipGraph_t graph;
+            hipGraphExec_t executable;
+            ck(hipStreamBeginCapture(stream, hipStreamCaptureModeThreadLocal), "native PLE capture");
             k::ple_block(d_emb, d_hid, d_hist, w, out, ple_ws, stream);
-            ck(cudaStreamEndCapture(stream, &graph), "native PLE capture end");
-            ck(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0), "native PLE instantiate");
+            ck(hipStreamEndCapture(stream, &graph), "native PLE capture end");
+            ck(hipGraphInstantiateWithFlags(&executable, graph, 0), "native PLE instantiate");
             k::ple_set_native_bf16(false);
-            ck(cudaGraphLaunch(executable, stream), "native PLE replay");
-            ck(cudaStreamSynchronize(stream), "native PLE replay sync");
-            ck(cudaMemcpy(replay.data(), d_cr, hcd * sizeof(float), cudaMemcpyDeviceToHost), "native PLE replay result");
+            ck(hipGraphLaunch(executable, stream), "native PLE replay");
+            ck(hipStreamSynchronize(stream), "native PLE replay sync");
+            ck(hipMemcpy(replay.data(), d_cr, hcd * sizeof(float), hipMemcpyDeviceToHost), "native PLE replay result");
             const bool captured = std::memcmp(native_result.data(), replay.data(), hcd * sizeof(float)) == 0;
             std::printf("  native PLE captured selection: %s\n", captured ? "byte-identical" : "FAIL");
             if (!captured) ++bad;
-            ck(cudaGraphExecDestroy(executable), "native PLE graph exec destroy");
-            ck(cudaGraphDestroy(graph), "native PLE graph destroy");
-            ck(cudaStreamDestroy(stream), "native PLE stream destroy");
-            ck(cudaMemcpy(d_emb, cap.emb.data(), nd * sizeof(float), cudaMemcpyHostToDevice), "restore PLE embedding");
+            ck(hipGraphExecDestroy(executable), "native PLE graph exec destroy");
+            ck(hipGraphDestroy(graph), "native PLE graph destroy");
+            ck(hipStreamDestroy(stream), "native PLE stream destroy");
+            ck(hipMemcpy(d_emb, cap.emb.data(), nd * sizeof(float), hipMemcpyHostToDevice), "restore PLE embedding");
             k::ple_block(d_emb, d_hid, d_hist, w, out, ple_ws, nullptr);
-            ck(cudaDeviceSynchronize(), "restored PLE sync");
-            ck(cudaMemcpy(replay.data(), d_cr, hcd * sizeof(float), cudaMemcpyDeviceToHost), "restored PLE result");
+            ck(hipDeviceSynchronize(), "restored PLE sync");
+            ck(hipMemcpy(replay.data(), d_cr, hcd * sizeof(float), hipMemcpyDeviceToHost), "restored PLE result");
             const bool restored = std::memcmp(dev_res.data(), replay.data(), hcd * sizeof(float)) == 0;
             std::printf("  restored PLE default: %s\n", restored ? "byte-identical" : "FAIL");
             if (!restored) ++bad;
@@ -866,20 +867,20 @@ int main(int argc, char** argv) {
             }
             void *native_storage = nullptr, *q_storage = nullptr;
             float* raw_projection = nullptr;
-            ck(cudaMalloc(&native_storage, native_bytes + 2 * guard), "native PLE weights");
-            ck(cudaMalloc(&q_storage, qbytes + 2 * guard), "native PLE q8 scratch");
-            ck(cudaMalloc(&raw_projection, hcd * 4), "native PLE raw projection");
-            ck(cudaMemset(native_storage, 0xa5, native_bytes + 2 * guard), "native PLE weight guards");
-            ck(cudaMemset(q_storage, 0xa5, qbytes + 2 * guard), "native PLE q8 guards");
+            ck(hipMalloc(&native_storage, native_bytes + 2 * guard), "native PLE weights");
+            ck(hipMalloc(&q_storage, qbytes + 2 * guard), "native PLE q8 scratch");
+            ck(hipMalloc(&raw_projection, hcd * 4), "native PLE raw projection");
+            ck(hipMemset(native_storage, 0xa5, native_bytes + 2 * guard), "native PLE weight guards");
+            ck(hipMemset(q_storage, 0xa5, qbytes + 2 * guard), "native PLE q8 guards");
             void* native_data = static_cast<uint8_t*>(native_storage) + guard;
             void* native_q = static_cast<uint8_t*>(q_storage) + guard;
-            ck(cudaMemcpy(native_data, native_key.data(), native_bytes, cudaMemcpyHostToDevice), "native PLE weights upload");
+            ck(hipMemcpy(native_data, native_key.data(), native_bytes, hipMemcpyHostToDevice), "native PLE weights upload");
             k::PleWeights nw = w;
             nw.key_native_data = native_data; nw.key_native_type = 42; nw.key_native_q8_1 = native_q;
-            cudaStream_t stream;
-            ck(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "native PLE key stream");
+            hipStream_t stream;
+            ck(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), "native PLE key stream");
             const size_t workspace_bytes = (size_t) k::ple_block_scratch_bytes();
-            ck(cudaMemset(ple_ws, 0xa5, workspace_bytes), "native PLE no-launch sentinel");
+            ck(hipMemset(ple_ws, 0xa5, workspace_bytes), "native PLE no-launch sentinel");
             int refused = 0;
             for (int c = 0; c < 9; ++c) {
                 auto invalid = nw;
@@ -894,20 +895,20 @@ int main(int argc, char** argv) {
                 try { k::ple_block(d_emb, d_hid, d_hist, invalid, out, ple_ws, c == 2 ? nullptr : stream); }
                 catch (const std::invalid_argument&) { ++refused; }
             }
-            ck(cudaStreamSynchronize(stream), "native PLE refusal sync");
+            ck(hipStreamSynchronize(stream), "native PLE refusal sync");
             std::vector<uint8_t> sentinel(workspace_bytes);
-            ck(cudaMemcpy(sentinel.data(), ple_ws, workspace_bytes, cudaMemcpyDeviceToHost), "native PLE refusal sentinel");
+            ck(hipMemcpy(sentinel.data(), ple_ws, workspace_bytes, hipMemcpyDeviceToHost), "native PLE refusal sentinel");
             const bool untouched = std::all_of(sentinel.begin(), sentinel.end(), [](uint8_t x) { return x == 0xa5; });
             std::printf("  native PLE key prelaunch guards: %s (%d/9, workspace %s)\n",
                         refused == 9 && untouched ? "pass" : "FAIL", refused, untouched ? "unchanged" : "changed");
             if (refused != 9 || !untouched) ++bad;
-            cudaGraph_t graph = nullptr; cudaGraphExec_t executable = nullptr;
+            hipGraph_t graph = nullptr; hipGraphExec_t executable = nullptr;
             std::vector<float> projected(hcd), normalized(hcd), actual_key(hcd), actual_result(hcd), replay(hcd);
             for (int p = 0; p < std::min(cap.nt, 2); ++p) {
-                ck(cudaMemcpy(d_emb, cap.emb.data() + (size_t) p * nd, nd * 4, cudaMemcpyHostToDevice), "native PLE key input");
+                ck(hipMemcpy(d_emb, cap.emb.data() + (size_t) p * nd, nd * 4, hipMemcpyHostToDevice), "native PLE key input");
                 k::native_q2_0_f32(native_data, d_emb, native_q, raw_projection, k::NG_N_EMBD, k::NG_HC_DIM, 1, stream);
-                ck(cudaStreamSynchronize(stream), "native PLE raw key sync");
-                ck(cudaMemcpy(projected.data(), raw_projection, hcd * 4, cudaMemcpyDeviceToHost), "native PLE raw key read");
+                ck(hipStreamSynchronize(stream), "native PLE raw key sync");
+                ck(hipMemcpy(projected.data(), raw_projection, hcd * 4, hipMemcpyDeviceToHost), "native PLE raw key read");
                 for (int c = 0; c < k::NG_HC; ++c) {
                     double sum = 0;
                     for (size_t j = 0; j < nd; ++j) { const float v = projected[(size_t) c * nd + j]; sum += double(v * v); }
@@ -915,44 +916,44 @@ int main(int argc, char** argv) {
                     for (size_t j = 0; j < nd; ++j) { const size_t i = (size_t) c * nd + j; normalized[i] = projected[i] * scale * cap.w_nk[i]; }
                 }
                 k::ple_block(d_emb, d_hid, d_hist, nw, out, ple_ws, stream);
-                ck(cudaStreamSynchronize(stream), "native PLE key direct sync");
-                ck(cudaMemcpy(actual_key.data(), d_ck, hcd * 4, cudaMemcpyDeviceToHost), "native PLE key read");
-                ck(cudaMemcpy(actual_result.data(), d_cr, hcd * 4, cudaMemcpyDeviceToHost), "native PLE result read");
+                ck(hipStreamSynchronize(stream), "native PLE key direct sync");
+                ck(hipMemcpy(actual_key.data(), d_ck, hcd * 4, hipMemcpyDeviceToHost), "native PLE key read");
+                ck(hipMemcpy(actual_result.data(), d_cr, hcd * 4, hipMemcpyDeviceToHost), "native PLE result read");
                 const double rel = rel_l1(normalized.data(), actual_key.data(), hcd);
                 const bool wired = le(rel, 2e-6) && nonfinite(actual_result.data(), hcd) == 0;
                 std::printf("  native PLE key projection->existing norm input %d: %s (rel %.3e)\n", p, wired ? "pass" : "FAIL", rel);
                 if (!wired) ++bad;
                 if (p == 0) {
-                    ck(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "native PLE key capture");
+                    ck(hipStreamBeginCapture(stream, hipStreamCaptureModeThreadLocal), "native PLE key capture");
                     k::ple_block(d_emb, d_hid, d_hist, nw, out, ple_ws, stream);
-                    ck(cudaStreamEndCapture(stream, &graph), "native PLE key capture end");
-                    ck(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0), "native PLE key instantiate");
+                    ck(hipStreamEndCapture(stream, &graph), "native PLE key capture end");
+                    ck(hipGraphInstantiateWithFlags(&executable, graph, 0), "native PLE key instantiate");
                 }
                 nw.key_native_data = nullptr; // graph selection must survive descriptor changes
                 for (int repeat = 0; repeat < 2; ++repeat) {
-                    ck(cudaGraphLaunch(executable, stream), "native PLE key replay");
-                    ck(cudaStreamSynchronize(stream), "native PLE key replay sync");
-                    ck(cudaMemcpy(replay.data(), d_cr, hcd * 4, cudaMemcpyDeviceToHost), "native PLE key replay read");
+                    ck(hipGraphLaunch(executable, stream), "native PLE key replay");
+                    ck(hipStreamSynchronize(stream), "native PLE key replay sync");
+                    ck(hipMemcpy(replay.data(), d_cr, hcd * 4, hipMemcpyDeviceToHost), "native PLE key replay read");
                     if (std::memcmp(actual_result.data(), replay.data(), hcd * 4) != 0) ++bad;
                 }
                 nw.key_native_data = native_data;
             }
-            ck(cudaGraphExecDestroy(executable), "native PLE key executable destroy");
-            ck(cudaGraphDestroy(graph), "native PLE key graph destroy");
+            ck(hipGraphExecDestroy(executable), "native PLE key executable destroy");
+            ck(hipGraphDestroy(graph), "native PLE key graph destroy");
             for (int b = 0; b < 2; ++b) {
                 const void* storage = b == 0 ? native_storage : q_storage;
                 const size_t payload = b == 0 ? native_bytes : qbytes;
                 std::vector<uint8_t> ends(2 * guard);
-                ck(cudaMemcpy(ends.data(), storage, guard, cudaMemcpyDeviceToHost), "native PLE prefix guard");
-                ck(cudaMemcpy(ends.data() + guard, static_cast<const uint8_t*>(storage) + guard + payload, guard, cudaMemcpyDeviceToHost), "native PLE suffix guard");
+                ck(hipMemcpy(ends.data(), storage, guard, hipMemcpyDeviceToHost), "native PLE prefix guard");
+                ck(hipMemcpy(ends.data() + guard, static_cast<const uint8_t*>(storage) + guard + payload, guard, hipMemcpyDeviceToHost), "native PLE suffix guard");
                 if (!std::all_of(ends.begin(), ends.end(), [](uint8_t x) { return x == 0xa5; })) ++bad;
             }
-            ck(cudaStreamDestroy(stream), "native PLE key stream destroy");
-            cudaFree(raw_projection); cudaFree(q_storage); cudaFree(native_storage);
-            ck(cudaMemcpy(d_emb, cap.emb.data(), nd * 4, cudaMemcpyHostToDevice), "native PLE restore input");
+            ck(hipStreamDestroy(stream), "native PLE key stream destroy");
+            hipFree(raw_projection); hipFree(q_storage); hipFree(native_storage);
+            ck(hipMemcpy(d_emb, cap.emb.data(), nd * 4, hipMemcpyHostToDevice), "native PLE restore input");
             k::ple_block(d_emb, d_hid, d_hist, w, out, ple_ws, nullptr);
-            ck(cudaDeviceSynchronize(), "native PLE default restore sync");
-            ck(cudaMemcpy(replay.data(), d_cr, hcd * 4, cudaMemcpyDeviceToHost), "native PLE default restore read");
+            ck(hipDeviceSynchronize(), "native PLE default restore sync");
+            ck(hipMemcpy(replay.data(), d_cr, hcd * 4, hipMemcpyDeviceToHost), "native PLE default restore read");
             const bool restored = std::memcmp(dev_res.data(), replay.data(), hcd * 4) == 0;
             std::printf("  native PLE key graph/repeat/buffer guards checked; restored default: %s\n", restored ? "byte-identical" : "FAIL");
             if (!restored) ++bad;
@@ -963,21 +964,21 @@ int main(int argc, char** argv) {
             // workspace; result may overwrite hidden once its original values are no longer needed.
             const size_t workspace_bytes = (size_t) k::ple_block_scratch_bytes();
             void* compact_workspace = nullptr;
-            ck(cudaMalloc(&compact_workspace, workspace_bytes + hcd * sizeof(float)), "compact PLE workspace");
+            ck(hipMalloc(&compact_workspace, workspace_bytes + hcd * sizeof(float)), "compact PLE workspace");
             k::PleOut compact{};
             compact.normalized = reinterpret_cast<float*>(static_cast<uint8_t*>(compact_workspace) + workspace_bytes);
             compact.result = d_hid;
             k::ple_block(d_emb, d_hid, d_hist, w, compact, compact_workspace, nullptr);
-            ck(cudaDeviceSynchronize(), "compact PLE sync");
+            ck(hipDeviceSynchronize(), "compact PLE sync");
             std::vector<float> compact_norm(hcd), compact_result(hcd);
-            ck(cudaMemcpy(compact_norm.data(), compact.normalized, hcd * sizeof(float), cudaMemcpyDeviceToHost), "compact PLE normalized");
-            ck(cudaMemcpy(compact_result.data(), d_hid, hcd * sizeof(float), cudaMemcpyDeviceToHost), "compact PLE result");
+            ck(hipMemcpy(compact_norm.data(), compact.normalized, hcd * sizeof(float), hipMemcpyDeviceToHost), "compact PLE normalized");
+            ck(hipMemcpy(compact_result.data(), d_hid, hcd * sizeof(float), hipMemcpyDeviceToHost), "compact PLE result");
             const bool equal = std::memcmp(compact_norm.data(), dev_norm.data(), hcd * sizeof(float)) == 0 &&
                                std::memcmp(compact_result.data(), dev_res.data(), hcd * sizeof(float)) == 0;
             std::printf("  PLE separate exports and in-place hidden result: %s\n", equal ? "byte-identical" : "FAIL");
             if (!equal) ++bad;
-            ck(cudaMemcpy(d_hid, cap.hidden.data(), hcd * sizeof(float), cudaMemcpyHostToDevice), "restore PLE hidden input");
-            cudaFree(compact_workspace);
+            ck(hipMemcpy(d_hid, cap.hidden.data(), hcd * sizeof(float), hipMemcpyHostToDevice), "restore PLE hidden input");
+            hipFree(compact_workspace);
         }
 
         // slide the conv state by one NORMALIZED row, which is what the next token's window needs
@@ -986,7 +987,7 @@ int main(int argc, char** argv) {
                 hist_state[r + (size_t) k::NG_HIST * c] = hist_state[(r + 1) + (size_t) k::NG_HIST * c];
         for (size_t c = 0; c < hcd; ++c)
             hist_state[((size_t) k::NG_HIST - 1) + (size_t) k::NG_HIST * c] = dev_norm[c];
-        cudaFree(ple_ws);
+        hipFree(ple_ws);
     }
 
     // ---- the trap that matters most: gated vs normalized as the conv input --------------------------
@@ -1182,3 +1183,4 @@ int main(int argc, char** argv) {
     if (selftest) std::printf("ple_parity OK\n");
     return 0;
 }
+

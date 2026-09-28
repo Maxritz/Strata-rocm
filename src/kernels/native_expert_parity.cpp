@@ -1,3 +1,4 @@
+﻿#include "hip/hip_runtime.h"
 // src/kernels/native_expert_parity.cpp - plan v0.3 P6: one native expert three ways, on real GGUF rows.
 //
 //     build/native_expert_parity <shard1.gguf> [layer ...]
@@ -16,7 +17,7 @@
 
 #include "ggml.h"
 
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
 
 #include <chrono>
 #include <cmath>
@@ -44,8 +45,8 @@ int main(int argc, char** argv) {
     const int NT = 3, E = 7;
     const int64_t H = 2560, FF = 640;
     int failures = 0;
-    cudaStream_t s;
-    cudaStreamCreate(&s);
+    hipStream_t s;
+    hipStreamCreate(&s);
     for (int l : layers) {
         const strata::TensorInfo* t[3] = {};
         const char* roles[3] = {"gate", "up", "down"};
@@ -212,31 +213,31 @@ int main(int argc, char** argv) {
             float* dout;
             unsigned long long* dptr;
             int32_t *dstart, *dn, *ddst, *dtok;
-            cudaMalloc(&dblob, blob.size());
-            cudaMalloc(&dx, x.size() * 4);
-            cudaMalloc(&dxq, (size_t) NT * H / 32 * 36);
-            cudaMalloc(&dscr, strata::kernels::native_expert_scratch_bytes(NT, FF));
-            cudaMalloc((void**) &dout, (size_t) NT * H * 4);
-            cudaMalloc((void**) &dptr, 8);
-            cudaMalloc((void**) &dstart, 8);
-            cudaMalloc((void**) &dn, 4);
-            cudaMalloc((void**) &ddst, NT * 4);
-            cudaMalloc((void**) &dtok, NT * 4);
-            cudaMemcpy(dblob, blob.data(), blob.size(), cudaMemcpyHostToDevice);
-            cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice);
+            hipMalloc(&dblob, blob.size());
+            hipMalloc(&dx, x.size() * 4);
+            hipMalloc(&dxq, (size_t) NT * H / 32 * 36);
+            hipMalloc(&dscr, strata::kernels::native_expert_scratch_bytes(NT, FF));
+            hipMalloc((void**) &dout, (size_t) NT * H * 4);
+            hipMalloc((void**) &dptr, 8);
+            hipMalloc((void**) &dstart, 8);
+            hipMalloc((void**) &dn, 4);
+            hipMalloc((void**) &ddst, NT * 4);
+            hipMalloc((void**) &dtok, NT * 4);
+            hipMemcpy(dblob, blob.data(), blob.size(), hipMemcpyHostToDevice);
+            hipMemcpy(dx, x.data(), x.size() * 4, hipMemcpyHostToDevice);
             const unsigned long long p = (unsigned long long) dblob;
             const int32_t st[2] = {0, NT}, one = 1, idx[NT] = {0, 1, 2};
-            cudaMemcpy(dptr, &p, 8, cudaMemcpyHostToDevice);
-            cudaMemcpy(dstart, st, 8, cudaMemcpyHostToDevice);
-            cudaMemcpy(dn, &one, 4, cudaMemcpyHostToDevice);
-            cudaMemcpy(ddst, idx, NT * 4, cudaMemcpyHostToDevice);
-            cudaMemcpy(dtok, idx, NT * 4, cudaMemcpyHostToDevice);
+            hipMemcpy(dptr, &p, 8, hipMemcpyHostToDevice);
+            hipMemcpy(dstart, st, 8, hipMemcpyHostToDevice);
+            hipMemcpy(dn, &one, 4, hipMemcpyHostToDevice);
+            hipMemcpy(ddst, idx, NT * 4, hipMemcpyHostToDevice);
+            hipMemcpy(dtok, idx, NT * 4, hipMemcpyHostToDevice);
             strata::kernels::quantize_q8_1_rows((const float*) dx, NT, H, dxq, s);
             strata::kernels::native_expert_grouped(L, dptr, dstart, dn, ddst, dtok, 1, NT, dxq, dscr, dout, s);
-            cudaStreamSynchronize(s);
-            cudaMemcpy(got_g.data(), dout, got_g.size() * 4, cudaMemcpyDeviceToHost);
-            cudaFree(dblob); cudaFree(dx); cudaFree(dxq); cudaFree(dscr); cudaFree(dout); cudaFree(dptr);
-            cudaFree(dstart); cudaFree(dn); cudaFree(ddst); cudaFree(dtok);
+            hipStreamSynchronize(s);
+            hipMemcpy(got_g.data(), dout, got_g.size() * 4, hipMemcpyDeviceToHost);
+            hipFree(dblob); hipFree(dx); hipFree(dxq); hipFree(dscr); hipFree(dout); hipFree(dptr);
+            hipFree(dstart); hipFree(dn); hipFree(ddst); hipFree(dtok);
         }
         const double ec = rel(got_c, ref), eg = rel(got_g, ref), ecg = rel(got_c, got_g);
         const bool ok = ec < 3e-2 && eg < 3e-2 && std::isfinite(ec) && std::isfinite(eg);
@@ -248,3 +249,4 @@ int main(int argc, char** argv) {
     std::printf("native_expert_parity: %d failures\n", failures);
     return failures ? 1 : 0;
 }
+

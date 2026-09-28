@@ -1,3 +1,4 @@
+﻿#include "hip/hip_runtime.h"
 // src/kernels/s_gemv_parity.cpp - P2.S2's parity test for the S-family GEMV.
 //
 // Four source types, chosen to cover every branch the kernel has:
@@ -20,7 +21,7 @@
 #include "strata/artifact/dequant.hpp"
 #include "strata/kernels/s_gemv.hpp"
 
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
 
 #include <cmath>
 #include <cstdint>
@@ -34,9 +35,9 @@
 
 namespace {
 
-void check(cudaError_t e, const char* what) {
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e));
+void check(hipError_t e, const char* what) {
+    if (e != hipSuccess) {
+        std::fprintf(stderr, "%s: %s\n", what, hipGetErrorString(e));
         std::exit(1);
     }
 }
@@ -234,20 +235,20 @@ void test_q4k(long long n_in, long long n_out, double tol, int* total_bad) {
     uint16_t* d_x = nullptr;
     uint8_t* d_codes = nullptr;
     float *d_scales = nullptr, *d_offsets = nullptr, *d_y = nullptr;
-    check(cudaMalloc(&d_x, x.size() * sizeof(uint16_t)), "cudaMalloc x");
-    check(cudaMalloc(&d_codes, codes.size()), "cudaMalloc codes");
-    check(cudaMalloc(&d_scales, scales.size() * sizeof(float)), "cudaMalloc scales");
-    check(cudaMalloc(&d_offsets, offsets.size() * sizeof(float)), "cudaMalloc offsets");
-    check(cudaMalloc(&d_y, (size_t) n_out * sizeof(float)), "cudaMalloc y");
-    check(cudaMemcpy(d_x, x.data(), x.size() * sizeof(uint16_t), cudaMemcpyHostToDevice), "copy x");
-    check(cudaMemcpy(d_codes, codes.data(), codes.size(), cudaMemcpyHostToDevice), "copy codes");
-    check(cudaMemcpy(d_scales, scales.data(), scales.size() * sizeof(float), cudaMemcpyHostToDevice),
+    check(hipMalloc(&d_x, x.size() * sizeof(uint16_t)), "hipMalloc x");
+    check(hipMalloc(&d_codes, codes.size()), "hipMalloc codes");
+    check(hipMalloc(&d_scales, scales.size() * sizeof(float)), "hipMalloc scales");
+    check(hipMalloc(&d_offsets, offsets.size() * sizeof(float)), "hipMalloc offsets");
+    check(hipMalloc(&d_y, (size_t) n_out * sizeof(float)), "hipMalloc y");
+    check(hipMemcpy(d_x, x.data(), x.size() * sizeof(uint16_t), hipMemcpyHostToDevice), "copy x");
+    check(hipMemcpy(d_codes, codes.data(), codes.size(), hipMemcpyHostToDevice), "copy codes");
+    check(hipMemcpy(d_scales, scales.data(), scales.size() * sizeof(float), hipMemcpyHostToDevice),
           "copy scales");
-    check(cudaMemcpy(d_offsets, offsets.data(), offsets.size() * sizeof(float), cudaMemcpyHostToDevice),
+    check(hipMemcpy(d_offsets, offsets.data(), offsets.size() * sizeof(float), hipMemcpyHostToDevice),
           "copy offsets");
     strata::kernels::s_gemv(d_x, d_codes, d_scales, d_offsets, d_y, n_in, n_out, form);
     std::vector<float> got((size_t) n_out);
-    check(cudaMemcpy(got.data(), d_y, got.size() * sizeof(float), cudaMemcpyDeviceToHost), "copy back");
+    check(hipMemcpy(got.data(), d_y, got.size() * sizeof(float), hipMemcpyDeviceToHost), "copy back");
 
     // THE ERROR IS MEASURED AGAINST sum|term|, NOT AGAINST THE RESULT.  A dot product of 2560 signed terms
     // cancels, so `|ref-got| / |ref|` is a statement about the condition number, not about the kernel: a row
@@ -283,11 +284,11 @@ void test_q4k(long long n_in, long long n_out, double tol, int* total_bad) {
         std::exit(1);
     }
     *total_bad += (int) bad;
-    cudaFree(d_x);
-    cudaFree(d_codes);
-    cudaFree(d_scales);
-    cudaFree(d_offsets);
-    cudaFree(d_y);
+    hipFree(d_x);
+    hipFree(d_codes);
+    hipFree(d_scales);
+    hipFree(d_offsets);
+    hipFree(d_y);
 }
 
 }  // namespace
@@ -313,13 +314,13 @@ void bench_s2_gemv(long long n_in, long long n_out, int iters, int* split_bad) {
     uint16_t* d_x = nullptr;
     uint8_t* d_codes = nullptr;
     float *d_scales = nullptr, *d_y = nullptr;
-    check(cudaMalloc(&d_x, x.size() * sizeof(uint16_t)), "bench x");
-    check(cudaMalloc(&d_codes, codes.size()), "bench codes");
-    check(cudaMalloc(&d_scales, scales.size() * sizeof(float)), "bench scales");
-    check(cudaMalloc(&d_y, (size_t) n_out * sizeof(float)), "bench y");
-    check(cudaMemcpy(d_x, x.data(), x.size() * sizeof(uint16_t), cudaMemcpyHostToDevice), "bench copy x");
-    check(cudaMemcpy(d_codes, codes.data(), codes.size(), cudaMemcpyHostToDevice), "bench copy codes");
-    check(cudaMemcpy(d_scales, scales.data(), scales.size() * sizeof(float), cudaMemcpyHostToDevice),
+    check(hipMalloc(&d_x, x.size() * sizeof(uint16_t)), "bench x");
+    check(hipMalloc(&d_codes, codes.size()), "bench codes");
+    check(hipMalloc(&d_scales, scales.size() * sizeof(float)), "bench scales");
+    check(hipMalloc(&d_y, (size_t) n_out * sizeof(float)), "bench y");
+    check(hipMemcpy(d_x, x.data(), x.size() * sizeof(uint16_t), hipMemcpyHostToDevice), "bench copy x");
+    check(hipMemcpy(d_codes, codes.data(), codes.size(), hipMemcpyHostToDevice), "bench copy codes");
+    check(hipMemcpy(d_scales, scales.data(), scales.size() * sizeof(float), hipMemcpyHostToDevice),
           "bench copy scales");
 
     for (int i = 0; i < 3; ++i) strata::kernels::s_gemv(d_x, d_codes, d_scales, nullptr, d_y, n_in, n_out, form);
@@ -358,7 +359,7 @@ void bench_s2_gemv(long long n_in, long long n_out, int iters, int* split_bad) {
     // sums in a different order - so this is a relative comparison, not bit equality.
     strata::kernels::s_gemv(d_x, d_codes, d_scales, nullptr, d_y, n_in, n_out, form);
     std::vector<float> ref_naive((size_t) n_out);
-    check(cudaMemcpy(ref_naive.data(), d_y, ref_naive.size() * sizeof(float), cudaMemcpyDeviceToHost),
+    check(hipMemcpy(ref_naive.data(), d_y, ref_naive.size() * sizeof(float), hipMemcpyDeviceToHost),
           "copy naive reference");
 
     // ---- the row-split variant, same planes, same process -------------------
@@ -379,7 +380,7 @@ void bench_s2_gemv(long long n_in, long long n_out, int iters, int* split_bad) {
 
         // correctness of the thing being timed
         std::vector<float> got((size_t) n_out);
-        check(cudaMemcpy(got.data(), d_y, got.size() * sizeof(float), cudaMemcpyDeviceToHost),
+        check(hipMemcpy(got.data(), d_y, got.size() * sizeof(float), hipMemcpyDeviceToHost),
               "copy split result");
         long long bad = 0;
         double worst = 0.0;
@@ -410,7 +411,7 @@ void bench_s2_gemv(long long n_in, long long n_out, int iters, int* split_bad) {
                                       std::chrono::steady_clock::now() - q0).count());
                 }
                 std::sort(qms.begin(), qms.end());
-                check(cudaMemcpy(got.data(), d_y, got.size() * sizeof(float), cudaMemcpyDeviceToHost),
+                check(hipMemcpy(got.data(), d_y, got.size() * sizeof(float), hipMemcpyDeviceToHost),
                       "copy quads result");
                 long long qbad = 0;
                 double qworst = 0.0;
@@ -442,7 +443,7 @@ void bench_s2_gemv(long long n_in, long long n_out, int iters, int* split_bad) {
                                           std::chrono::steady_clock::now() - q0).count());
                     }
                     std::sort(fms.begin(), fms.end());
-                    check(cudaMemcpy(got.data(), d_y, got.size() * sizeof(float), cudaMemcpyDeviceToHost),
+                    check(hipMemcpy(got.data(), d_y, got.size() * sizeof(float), hipMemcpyDeviceToHost),
                           "copy fast result");
                     long long fbad = 0;
                     for (long long o = 0; o < n_out; ++o) {
@@ -464,10 +465,10 @@ void bench_s2_gemv(long long n_in, long long n_out, int iters, int* split_bad) {
                     sms.front(), weights / sms.front() / 1e6, sp);
     }
 
-    cudaFree(d_x);
-    cudaFree(d_codes);
-    cudaFree(d_scales);
-    cudaFree(d_y);
+    hipFree(d_x);
+    hipFree(d_codes);
+    hipFree(d_scales);
+    hipFree(d_y);
 }
 
 int main(int argc, char** argv) {
@@ -566,17 +567,17 @@ int main(int argc, char** argv) {
         uint16_t* d_x = nullptr;
         uint8_t* d_codes = nullptr;
         float *d_scales = nullptr, *d_y = nullptr;
-        check(cudaMalloc(&d_x, x.size() * sizeof(uint16_t)), "cudaMalloc x");
-        check(cudaMalloc(&d_codes, codes.size()), "cudaMalloc codes");
-        check(cudaMalloc(&d_scales, scales.size() * sizeof(float)), "cudaMalloc scales");
-        check(cudaMalloc(&d_y, (size_t) n_out * sizeof(float)), "cudaMalloc y");
-        check(cudaMemcpy(d_x, x.data(), x.size() * sizeof(uint16_t), cudaMemcpyHostToDevice), "copy x");
-        check(cudaMemcpy(d_codes, codes.data(), codes.size(), cudaMemcpyHostToDevice), "copy codes");
-        check(cudaMemcpy(d_scales, scales.data(), scales.size() * sizeof(float), cudaMemcpyHostToDevice),
+        check(hipMalloc(&d_x, x.size() * sizeof(uint16_t)), "hipMalloc x");
+        check(hipMalloc(&d_codes, codes.size()), "hipMalloc codes");
+        check(hipMalloc(&d_scales, scales.size() * sizeof(float)), "hipMalloc scales");
+        check(hipMalloc(&d_y, (size_t) n_out * sizeof(float)), "hipMalloc y");
+        check(hipMemcpy(d_x, x.data(), x.size() * sizeof(uint16_t), hipMemcpyHostToDevice), "copy x");
+        check(hipMemcpy(d_codes, codes.data(), codes.size(), hipMemcpyHostToDevice), "copy codes");
+        check(hipMemcpy(d_scales, scales.data(), scales.size() * sizeof(float), hipMemcpyHostToDevice),
               "copy scales");
         strata::kernels::s_gemv(d_x, d_codes, d_scales, nullptr, d_y, n_in, n_out, tc.form);
         std::vector<float> got((size_t) n_out);
-        check(cudaMemcpy(got.data(), d_y, got.size() * sizeof(float), cudaMemcpyDeviceToHost), "copy back");
+        check(hipMemcpy(got.data(), d_y, got.size() * sizeof(float), hipMemcpyDeviceToHost), "copy back");
 
         long long bad = 0;
         double worst = 0.0;
@@ -599,10 +600,10 @@ int main(int argc, char** argv) {
         }
         total_bad += (int) bad;
 
-        cudaFree(d_x);
-        cudaFree(d_codes);
-        cudaFree(d_scales);
-        cudaFree(d_y);
+        hipFree(d_x);
+        hipFree(d_codes);
+        hipFree(d_scales);
+        hipFree(d_y);
     }
 
     std::printf("s_gemv: %zu type cases, %d rows over tolerance (tol %.1e)\n", cases.size(), total_bad, tol);
@@ -632,3 +633,4 @@ int main(int argc, char** argv) {
     if (selftest) std::printf("s_gemv_parity OK\n");
     return 0;
 }
+

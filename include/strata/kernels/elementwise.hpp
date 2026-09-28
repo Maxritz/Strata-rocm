@@ -1,4 +1,4 @@
-﻿// include/strata/kernels/elementwise.hpp - the small ops a LAYER needs between its GEMVs, P2.S5.
+// include/strata/kernels/elementwise.hpp - the small ops a LAYER needs between its GEMVs, P2.S5.
 //
 // These are not interesting kernels and that is why they are in one file with one parity test: they are the
 // glue in the per-layer graph, and glue that is written inline at each call site is glue with several

@@ -1,3 +1,4 @@
+#include "hip/hip_runtime.h"
 // src/program/generate.cpp - P2.S6: `strata generate`.
 //
 // THE DRIVER, and the first program in this project that answers a question.  Everything below it is a
@@ -24,6 +25,7 @@
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/ngram.hpp"
+#include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/sampler.hpp"
 #include "strata/kernels/shared_expert.hpp"
@@ -59,7 +61,7 @@
 #include <cerrno>
 #endif
 
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
 
 #include <chrono>
 #include <algorithm>
@@ -589,7 +591,7 @@ void mem_mark(const char* where) {
     static const bool on = std::getenv("STRATA_TRACE") != nullptr;
     if (!on) return;
     size_t free_b = 0, total_b = 0;
-    cudaMemGetInfo(&free_b, &total_b);
+    hipMemGetInfo(&free_b, &total_b);
     std::fprintf(stderr, "strata trace: %lld MiB free after %s\n", (long long) (free_b >> 20), where);
 }
 
@@ -650,12 +652,12 @@ bool checkpoint_save(ConvCheckpoint& c, const strata::core::SessionState& ss, co
     c.gdn.resize(z.gdn);
     c.ple.resize(ss.ple_hist != nullptr ? z.ple : 0);
     c.tails.resize(z.tail * (size_t) g.n_qsa_layers());
-    if (cudaMemcpy(c.gdn.data(), ss.gdn_state, z.gdn, cudaMemcpyDeviceToHost) != cudaSuccess) return false;
-    if (!c.ple.empty() && cudaMemcpy(c.ple.data(), ss.ple_hist, z.ple, cudaMemcpyDeviceToHost) != cudaSuccess)
+    if (hipMemcpy(c.gdn.data(), ss.gdn_state, z.gdn, hipMemcpyDeviceToHost) != hipSuccess) return false;
+    if (!c.ple.empty() && hipMemcpy(c.ple.data(), ss.ple_hist, z.ple, hipMemcpyDeviceToHost) != hipSuccess)
         return false;
     for (int64_t i = 0; i < g.n_qsa_layers(); ++i)
-        if (cudaMemcpy(c.tails.data() + (size_t) i * z.tail, ss.qsa_states[i].idx_tail, z.tail, cudaMemcpyDeviceToHost) !=
-            cudaSuccess)
+        if (hipMemcpy(c.tails.data() + (size_t) i * z.tail, ss.qsa_states[i].idx_tail, z.tail, hipMemcpyDeviceToHost) !=
+            hipSuccess)
             return false;
     return true;
 }
@@ -664,18 +666,18 @@ bool checkpoint_save(ConvCheckpoint& c, const strata::core::SessionState& ss, co
 bool checkpoint_restore(const ConvCheckpoint& c, strata::core::SessionState& ss, const strata::core::ModelGeometry& g) {
     const ConvStateSizes z = conv_state_sizes(g);
     if (c.gdn.size() != z.gdn || c.tails.size() != z.tail * (size_t) g.n_qsa_layers()) return false;
-    if (cudaMemcpy(ss.gdn_state, c.gdn.data(), z.gdn, cudaMemcpyHostToDevice) != cudaSuccess) return false;
-    if (!c.ple.empty() && cudaMemcpy(ss.ple_hist, c.ple.data(), z.ple, cudaMemcpyHostToDevice) != cudaSuccess)
+    if (hipMemcpy(ss.gdn_state, c.gdn.data(), z.gdn, hipMemcpyHostToDevice) != hipSuccess) return false;
+    if (!c.ple.empty() && hipMemcpy(ss.ple_hist, c.ple.data(), z.ple, hipMemcpyHostToDevice) != hipSuccess)
         return false;
     for (int64_t i = 0; i < g.n_qsa_layers(); ++i)
-        if (cudaMemcpy(ss.qsa_states[i].idx_tail, c.tails.data() + (size_t) i * z.tail, z.tail, cudaMemcpyHostToDevice) !=
-            cudaSuccess)
+        if (hipMemcpy(ss.qsa_states[i].idx_tail, c.tails.data() + (size_t) i * z.tail, z.tail, hipMemcpyHostToDevice) !=
+            hipSuccess)
             return false;
     // the PLE's token window is the last two tokens, OLDEST FIRST, -1 where there is none (as session_zero leaves it)
     const size_t L = c.ids.size();
     ss.ple_prev[0] = L >= 2 ? c.ids[L - 2] : -1;
     ss.ple_prev[1] = L >= 1 ? c.ids[L - 1] : -1;
-    return cudaDeviceSynchronize() == cudaSuccess;
+    return hipDeviceSynchronize() == hipSuccess;
 }
 
 // --control-vector-scaled: llama.cpp's `common_control_vector_load` (every file's `direction.<l>` times its scale,
@@ -1130,8 +1132,8 @@ int main(int argc, char** argv) {
         return 1;
     }
     void* arena = nullptr;
-    if (cudaMalloc(&arena, pool_bytes) != cudaSuccess) {
-        std::fprintf(stderr, "strata generate: cudaMalloc(%llu) for the weight arena failed\n",
+    if (hipMalloc(&arena, pool_bytes) != hipSuccess) {
+        std::fprintf(stderr, "strata generate: hipMalloc(%llu) for the weight arena failed\n",
                      (unsigned long long) pool_bytes);
         return 1;
     }
@@ -1183,16 +1185,19 @@ int main(int argc, char** argv) {
         mrope_host.resize((size_t) cells * 3);
         for (int64_t c = 0; c < cells; ++c)
             mrope_host[(size_t) c * 3] = mrope_host[(size_t) c * 3 + 1] = mrope_host[(size_t) c * 3 + 2] = (int32_t) c;
-        if (cudaMalloc(&d_mrope, mrope_host.size() * sizeof(int32_t)) != cudaSuccess ||
-            cudaMemcpy(d_mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t), cudaMemcpyHostToDevice) !=
-                cudaSuccess) {
+        if (hipMalloc(&d_mrope, mrope_host.size() * sizeof(int32_t)) != hipSuccess ||
+            hipMemcpy(d_mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t), hipMemcpyHostToDevice) !=
+                hipSuccess) {
             std::fprintf(stderr, "strata generate: cannot allocate the image position table\n");
             return 1;
         }
         strata::kernels::mrope_table_set(d_mrope);
     }
     strata::kernels::ple_set_native_postops(o.native_ple_postops);
-    const strata::core::ModelGeometry g;
+    strata::core::ModelGeometry g;
+    // The artifact is authoritative over the engine default: a 288-expert Flash-Next pack must not be run
+    // through the compiled-in 512.  expert_layout_load() above already resolved this from the pack manifest.
+    g.n_expert = strata::kernels::cpu::expert_layout().n_expert;
     const int64_t K = 10;
     // before session_init: every graph captured from here on has the vector's kernels where it applies
     std::string cvec_summary = "0";
@@ -1210,7 +1215,7 @@ int main(int argc, char** argv) {
     }
 
     void* sbuf = nullptr;
-    if (cudaMalloc(&sbuf, strata::core::session_bytes(g, o.max_context, K)) != cudaSuccess) {
+    if (hipMalloc(&sbuf, strata::core::session_bytes(g, o.max_context, K)) != hipSuccess) {
         std::fprintf(stderr, "strata generate: session state allocation failed\n");
         return 1;
     }
@@ -1222,8 +1227,8 @@ int main(int argc, char** argv) {
     // on 10,240 floats being indistinguishable, which is a fixed per-launch cost and not execution.
     // `bench/micro/graph_node_cost.cu` measures the same kernels on a real stream at 3.63 us ungrapped and
     // 0.805 us inside a graph.  **That is an ~8x penalty on every launch in the engine.**
-    cudaStream_t main_stream = nullptr;
-    if (cudaStreamCreateWithFlags(&main_stream, cudaStreamNonBlocking) != cudaSuccess) {
+    hipStream_t main_stream = nullptr;
+    if (hipStreamCreateWithFlags(&main_stream, hipStreamNonBlocking) != hipSuccess) {
         std::fprintf(stderr, "strata generate: cannot create the main stream\n");
         return 1;
     }
@@ -1254,7 +1259,7 @@ int main(int argc, char** argv) {
             return 1;
         }
         const size_t n = (size_t) g.n_layers * (size_t) half_stride;
-        if (cudaHostAlloc((void**) &half_stage, n * sizeof(float), cudaHostAllocDefault) != cudaSuccess) {
+        if (hipHostAlloc((void**) &half_stage, n * sizeof(float), hipHostMallocDefault) != hipSuccess) {
             std::fprintf(stderr, "strata generate: cannot pin the half-dump staging buffer\n");
             return 1;
         }
@@ -1309,7 +1314,7 @@ int main(int argc, char** argv) {
             ss.ple.w.key_scales = (const float*) ((const uint8_t*) wk->data + wk->codes_bytes);
         }
         if (o.native_ple_key && wk->quantized()) {
-            if (!wk->native_data || wk->native_type != 42 || !wk->native_q8_1) {
+            if (!wk->native_data || !strata::kernels::native_mmvq_supported(wk->native_type) || !wk->native_q8_1) {
                 std::fprintf(stderr, "strata generate: native PLE key is absent or incompatible\n");
                 return 1;
             }
@@ -1329,8 +1334,8 @@ int main(int argc, char** argv) {
         ss.ple.prev = ss.ple_prev;
         ss.ple.hist = ss.ple_hist;
         ss.ple.emb_host = ple_emb_host.data();
-        if (cudaMalloc((void**) &ple_emb_dev, (size_t) strata::kernels::NG_N_EMBD * 4) != cudaSuccess ||
-            cudaMalloc((void**) &ple_scratch, strata::core::ple_run_scratch_bytes()) != cudaSuccess) {
+        if (hipMalloc((void**) &ple_emb_dev, (size_t) strata::kernels::NG_N_EMBD * 4) != hipSuccess ||
+            hipMalloc((void**) &ple_scratch, strata::core::ple_run_scratch_bytes()) != hipSuccess) {
             std::fprintf(stderr, "strata generate: the PLE buffers failed\n");
             return 1;
         }
@@ -1349,8 +1354,8 @@ int main(int argc, char** argv) {
     }
 
     float* d_parts = nullptr;
-    if (cudaMalloc(&d_parts, (size_t) K * g.n_embd * 4) != cudaSuccess ||
-        cudaMemset(d_parts, 0, (size_t) K * g.n_embd * 4) != cudaSuccess) {
+    if (hipMalloc(&d_parts, (size_t) K * g.n_embd * 4) != hipSuccess ||
+        hipMemset(d_parts, 0, (size_t) K * g.n_embd * 4) != hipSuccess) {
         std::fprintf(stderr, "strata generate: the parts buffer failed\n");
         return 1;
     }
@@ -1446,14 +1451,14 @@ int main(int argc, char** argv) {
     }
     std::vector<float> logits((size_t) n_vocab);
     float* d_logits = nullptr;
-    if (cudaMalloc(&d_logits, (size_t) n_vocab * 4) != cudaSuccess) {
+    if (hipMalloc(&d_logits, (size_t) n_vocab * 4) != hipSuccess) {
         std::fprintf(stderr, "strata generate: the logits buffer failed\n");
         return 1;
     }
     const bool auto_cache = o.expert_cache < 0;
     if (o.expert_cache < 0) {
         size_t free_b = 0, total_b = 0;
-        cudaMemGetInfo(&free_b, &total_b);
+        hipMemGetInfo(&free_b, &total_b);
         // Plan v0.3 P5: the batched prompt path's chunk buffers are allocated later, so they are reserved here -
         // under WDDM an over-subscribed allocation does not fail, it pages to system memory and crawls.
         // (with borrowing - the default with a profile - the prompt path lends cache slots instead)
@@ -1471,7 +1476,7 @@ int main(int argc, char** argv) {
     std::vector<int64_t> sized_slots;
     if (native_pack && o.expert_cache > 0 && !profile.empty()) {
         size_t free_b = 0, total_b = 0;
-        cudaMemGetInfo(&free_b, &total_b);
+        hipMemGetInfo(&free_b, &total_b);
         const auto& lay = strata::kernels::cpu::expert_layout();
         const uint64_t budget = (uint64_t) o.expert_cache * lay.max_blob;   // what the uniform sizing granted
         uint64_t used = 0;
@@ -1500,10 +1505,10 @@ int main(int argc, char** argv) {
                 return 1;
             }
             if (!auto_cache || attempt >= 6) break;
-            cudaMemset(xcache.device_slot(0), 0, (size_t) xcache.bytes());
-            cudaDeviceSynchronize();
+            hipMemset(xcache.device_slot(0), 0, (size_t) xcache.bytes());
+            hipDeviceSynchronize();
             size_t free_b = 0, total_b = 0;
-            cudaMemGetInfo(&free_b, &total_b);
+            hipMemGetInfo(&free_b, &total_b);
             const int64_t want = (int64_t) o.vram_reserve_mib << 20;
             if ((int64_t) free_b >= want - (64ll << 20)) break;
             // short by (want - free); a figure of 0 only says "at least", so then give back a quarter as well
@@ -1604,15 +1609,15 @@ int main(int argc, char** argv) {
     float* d_hit_out = nullptr;
     if (o.expert_cache > 0 && !o.no_pool) {
         const uint64_t sb = strata::kernels::moe_hit_grouped_scratch_bytes(K, g.n_embd, strata::kernels::cpu::FF);
-        if (cudaMalloc(&hit_scratch, (size_t) sb) != cudaSuccess ||
-            cudaMalloc((void**) &d_hit_slot, (size_t) K * sizeof(int32_t)) != cudaSuccess ||
-            cudaMalloc((void**) &d_hit_dst, (size_t) K * sizeof(int32_t)) != cudaSuccess ||
-            cudaMalloc((void**) &d_hit_q8, (size_t) (g.n_embd / 32) * 34) != cudaSuccess ||
+        if (hipMalloc(&hit_scratch, (size_t) sb) != hipSuccess ||
+            hipMalloc((void**) &d_hit_slot, (size_t) K * sizeof(int32_t)) != hipSuccess ||
+            hipMalloc((void**) &d_hit_dst, (size_t) K * sizeof(int32_t)) != hipSuccess ||
+            hipMalloc((void**) &d_hit_q8, (size_t) (g.n_embd / 32) * 34) != hipSuccess ||
             // R4.2h: the fp32 activation scales.  Without this the GPU's hits use the block's fp16 `d`
             // while the CPU's misses use `ActQ::scale`, which is fp32 - a 4.761e-04 relative disagreement on
             // every chunk, and the reason enabling the cache changed the tokens.
-            cudaMalloc((void**) &d_hit_q8_scale, (size_t) (g.n_embd / 32) * sizeof(float)) != cudaSuccess ||
-            cudaMalloc((void**) &d_hit_out, (size_t) K * g.n_embd * 4) != cudaSuccess) {
+            hipMalloc((void**) &d_hit_q8_scale, (size_t) (g.n_embd / 32) * sizeof(float)) != hipSuccess ||
+            hipMalloc((void**) &d_hit_out, (size_t) K * g.n_embd * 4) != hipSuccess) {
             std::fprintf(stderr, "strata generate: the R4 hit path could not allocate its device buffers\n");
             return 1;
         }
@@ -1631,8 +1636,8 @@ int main(int argc, char** argv) {
         drive.d.d_slot = d_hit_slot;
         drive.d.d_dst = d_hit_dst;
         drive.d.h_slot.resize((size_t) K);
-        cudaEvent_t hit_done = nullptr;
-        if (cudaEventCreate(&hit_done) != cudaSuccess) {
+        hipEvent_t hit_done = nullptr;
+        if (hipEventCreate(&hit_done) != hipSuccess) {
             std::fprintf(stderr, "strata generate: the hit path could not create its probe event\n");
             return 1;
         }
@@ -1766,7 +1771,7 @@ int main(int argc, char** argv) {
                native_head.run(ss.block.mixed, d_logits, stream, err);
     };
     float* d_emb = nullptr;
-    if (cudaMalloc(&d_emb, (size_t) g.n_embd * 4) != cudaSuccess) {
+    if (hipMalloc(&d_emb, (size_t) g.n_embd * 4) != hipSuccess) {
         std::fprintf(stderr, "strata generate: the embedding buffer failed\n");
         return 1;
     }
@@ -1775,7 +1780,7 @@ int main(int argc, char** argv) {
     // error surfaces at the NEXT synchronising call, which here was the next token's `embed_row`, reporting an
     // illegal access on a weight plane.  Nothing in the parameter names said device.
     int* d_next = nullptr;
-    if (cudaMalloc(&d_next, sizeof(int)) != cudaSuccess) {
+    if (hipMalloc(&d_next, sizeof(int)) != hipSuccess) {
         std::fprintf(stderr, "strata generate: the sampler output buffer failed\n");
         return 1;
     }
@@ -1794,13 +1799,13 @@ int main(int argc, char** argv) {
             strata::core::session_zero(ss, g, d_emb, token_stream);
         } else {
             for (int64_t c = 0; c < g.hc; ++c)
-                if (cudaMemcpyAsync(ss.R + (size_t) c * g.n_embd, d_emb, (size_t) g.n_embd * 4,
-                                    cudaMemcpyDeviceToDevice, (cudaStream_t) token_stream) != cudaSuccess) {
+                if (hipMemcpyAsync(ss.R + (size_t) c * g.n_embd, d_emb, (size_t) g.n_embd * 4,
+                                    hipMemcpyDeviceToDevice, (hipStream_t) token_stream) != hipSuccess) {
                     std::fprintf(stderr, "strata generate: the residual broadcast failed\n");
                     return false;
                 }
         }
-        return o.stream_token || cudaDeviceSynchronize() == cudaSuccess;
+        return o.stream_token || hipDeviceSynchronize() == hipSuccess;
     };
 
     strata::kernels::SamplerParams sp;
@@ -1851,8 +1856,8 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: cannot write %s\n", o.dump_layers.c_str());
             return 1;
         }
-        if (cudaHostAlloc((void**) &layer_stage, layer_floats * sizeof(float), cudaHostAllocDefault) !=
-            cudaSuccess) {
+        if (hipHostAlloc((void**) &layer_stage, layer_floats * sizeof(float), hipHostMallocDefault) !=
+            hipSuccess) {
             std::fprintf(stderr, "strata generate: cannot pin the layer-dump staging buffer\n");
             return 1;
         }
@@ -2027,7 +2032,7 @@ int main(int argc, char** argv) {
         std::printf("  three sum slightly above it because each launch carries the driver's gap.\n");
         strata::core::session_graphs_free(gr);
         strata::core::doorbell_free(db);
-        cudaFree(d_next);
+        hipFree(d_next);
         return 0;
     }
 
@@ -2038,7 +2043,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: session_replay warm: %s\n", err.c_str());
             return 1;
         }
-        if (cudaDeviceSynchronize() != cudaSuccess) {
+        if (hipDeviceSynchronize() != hipSuccess) {
             std::fprintf(stderr, "strata generate: session_replay warm faulted\n");
             return 1;
         }
@@ -2050,8 +2055,8 @@ int main(int argc, char** argv) {
                 return 1;
             }
         }
-        if (cudaDeviceSynchronize() != cudaSuccess) {
-            std::fprintf(stderr, "strata generate: session_replay faulted: %s\n", cudaGetErrorString(cudaGetLastError()));
+        if (hipDeviceSynchronize() != hipSuccess) {
+            std::fprintf(stderr, "strata generate: session_replay faulted: %s\n", hipGetErrorString(hipGetLastError()));
             return 1;
         }
         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count() / (double) reps;
@@ -2082,9 +2087,9 @@ int main(int argc, char** argv) {
                 return 1;
             }
             // The sync is INSIDE the interval on purpose: it is the wait for the GPU, so t1 - t0 is GPU time.
-            if (cudaStreamSynchronize((cudaStream_t) main_cs) != cudaSuccess) {
+            if (hipStreamSynchronize((hipStream_t) main_cs) != hipSuccess) {
                 std::fprintf(stderr, "strata generate: gpu-only-full layers faulted: %s\n",
-                             cudaGetErrorString(cudaGetLastError()));
+                             hipGetErrorString(hipGetLastError()));
                 return 1;
             }
             const Clock::time_point t1 = Clock::now();
@@ -2092,9 +2097,9 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata generate: gpu-only-full lm_head: %s\n", err.c_str());
                 return 1;
             }
-            if (cudaStreamSynchronize((cudaStream_t) main_cs) != cudaSuccess) {
+            if (hipStreamSynchronize((hipStream_t) main_cs) != hipSuccess) {
                 std::fprintf(stderr, "strata generate: gpu-only-full head faulted: %s\n",
-                             cudaGetErrorString(cudaGetLastError()));
+                             hipGetErrorString(hipGetLastError()));
                 return 1;
             }
             const Clock::time_point t2 = Clock::now();
@@ -2154,9 +2159,9 @@ int main(int argc, char** argv) {
                 host_res[(size_t) (l * g.n_expert + e)] = slot;
                 if (slot != strata::core::kNotResident) ++resident;
             }
-        if (cudaMalloc((void**) &d_res, host_res.size() * sizeof(int32_t)) != cudaSuccess ||
-            cudaMalloc((void**) &d_hit_count, sizeof(int32_t)) != cudaSuccess ||
-            cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess) {
+        if (hipMalloc((void**) &d_res, host_res.size() * sizeof(int32_t)) != hipSuccess ||
+            hipMalloc((void**) &d_hit_count, sizeof(int32_t)) != hipSuccess ||
+            hipMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), hipMemcpyHostToDevice) != hipSuccess) {
             std::fprintf(stderr, "strata generate: the device residency table could not be staged\n");
             return 1;
         }
@@ -2326,7 +2331,7 @@ int main(int argc, char** argv) {
         constexpr int kPenaltyWindowCap = 4096;
         int32_t* d_hist = nullptr;
         std::vector<int32_t> hist_stage((size_t) kPenaltyWindowCap, -1);
-        if (cudaMalloc(&d_hist, (size_t) kPenaltyWindowCap * sizeof(int32_t)) != cudaSuccess) {
+        if (hipMalloc(&d_hist, (size_t) kPenaltyWindowCap * sizeof(int32_t)) != hipSuccess) {
             std::fprintf(stderr, "strata serve: the penalty-history allocation failed\n");
             return 1;
         }
@@ -2370,7 +2375,7 @@ int main(int argc, char** argv) {
             ConvCheckpoint c;
             c.ids.assign(cur.begin(), cur.begin() + L);
             c.imgs = imgs_below(req_imgs, L);
-            if (cudaDeviceSynchronize() != cudaSuccess || !checkpoint_save(c, ss, g)) return false;
+            if (hipDeviceSynchronize() != hipSuccess || !checkpoint_save(c, ss, g)) return false;
             checks.push_back(std::move(c));
             while ((int) checks.size() > o.prompt_cache) checks.erase(checks.begin());   // the oldest goes first
             return true;
@@ -2396,23 +2401,23 @@ int main(int argc, char** argv) {
         drive.d.plan = ver.plan_sink();
         drive.d.pcie_num = std::max(0, std::min(256, (int) (o.pcie_frac * 256.0 + 0.5)));
         if (o.adapt_every > 0 && o.adapt_swaps > 0) drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
-        cudaStream_t adapt_stream = nullptr;
-        if (cudaStreamCreateWithFlags(&adapt_stream, cudaStreamNonBlocking) != cudaSuccess) {
+        hipStream_t adapt_stream = nullptr;
+        if (hipStreamCreateWithFlags(&adapt_stream, hipStreamNonBlocking) != hipSuccess) {
             std::fprintf(stderr, "strata serve: cannot create the refill stream\n");
             return 1;
         }
         // plan v0.3 P6: swaps in flight - (residency index, slot) admitted when adapt_ev has completed
         std::vector<std::pair<int32_t, int32_t>> pending;
-        cudaEvent_t adapt_ev = nullptr;
-        cudaEventCreateWithFlags(&adapt_ev, cudaEventDisableTiming);
+        hipEvent_t adapt_ev = nullptr;
+        hipEventCreateWithFlags(&adapt_ev, hipEventDisableTiming);
         auto apply_pending = [&](bool wait) {
             if (pending.empty()) return;
-            if (wait) cudaEventSynchronize(adapt_ev);
-            else if (cudaEventQuery(adapt_ev) != cudaSuccess) return;
+            if (wait) hipEventSynchronize(adapt_ev);
+            else if (hipEventQuery(adapt_ev) != hipSuccess) return;
             for (const auto& [i, slot] : pending) host_res[(size_t) i] = slot;
             pending.clear();
             if (d_res != nullptr)
-                cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+                hipMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), hipMemcpyHostToDevice);
         };
         // the VRAM tier follows the conversation (the same rule as the speculative loop below)
         auto adapt = [&]() -> bool {
@@ -2446,13 +2451,13 @@ int main(int argc, char** argv) {
                 const int32_t slot = host_res[out];
                 const uint8_t* b = srcp->blob(s.layer, s.in);
                 if (slot < 0 || b == nullptr ||
-                    cudaMemcpyAsync(xcache.device_slot(slot), b, (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer),
-                                    cudaMemcpyHostToDevice, adapt_stream) != cudaSuccess)
+                    hipMemcpyAsync(xcache.device_slot(slot), b, (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer),
+                                    hipMemcpyHostToDevice, adapt_stream) != hipSuccess)
                     return false;
                 host_res[out] = strata::core::kNotResident;   // evicted now: the CPU computes it meanwhile
                 pending.emplace_back((int32_t) in, slot);      // resident once the copy has landed
             }
-            if (!swaps.empty()) cudaEventRecord(adapt_ev, adapt_stream);
+            if (!swaps.empty()) hipEventRecord(adapt_ev, adapt_stream);
             for (float& v : drive.d.usage) v *= 0.7f;
             return true;
         };
@@ -2523,7 +2528,7 @@ int main(int argc, char** argv) {
             // what is left once everything is allocated: under WDDM a GPU filled to the brim does not fail, it pages -
             // and a page-in while the verify graph spins on a host flag stalls the request for good
             size_t free_b = 0, total_b = 0;
-            cudaMemGetInfo(&free_b, &total_b);
+            hipMemGetInfo(&free_b, &total_b);
             // below ~256 MiB a later allocation (a first-used window's buffers, the desktop, another program) can make
             // the driver page GPU memory, and a verify graph spinning on a host flag then never finishes
             const int64_t free_mib = (int64_t) (free_b >> 20);
@@ -2538,7 +2543,7 @@ int main(int argc, char** argv) {
         // what the server's Monitor tab shows (servers before 0.1.8 skip unknown lines until READY)
         {
             size_t free_b = 0, total_b = 0;
-            cudaMemGetInfo(&free_b, &total_b);
+            hipMemGetInfo(&free_b, &total_b);
             std::printf("INFO context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld spec=%d "
                         "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld engine=" STRATA_VERSION "\n",
                         (long long) o.max_context, o.kv.c_str(),
@@ -2719,15 +2724,15 @@ int main(int argc, char** argv) {
                     for (int64_t c = n; ve.empty() && c < cells; ++c) put(c, p + (c - n), p + (c - n), p + (c - n));
                 }
                 tr("positions built", (long long) img_rows.size());
-                cudaDeviceSynchronize();
+                hipDeviceSynchronize();
                 tr("device idle");
-                if (ve.empty() && cudaMemcpy(d_mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t),
-                                             cudaMemcpyHostToDevice) != cudaSuccess)
+                if (ve.empty() && hipMemcpy(d_mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t),
+                                             hipMemcpyHostToDevice) != hipSuccess)
                     ve = "the image position upload failed";
                 if (!ve.empty()) {
                     // leave the table as the identity so the next text request is untouched
                     for (int64_t c = 0; c < cells; ++c) put(c, c, c, c);
-                    cudaMemcpy(d_mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+                    hipMemcpy(d_mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t), hipMemcpyHostToDevice);
                     mrope_identity = true;
                     std::printf("ERR %s\n", ve.c_str());
                     std::fflush(stdout);
@@ -2785,7 +2790,7 @@ int main(int argc, char** argv) {
             int64_t reread_to = -1;   // STRATA_CKPT_REREAD only: read [0, reread_to) again instead of restoring
             if (resume == 0) {
                 strata::core::session_zero(ss, g, nullptr, main_cs);
-                cudaStreamSynchronize(main_stream);
+                hipStreamSynchronize(main_stream);
                 checks.clear();
             } else if (!from_live) {
                 const ConvCheckpoint* c = nullptr;
@@ -2798,7 +2803,7 @@ int main(int argc, char** argv) {
                     // (--adapt-swaps 0) the answer must match the restored one token for token; anything the
                     // checkpoint missed shows up as a difference.
                     strata::core::session_zero(ss, g, nullptr, main_cs);
-                    cudaStreamSynchronize(main_stream);
+                    hipStreamSynchronize(main_stream);
                     reread_to = resume;
                     std::fprintf(stderr, "strata serve: STRATA_CKPT_REREAD: reading %lld tokens again instead of "
                                          "restoring\n", (long long) resume);
@@ -2876,7 +2881,7 @@ int main(int argc, char** argv) {
                         return false;
                     host_res[(size_t) i] = slot;
                 }
-                cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+                hipMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), hipMemcpyHostToDevice);
                 lent_now.clear();
                 lent_chunk = 0;
                 return true;
@@ -2900,7 +2905,7 @@ int main(int argc, char** argv) {
                         lent_now.emplace_back((int32_t) i, host_res[i]);
                         host_res[i] = strata::core::kNotResident;
                     }
-                cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+                hipMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), hipMemcpyHostToDevice);
                 lent_chunk = want;
                 return true;
             };
@@ -3034,7 +3039,7 @@ int main(int argc, char** argv) {
                         hist_stage[(size_t) (hist_n - take + j)] =
                             consumed[(size_t) ((int64_t) consumed.size() - (take - 1) + j)];
                     hist_stage[(size_t) (hist_n - 1)] = (int32_t) x;
-                    cudaMemcpy(d_hist, hist_stage.data(), (size_t) hist_n * sizeof(int32_t), cudaMemcpyHostToDevice);
+                    hipMemcpy(d_hist, hist_stage.data(), (size_t) hist_n * sizeof(int32_t), hipMemcpyHostToDevice);
                 }
                 tr("window", p, T);
                 if (!ver.run(T, window.data(), p, &drive_pool_multi, &drive, outv.data(), err) || drive.d.failed) {
@@ -3099,7 +3104,7 @@ int main(int argc, char** argv) {
             if (state_hash && live_ok) {
                 // DEBUG: a fingerprint of every part of the session over the positions it holds ([0, L)), and
                 // separately of what lies past them in the last KV page (stale cells, fine unless something reads them)
-                cudaDeviceSynchronize();
+                hipDeviceSynchronize();
                 const int64_t L = (int64_t) live.size();
                 const strata::kernels::QsaShapes qs = [&] {
                     strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
@@ -3108,7 +3113,7 @@ int main(int argc, char** argv) {
                 }();
                 auto hash_dev = [&](const void* p, size_t bytes, uint64_t h) {
                     std::vector<uint8_t> b(bytes);
-                    if (bytes) cudaMemcpy(b.data(), p, bytes, cudaMemcpyDefault);   // VRAM or a streamed host copy
+                    if (bytes) hipMemcpy(b.data(), p, bytes, hipMemcpyDefault);   // VRAM or a streamed host copy
                     return fnv1a(b.data(), b.size(), h);
                 };
                 // the cells [c0, c1) of one int8 K or V pool ([page][kv_head][page_size][head_dim]), bytes per value `w`
@@ -3238,7 +3243,7 @@ int main(int argc, char** argv) {
                         lent.emplace_back((int32_t) i, host_res[i]);
                         host_res[i] = strata::core::kNotResident;
                     }
-                cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+                hipMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), hipMemcpyHostToDevice);
                 borrow = xcache.device_slot(first);
                 borrow_bytes = xcache.slot_offsets() ? (uint64_t) (xcache.bytes() - (int64_t) xcache.slot_offsets()[first])
                                                      : (uint64_t) k * (uint64_t) blob;
@@ -3284,7 +3289,7 @@ int main(int argc, char** argv) {
                 }
                 host_res[(size_t) i] = slot;
             }
-            cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+            hipMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), hipMemcpyHostToDevice);
             std::fprintf(stderr, "strata generate: %zu lent slots refilled in %.1f ms\n", lent.size(),
                          std::chrono::duration<double, std::milli>(Clock::now() - tr).count());
         }
@@ -3383,7 +3388,7 @@ int main(int argc, char** argv) {
             }
         }
         if (final_r != nullptr) {
-            cudaMemcpy(final_r_host.data(), ss.R, final_r_host.size() * sizeof(float), cudaMemcpyDeviceToHost);
+            hipMemcpy(final_r_host.data(), ss.R, final_r_host.size() * sizeof(float), hipMemcpyDeviceToHost);
             const int64_t posrec[2] = {pos, tok};
             std::fwrite(posrec, sizeof posrec, 1, final_r);
             std::fwrite(final_r_host.data(), sizeof(float), final_r_host.size(), final_r);
@@ -3414,9 +3419,9 @@ int main(int argc, char** argv) {
         // memory access" at a plane offset that has nothing to do with the fault, and the layer that actually
         // faulted had completed its own error checks successfully - because its kernels had not run yet.  A
         // sticky error surfaces at the next SYNCHRONISING call, which is whatever happens to come next.
-        if (!o.stream_token && cudaDeviceSynchronize() != cudaSuccess) {
+        if (!o.stream_token && hipDeviceSynchronize() != hipSuccess) {
             std::fprintf(stderr, "strata generate: the device faulted in lm_head at position %lld: %s\n",
-                         (long long) pos, cudaGetErrorString(cudaGetLastError()));
+                         (long long) pos, hipGetErrorString(hipGetLastError()));
             return 1;
         }
         {
@@ -3427,9 +3432,9 @@ int main(int argc, char** argv) {
         const bool emit_logits = dump != nullptr &&
             strata::program::logits_selection::selected(pos, dump_positions, o.logits_stride);
         const bool read_logits = !o.stream_token || o.check_logits || emit_logits;
-        if (read_logits && (cudaMemcpyAsync(logits.data(), d_logits, (size_t) n_vocab * 4,
-                                           cudaMemcpyDeviceToHost, (cudaStream_t) token_stream) != cudaSuccess ||
-                            cudaStreamSynchronize((cudaStream_t) token_stream) != cudaSuccess)) {
+        if (read_logits && (hipMemcpyAsync(logits.data(), d_logits, (size_t) n_vocab * 4,
+                                           hipMemcpyDeviceToHost, (hipStream_t) token_stream) != hipSuccess ||
+                            hipStreamSynchronize((hipStream_t) token_stream) != hipSuccess)) {
             std::fprintf(stderr, "strata generate: reading the logits back failed\n");
             return 1;
         }
@@ -3461,11 +3466,11 @@ int main(int argc, char** argv) {
         // Teacher-forced prompt rows consume no generation draws.
         sp.counter = (uint64_t) produced.size();
         strata::kernels::sample_tokens(d_logits, 1, (int) n_vocab, nullptr, 0, sp, d_next, token_stream);
-        if (cudaMemcpyAsync(&next, d_next, sizeof(int), cudaMemcpyDeviceToHost,
-                            (cudaStream_t) token_stream) != cudaSuccess ||
-            cudaStreamSynchronize((cudaStream_t) token_stream) != cudaSuccess) {
+        if (hipMemcpyAsync(&next, d_next, sizeof(int), hipMemcpyDeviceToHost,
+                            (hipStream_t) token_stream) != hipSuccess ||
+            hipStreamSynchronize((hipStream_t) token_stream) != hipSuccess) {
             std::fprintf(stderr, "strata generate: reading the sampled token back failed: %s\n",
-                         cudaGetErrorString(cudaGetLastError()));
+                         hipGetErrorString(hipGetLastError()));
             return 1;
         }
         // The sampled-token synchronization also completes every captured QSA
@@ -3569,23 +3574,23 @@ int main(int argc, char** argv) {
         if (o.adapt_every > 0 && o.adapt_swaps > 0) drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
         int64_t swaps_total = 0;
         double ms_adapt = 0;
-        cudaStream_t adapt_stream = nullptr;
-        if (!drive.d.usage.empty() && cudaStreamCreateWithFlags(&adapt_stream, cudaStreamNonBlocking) != cudaSuccess) {
+        hipStream_t adapt_stream = nullptr;
+        if (!drive.d.usage.empty() && hipStreamCreateWithFlags(&adapt_stream, hipStreamNonBlocking) != hipSuccess) {
             std::fprintf(stderr, "strata generate: cannot create the refill stream\n");
             return 1;
         }
         // plan v0.3 P6: swaps in flight - (residency index, slot) admitted when adapt_ev has completed
         std::vector<std::pair<int32_t, int32_t>> pending;
-        cudaEvent_t adapt_ev = nullptr;
-        cudaEventCreateWithFlags(&adapt_ev, cudaEventDisableTiming);
+        hipEvent_t adapt_ev = nullptr;
+        hipEventCreateWithFlags(&adapt_ev, hipEventDisableTiming);
         auto apply_pending = [&](bool wait) {
             if (pending.empty()) return;
-            if (wait) cudaEventSynchronize(adapt_ev);
-            else if (cudaEventQuery(adapt_ev) != cudaSuccess) return;
+            if (wait) hipEventSynchronize(adapt_ev);
+            else if (hipEventQuery(adapt_ev) != hipSuccess) return;
             for (const auto& [i, slot] : pending) host_res[(size_t) i] = slot;
             pending.clear();
             if (d_res != nullptr)
-                cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+                hipMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), hipMemcpyHostToDevice);
         };
         // Plan v0.3 P6: the VRAM tier follows the conversation.  Candidates are missing experts routed at least
         // twice (decayed); each is paired with its layer's least-routed resident expert and swapped when it was
@@ -3623,15 +3628,15 @@ int main(int argc, char** argv) {
                 const uint8_t* b = srcp->blob(s.layer, s.in);
                 // asynchronous: the copies run while the MTP drafts; the next window waits for them
                 if (slot < 0 || b == nullptr ||
-                    cudaMemcpyAsync(xcache.device_slot(slot), b, (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer),
-                                    cudaMemcpyHostToDevice, adapt_stream) != cudaSuccess) {
+                    hipMemcpyAsync(xcache.device_slot(slot), b, (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer),
+                                    hipMemcpyHostToDevice, adapt_stream) != hipSuccess) {
                     std::fprintf(stderr, "strata generate: an adaptive refill failed\n");
                     return false;
                 }
                 host_res[out] = strata::core::kNotResident;   // evicted now: the CPU computes it meanwhile
                 pending.emplace_back((int32_t) in, slot);      // resident once the copy has landed
             }
-            if (!swaps.empty()) cudaEventRecord(adapt_ev, adapt_stream);
+            if (!swaps.empty()) hipEventRecord(adapt_ev, adapt_stream);
             for (float& v : drive.d.usage) v *= 0.7f;
             swaps_total += (int64_t) swaps.size();
             ms_adapt += std::chrono::duration<double, std::milli>(Clock::now() - ta).count();
@@ -3813,13 +3818,13 @@ int main(int argc, char** argv) {
     }
     if (layer_dump != nullptr) {
         std::fclose(layer_dump);
-        cudaFreeHost(layer_stage);
+        hipHostFree(layer_stage);
         std::printf("%-24s %s (%lld layers + the input x %d streams x %lld per position)\n", "layers dumped",
                     o.dump_layers.c_str(), (long long) g.n_layers, (int) g.hc, (long long) g.n_embd);
     }
     if (half_dump != nullptr) {
         std::fclose(half_dump);
-        cudaFreeHost(half_stage);
+        hipHostFree(half_stage);
         std::printf("%-24s %s (%lld layers x %llu per position)\n", "halves dumped", o.dump_halves.c_str(),
                     (long long) g.n_layers, (unsigned long long) half_stride);
     }
@@ -3846,8 +3851,8 @@ int main(int argc, char** argv) {
                     prefill_ms > 0 ? 1000.0 * (double) (n_prompt - 1) / prefill_ms : 0.0, ttft_ms);
     if (!o.dump_mixed.empty()) {
         std::vector<float> mx((size_t) g.n_embd);
-        if (cudaMemcpy(mx.data(), ss.block.mixed, mx.size() * sizeof(float), cudaMemcpyDeviceToHost) !=
-            cudaSuccess) {
+        if (hipMemcpy(mx.data(), ss.block.mixed, mx.size() * sizeof(float), hipMemcpyDeviceToHost) !=
+            hipSuccess) {
             std::fprintf(stderr, "strata generate: reading mixed back failed\n");
             return 1;
         }
@@ -3867,7 +3872,7 @@ int main(int argc, char** argv) {
     // ---- the residual, for bisecting the head against the layers (see `dump_residual`'s note)
     if (!o.dump_residual.empty()) {
         std::vector<float> R((size_t) g.hc * g.n_embd);
-        if (cudaMemcpy(R.data(), ss.R, R.size() * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
+        if (hipMemcpy(R.data(), ss.R, R.size() * sizeof(float), hipMemcpyDeviceToHost) != hipSuccess) {
             std::fprintf(stderr, "strata generate: reading R back failed\n");
             return 1;
         }
@@ -3978,11 +3983,11 @@ int main(int argc, char** argv) {
 
     strata::core::session_graphs_free(gr);
     strata::core::doorbell_free(db);
-    cudaFree(d_next);
-    cudaFree(d_logits);
-    cudaFree(d_emb);
-    cudaFree(d_parts);
-    cudaFree(sbuf);
-    cudaFree(arena);
+    hipFree(d_next);
+    hipFree(d_logits);
+    hipFree(d_emb);
+    hipFree(d_parts);
+    hipFree(sbuf);
+    hipFree(arena);
     return 0;
 }

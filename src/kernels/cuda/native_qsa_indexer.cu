@@ -1,3 +1,4 @@
+#include "hip/hip_runtime.h"
 // Adapted from llama.cpp 3cf03257f219afbe7334045ff7c6a06ac68c627d:
 // src/models/qwen4exp.cpp; ggml/src/ggml-cuda/{set-rows.cu,norm.cu,rope.cu}.
 // MIT License
@@ -20,8 +21,9 @@
 
 #include "strata/kernels/native_qsa_indexer.hpp"
 #include "strata/kernels/mrope.hpp"
-#include <cuda_runtime.h>
-#include <cuda_fp16.h>
+#include <hip/hip_runtime.h>
+#include "strata/hip_compat.h"
+#include <hip/hip_fp16.h>
 #include <atomic>
 #include <cmath>
 #include <cstddef>
@@ -36,7 +38,7 @@ constexpr int D = 128, R = 4, ROT = 64, THREADS = 256;
 __device__ float warp_sum(float x) {
 #pragma unroll
     for (int offset = 16; offset; offset >>= 1)
-        x += __shfl_xor_sync(0xffffffffu, x, offset);
+        x += __shfl_xor_sync(0xffffffffffffffffull, x, offset, 32);
     return x;
 }
 __global__ void append(const float* __restrict__ raw, const int32_t* __restrict__ pos_dev,
@@ -121,9 +123,9 @@ void native_qsa_indexer_append(const float* raw, const int32_t* relative_pos_dev
     for (int i = 0; i < 7; ++i) for (int j = i + 1; j < 7; ++j)
         if (overlaps(spans[i], spans[j])) throw std::invalid_argument("native QSA indexer buffers overlap");
     const float theta_scale = powf(freq_base, -2.0f / ROT);
-    append<<<1,THREADS,0,static_cast<cudaStream_t>(stream)>>>(raw,relative_pos_device,pos_base,gamma,epsilon,
+    append<<<1,THREADS,0,static_cast<hipStream_t>(stream)>>>(raw,relative_pos_device,pos_base,gamma,epsilon,
         b.tail,b.dead,b.pooled,b.block_pos,int(max_cells),theta_scale,mrope_table());
-    const auto error = cudaGetLastError();
-    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+    const auto error = hipGetLastError();
+    if (error != hipSuccess) throw std::runtime_error(hipGetErrorString(error));
 }
 } // namespace strata::kernels

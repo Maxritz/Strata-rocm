@@ -229,7 +229,7 @@ public:
     template <class T> T read() {
         need(sizeof(T));
         T v;
-        std::memcpy(&v, base_ + pos_, sizeof(T));
+        __builtin_memcpy(&v, base_ + pos_, sizeof(T));
         pos_ += sizeof(T);
         return v;
     }
@@ -454,7 +454,10 @@ private:
 // ---- architecture guard (P1.S2). The engine is specialised to ONE model; anything else must be
 // refused with a precise error rather than silently mis-run.
 struct Qwen4ExpGuard {
-    uint32_t block_count = 48, hidden = 2560, experts = 512, experts_used = 10, head_count = 24,
+    // `experts == 0` is the sentinel for "any positive expert count": the engine reads the artifact's own
+    // `n_experts_per_layer` (from the pack manifest) or `qwen4exp.expert_count` (from a GGUF) and sizes its
+    // expert ring, arena and residency tables from that.  A non-zero value still enforces an exact count.
+    uint32_t block_count = 48, hidden = 2560, experts = 0, experts_used = 10, head_count = 24,
              head_count_kv = 2;
 };
 
@@ -465,20 +468,25 @@ inline std::string check_architecture(const GgufFile& g, const Qwen4ExpGuard& wa
     struct Req {
         const char* key;
         uint64_t want;
+        bool exact;
     };
     const Req reqs[] = {
-        {"qwen4exp.block_count", want.block_count},
-        {"qwen4exp.embedding_length", want.hidden},
-        {"qwen4exp.expert_count", want.experts},
-        {"qwen4exp.expert_used_count", want.experts_used},
-        {"qwen4exp.attention.head_count", want.head_count},
-        {"qwen4exp.attention.head_count_kv", want.head_count_kv},
+        {"qwen4exp.block_count", want.block_count, true},
+        {"qwen4exp.embedding_length", want.hidden, true},
+        {"qwen4exp.expert_count", want.experts, want.experts != 0},
+        {"qwen4exp.expert_used_count", want.experts_used, true},
+        {"qwen4exp.attention.head_count", want.head_count, true},
+        {"qwen4exp.attention.head_count_kv", want.head_count_kv, true},
     };
     for (const auto& r : reqs) {
         const MetaValue* v = g.get(r.key);
         if (!v) return std::string("missing ") + r.key;
-        if (v->u != r.want)
-            return std::string(r.key) + " = " + std::to_string(v->u) + ", expected " + std::to_string(r.want);
+        if (r.exact) {
+            if (v->u != r.want)
+                return std::string(r.key) + " = " + std::to_string(v->u) + ", expected " + std::to_string(r.want);
+        } else if (v->u == 0) {
+            return std::string(r.key) + " = 0, expected a positive expert count";
+        }
     }
     return {}; // empty == ok
 }

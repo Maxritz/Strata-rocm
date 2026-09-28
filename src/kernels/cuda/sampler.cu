@@ -1,3 +1,4 @@
+#include "hip/hip_runtime.h"
 // src/kernels/cuda/sampler.cu - P2.S2: the sampler chain, in the order docs/sampling.md settles.
 //
 //     penalties -> top_k -> min_p -> top_p -> temperature -> penalties -> pick
@@ -14,7 +15,7 @@
 // draw chain (its header says why the selection must be parallel and why the tie rule keeps the semantics).
 #include "strata/kernels/sampler.hpp"
 
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
 
 #include <cmath>
 #include <cstdio>
@@ -130,8 +131,8 @@ __global__ void sampler_greedy_kernel(const float* __restrict__ logits, int n_vo
         if (s > bv) { bv = s; best = v; }
     }
     for (int off = 16; off > 0; off >>= 1) {
-        const float ov = __shfl_down_sync(0xFFFFFFFFu, bv, off);
-        const int oi = __shfl_down_sync(0xFFFFFFFFu, best, off);
+        const float ov = __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, bv, off, 32);
+        const int oi = __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, best, off, 32);
         if (ov > bv || (ov == bv && oi < best)) { bv = ov; best = oi; }
     }
     __shared__ float sv[32];
@@ -144,8 +145,8 @@ __global__ void sampler_greedy_kernel(const float* __restrict__ logits, int n_vo
         float wv = lane < nw ? sv[lane] : __int_as_float(0xff800000);
         int wi = lane < nw ? si[lane] : n_vocab;
         for (int off = 16; off > 0; off >>= 1) {
-            const float ov = __shfl_down_sync(0xFFFFFFFFu, wv, off);
-            const int oi = __shfl_down_sync(0xFFFFFFFFu, wi, off);
+            const float ov = __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, wv, off, 32);
+            const int oi = __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, wi, off, 32);
             if (ov > wv || (ov == wv && oi < wi)) { wv = ov; wi = oi; }
         }
         // A tie between two `-inf` candidates leaves `wi == n_vocab`, and the serial version answered 0.
@@ -207,7 +208,7 @@ __global__ void sampler_kernel(const float* __restrict__ logits, int n_vocab, in
     int k = p.top_k > 0 ? (p.top_k < KMAX ? p.top_k : KMAX) : 0;
     if (k <= 0) {
         if (threadIdx.x == 0)
-            std::printf("sampler: the sampled path needs top_k in 1..%d (got %d); greedy needs no filters\n",
+            printf("sampler: the sampled path needs top_k in 1..%d (got %d); greedy needs no filters\n",
                         KMAX, p.top_k);
         return;   // leave out[t] unwritten rather than returning an uninitialised token
     }
@@ -232,8 +233,8 @@ __global__ void sampler_kernel(const float* __restrict__ logits, int n_vocab, in
             if (s > bv) { bv = s; best = v; }
         }
         for (int off = 16; off > 0; off >>= 1) {
-            const float ov = __shfl_down_sync(0xFFFFFFFFu, bv, off);
-            const int oi = __shfl_down_sync(0xFFFFFFFFu, best, off);
+            const float ov = __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, bv, off, 32);
+            const int oi = __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, best, off, 32);
             if (ov > bv || (ov == bv && oi < best)) { bv = ov; best = oi; }
         }
         const int warp = (int) (threadIdx.x >> 5), lane = (int) (threadIdx.x & 31);
@@ -244,8 +245,8 @@ __global__ void sampler_kernel(const float* __restrict__ logits, int n_vocab, in
             float wv = lane < nw ? sv[lane] : __int_as_float(0xff800000);
             int wi = lane < nw ? si[lane] : n_vocab;
             for (int off = 16; off > 0; off >>= 1) {
-                const float ov = __shfl_down_sync(0xFFFFFFFFu, wv, off);
-                const int oi = __shfl_down_sync(0xFFFFFFFFu, wi, off);
+                const float ov = __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, wv, off, 32);
+                const int oi = __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, wi, off, 32);
                 if (ov > wv || (ov == wv && oi < wi)) { wv = ov; wi = oi; }
             }
             if (lane == 0) { sel_ids[i] = (wi < n_vocab) ? wi : 0; sel_logit[i] = wv; }
@@ -316,20 +317,20 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
     if (p.greedy || p.temperature <= 0.0f) {
         // One block per token, 1,024 threads over the vocabulary.  See `sampler_greedy_kernel`.
         const int gthreads = 1024;
-        sampler_greedy_kernel<<<(unsigned) n_tokens, gthreads, shmem, (cudaStream_t) stream>>>(
+        sampler_greedy_kernel<<<(unsigned) n_tokens, gthreads, shmem, (hipStream_t) stream>>>(
             logits, n_vocab, history, history_len, p, p.penalty_last_n, p.penalty_last_n, out);
     } else {
         // The same block-per-token shape: the selection's k argmax rounds reduce inside the block.  See
         // `sampler_kernel`'s header for what the old one-thread-per-token launch cost.
-        sampler_kernel<<<(unsigned) n_tokens, 1024, shmem, (cudaStream_t) stream>>>(
+        sampler_kernel<<<(unsigned) n_tokens, 1024, shmem, (hipStream_t) stream>>>(
             logits, n_vocab, n_tokens, history, history_len, p, out);
     }
-    const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "sample_tokens launch: %s\n", cudaGetErrorString(e));
+    const hipError_t e = hipGetLastError();
+    if (e != hipSuccess) {
+        std::fprintf(stderr, "sample_tokens launch: %s\n", hipGetErrorString(e));
         std::exit(1);
     }
-    if (stream == nullptr) cudaDeviceSynchronize();
+    if (stream == nullptr) hipDeviceSynchronize();
 }
 
 }  // namespace strata::kernels

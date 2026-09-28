@@ -1,3 +1,4 @@
+﻿#include "hip/hip_runtime.h"
 // src/kernels/gdn_parity.cpp - P2.S2's test for the GDN recurrence, the conv and the two norms.
 //
 // `ref/gdn.py` carries eleven PROPERTY checks, several of which exist because a rival reading of the SOURCE
@@ -20,7 +21,7 @@
 // filled with a value that encodes its own coordinates.
 #include "strata/kernels/gdn.hpp"
 
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
 
 #include <cmath>
 #include <cstdio>
@@ -32,9 +33,9 @@
 
 namespace {
 
-void check(cudaError_t e, const char* what) {
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e));
+void check(hipError_t e, const char* what) {
+    if (e != hipSuccess) {
+        std::fprintf(stderr, "%s: %s\n", what, hipGetErrorString(e));
         std::exit(1);
     }
 }
@@ -160,26 +161,26 @@ int main(int argc, char** argv) {
         // the kernel
         float *d_st = nullptr, *d_q = nullptr, *d_k = nullptr, *d_v = nullptr, *d_g = nullptr, *d_b = nullptr,
               *d_o = nullptr;
-        check(cudaMalloc(&d_st, st_dev.size() * 4), "st");
-        check(cudaMalloc(&d_q, q.size() * 4), "q");
-        check(cudaMalloc(&d_k, k.size() * 4), "k");
-        check(cudaMalloc(&d_v, v.size() * 4), "v");
-        check(cudaMalloc(&d_g, gate.size() * 4), "g");
-        check(cudaMalloc(&d_b, beta.size() * 4), "b");
-        check(cudaMalloc(&d_o, (size_t) h_v * S * 4), "o");
-        check(cudaMemcpy(d_st, st_dev.data(), st_dev.size() * 4, cudaMemcpyHostToDevice), "cst");
-        check(cudaMemcpy(d_q, q.data(), q.size() * 4, cudaMemcpyHostToDevice), "cq");
-        check(cudaMemcpy(d_k, k.data(), k.size() * 4, cudaMemcpyHostToDevice), "ck");
-        check(cudaMemcpy(d_v, v.data(), v.size() * 4, cudaMemcpyHostToDevice), "cv");
-        check(cudaMemcpy(d_g, gate.data(), gate.size() * 4, cudaMemcpyHostToDevice), "cg");
-        check(cudaMemcpy(d_b, beta.data(), beta.size() * 4, cudaMemcpyHostToDevice), "cb");
+        check(hipMalloc(&d_st, st_dev.size() * 4), "st");
+        check(hipMalloc(&d_q, q.size() * 4), "q");
+        check(hipMalloc(&d_k, k.size() * 4), "k");
+        check(hipMalloc(&d_v, v.size() * 4), "v");
+        check(hipMalloc(&d_g, gate.size() * 4), "g");
+        check(hipMalloc(&d_b, beta.size() * 4), "b");
+        check(hipMalloc(&d_o, (size_t) h_v * S * 4), "o");
+        check(hipMemcpy(d_st, st_dev.data(), st_dev.size() * 4, hipMemcpyHostToDevice), "cst");
+        check(hipMemcpy(d_q, q.data(), q.size() * 4, hipMemcpyHostToDevice), "cq");
+        check(hipMemcpy(d_k, k.data(), k.size() * 4, hipMemcpyHostToDevice), "ck");
+        check(hipMemcpy(d_v, v.data(), v.size() * 4, hipMemcpyHostToDevice), "cv");
+        check(hipMemcpy(d_g, gate.data(), gate.size() * 4, hipMemcpyHostToDevice), "cg");
+        check(hipMemcpy(d_b, beta.data(), beta.size() * 4, hipMemcpyHostToDevice), "cb");
 
         strata::kernels::GdnShapes sh{S, h_k, h_v};
         strata::kernels::gdn_step(d_st, d_q, d_k, d_v, d_g, d_b, d_o, sh, nullptr);
 
         std::vector<float> got_o((size_t) h_v * S), got_st(st_dev.size());
-        check(cudaMemcpy(got_o.data(), d_o, got_o.size() * 4, cudaMemcpyDeviceToHost), "cgo");
-        check(cudaMemcpy(got_st.data(), d_st, got_st.size() * 4, cudaMemcpyDeviceToHost), "cgst");
+        check(hipMemcpy(got_o.data(), d_o, got_o.size() * 4, hipMemcpyDeviceToHost), "cgo");
+        check(hipMemcpy(got_st.data(), d_st, got_st.size() * 4, hipMemcpyDeviceToHost), "cgst");
 
         // o, and the STATE read back through the declared layout
         const double rel_o = rel_l1(want_o, got_o);
@@ -204,12 +205,12 @@ int main(int argc, char** argv) {
         // PROPERTY 4 setup) - a cheap independent invariant that no layout can fake
         {
             std::vector<float> zero(st_dev.size(), 0.0f), zg((size_t) h_v, 0.0f), zb((size_t) h_v, 0.0f);
-            check(cudaMemcpy(d_st, zero.data(), zero.size() * 4, cudaMemcpyHostToDevice), "z0");
-            check(cudaMemcpy(d_g, zg.data(), zg.size() * 4, cudaMemcpyHostToDevice), "z1");
-            check(cudaMemcpy(d_b, zb.data(), zb.size() * 4, cudaMemcpyHostToDevice), "z2");
+            check(hipMemcpy(d_st, zero.data(), zero.size() * 4, hipMemcpyHostToDevice), "z0");
+            check(hipMemcpy(d_g, zg.data(), zg.size() * 4, hipMemcpyHostToDevice), "z1");
+            check(hipMemcpy(d_b, zb.data(), zb.size() * 4, hipMemcpyHostToDevice), "z2");
             strata::kernels::gdn_step(d_st, d_q, d_k, d_v, d_g, d_b, d_o, sh, nullptr);
             std::vector<float> zz(zero.size());
-            check(cudaMemcpy(zz.data(), d_st, zz.size() * 4, cudaMemcpyDeviceToHost), "z3");
+            check(hipMemcpy(zz.data(), d_st, zz.size() * 4, hipMemcpyDeviceToHost), "z3");
             double nz = 0;
             for (float x : zz) nz += std::fabs(x);
             const bool ok = nz == 0.0;
@@ -217,8 +218,8 @@ int main(int argc, char** argv) {
             if (!ok) ++bad;
         }
 
-        // ephemeral state: unchanged when the state is untouched but beta=1 — the delta rule writing k*d
-        cudaFree(d_st); cudaFree(d_q); cudaFree(d_k); cudaFree(d_v); cudaFree(d_g); cudaFree(d_b); cudaFree(d_o);
+        // ephemeral state: unchanged when the state is untouched but beta=1 ΓÇö the delta rule writing k*d
+        hipFree(d_st); hipFree(d_q); hipFree(d_k); hipFree(d_v); hipFree(d_g); hipFree(d_b); hipFree(d_o);
     }
 
     // ================= 2. the conv =================
@@ -280,23 +281,23 @@ int main(int argc, char** argv) {
         }
 
         float *d_cs = nullptr, *d_x = nullptr, *d_w = nullptr, *d_o = nullptr;
-        check(cudaMalloc(&d_cs, cs.size() * 4), "cs");
-        check(cudaMalloc(&d_x, x.size() * 4), "cx");
-        check(cudaMalloc(&d_w, kW.size() * 4), "cw");
-        check(cudaMalloc(&d_o, (size_t) C * 4), "co");
-        check(cudaMemcpy(d_cs, cs.data(), cs.size() * 4, cudaMemcpyHostToDevice), "ccs");
-        check(cudaMemcpy(d_x, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "ccx");
-        check(cudaMemcpy(d_w, kW.data(), kW.size() * 4, cudaMemcpyHostToDevice), "ccw");
+        check(hipMalloc(&d_cs, cs.size() * 4), "cs");
+        check(hipMalloc(&d_x, x.size() * 4), "cx");
+        check(hipMalloc(&d_w, kW.size() * 4), "cw");
+        check(hipMalloc(&d_o, (size_t) C * 4), "co");
+        check(hipMemcpy(d_cs, cs.data(), cs.size() * 4, hipMemcpyHostToDevice), "ccs");
+        check(hipMemcpy(d_x, x.data(), x.size() * 4, hipMemcpyHostToDevice), "ccx");
+        check(hipMemcpy(d_w, kW.data(), kW.size() * 4, hipMemcpyHostToDevice), "ccw");
         strata::kernels::gdn_conv_step(d_cs, d_x, d_w, d_o, C, dc, nullptr);
         std::vector<float> got((size_t) C), got_cs(cs.size());
-        check(cudaMemcpy(got.data(), d_o, got.size() * 4, cudaMemcpyDeviceToHost), "cgo");
-        check(cudaMemcpy(got_cs.data(), d_cs, got_cs.size() * 4, cudaMemcpyDeviceToHost), "cgs");
+        check(hipMemcpy(got.data(), d_o, got.size() * 4, hipMemcpyDeviceToHost), "cgo");
+        check(hipMemcpy(got_cs.data(), d_cs, got_cs.size() * 4, hipMemcpyDeviceToHost), "cgs");
         const double rel_out = rel_l1(want, got), rel_cs = rel_l1(cs_want, got_cs);
         std::printf("  %-42s rel %.3e\n", "conv out vs reference", rel_out);
         std::printf("  %-42s rel %.3e\n", "conv state slide (mapped) vs reference", rel_cs);
         if (!(rel_out <= 1e-6)) { std::printf("    *** conv out ***\n"); ++bad; }
         if (!(rel_cs <= 1e-6)) { std::printf("    *** conv state ***\n"); ++bad; }
-        cudaFree(d_cs); cudaFree(d_x); cudaFree(d_w); cudaFree(d_o);
+        hipFree(d_cs); hipFree(d_x); hipFree(d_w); hipFree(d_o);
     }
 
     // ================= 3. l2_norm =================
@@ -329,15 +330,15 @@ int main(int argc, char** argv) {
         if (!(rel_trap > 0.05)) ++bad;
 
         float* d_x = nullptr;
-        check(cudaMalloc(&d_x, x.size() * 4), "lx");
-        check(cudaMemcpy(d_x, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "lcx");
+        check(hipMalloc(&d_x, x.size() * 4), "lx");
+        check(hipMemcpy(d_x, x.data(), x.size() * 4, hipMemcpyHostToDevice), "lcx");
         strata::kernels::gdn_l2_norm(d_x, rows, cols, eps, nullptr);
         std::vector<float> got(x.size());
-        check(cudaMemcpy(got.data(), d_x, got.size() * 4, cudaMemcpyDeviceToHost), "lcg");
+        check(hipMemcpy(got.data(), d_x, got.size() * 4, hipMemcpyDeviceToHost), "lcg");
         const double rel = rel_l1(x_ref, got);
         std::printf("  %-42s rel %.3e\n", "l2_norm vs reference", rel);
         if (!(rel <= 1e-6)) ++bad;
-        cudaFree(d_x);
+        hipFree(d_x);
     }
 
     // ================= 4. the closing norm =================
@@ -357,16 +358,16 @@ int main(int argc, char** argv) {
                                               sigmoid_f(z[(size_t) (h * S2 + i)]);
         }
         float *d_o = nullptr, *d_z = nullptr, *d_sn = nullptr, *d_y = nullptr;
-        check(cudaMalloc(&d_o, o.size() * 4), "no");
-        check(cudaMalloc(&d_z, z.size() * 4), "nz");
-        check(cudaMalloc(&d_sn, sn.size() * 4), "ns");
-        check(cudaMalloc(&d_y, y_ref.size() * 4), "ny");
-        check(cudaMemcpy(d_o, o.data(), o.size() * 4, cudaMemcpyHostToDevice), "nco");
-        check(cudaMemcpy(d_z, z.data(), z.size() * 4, cudaMemcpyHostToDevice), "ncz");
-        check(cudaMemcpy(d_sn, sn.data(), sn.size() * 4, cudaMemcpyHostToDevice), "ncs");
+        check(hipMalloc(&d_o, o.size() * 4), "no");
+        check(hipMalloc(&d_z, z.size() * 4), "nz");
+        check(hipMalloc(&d_sn, sn.size() * 4), "ns");
+        check(hipMalloc(&d_y, y_ref.size() * 4), "ny");
+        check(hipMemcpy(d_o, o.data(), o.size() * 4, hipMemcpyHostToDevice), "nco");
+        check(hipMemcpy(d_z, z.data(), z.size() * 4, hipMemcpyHostToDevice), "ncz");
+        check(hipMemcpy(d_sn, sn.data(), sn.size() * 4, hipMemcpyHostToDevice), "ncs");
         strata::kernels::gdn_out_norm(d_o, d_z, d_sn, d_y, hv2, S2, eps, nullptr);
         std::vector<float> got(y_ref.size());
-        check(cudaMemcpy(got.data(), d_y, got.size() * 4, cudaMemcpyDeviceToHost), "ncy");
+        check(hipMemcpy(got.data(), d_y, got.size() * 4, hipMemcpyDeviceToHost), "ncy");
         const double rel = rel_l1(y_ref, got);
         std::printf("\n  %-42s rel %.3e\n", "out norm (rms * ssm_norm * sigmoid z)", rel);
         if (!(rel <= 1e-6)) ++bad;
@@ -387,7 +388,7 @@ int main(int argc, char** argv) {
         std::printf("  %-42s %-4s (%.2f%% apart)\n", "sigmoid vs SiLU on the gate is observable",
                     rel_silu > 0.05 ? "yes" : "*** NO ***", rel_silu * 100);
         if (!(rel_silu > 0.05)) ++bad;
-        cudaFree(d_o); cudaFree(d_z); cudaFree(d_sn); cudaFree(d_y);
+        hipFree(d_o); hipFree(d_z); hipFree(d_sn); hipFree(d_y);
     }
 
     std::printf("\ngdn: %d failures\n", bad);
@@ -395,3 +396,4 @@ int main(int argc, char** argv) {
     if (selftest) std::printf("gdn_parity OK\n");
     return 0;
 }
+

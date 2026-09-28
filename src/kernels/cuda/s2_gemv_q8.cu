@@ -1,3 +1,4 @@
+#include "hip/hip_runtime.h"
 // src/kernels/cuda/s2_gemv_q8.cu - the S2 GEMV that consumes Q8_0 ACTIVATIONS, as ggml does.
 //
 // THE GAP THIS CLOSES (round 186).  `ggml_mul_mat` converts src1 - the ACTIVATION - to the weight's
@@ -18,8 +19,8 @@
 // scale is constant across it and is loaded once.
 #include "strata/kernels/s2_gemv_q8.hpp"
 
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
+#include <hip/hip_fp16.h>
+#include <hip/hip_runtime.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -82,15 +83,15 @@ void s2_gemv_q8(const uint8_t* act, const uint8_t* codes, const float* scales, f
         std::exit(1);
     }
     const size_t smem = (size_t) threads_per_row * sizeof(float);
-    s2_gemv_q8_kernel<<<(unsigned) n_out, threads_per_row, smem, (cudaStream_t) stream>>>(act, codes, scales, y,
+    s2_gemv_q8_kernel<<<(unsigned) n_out, threads_per_row, smem, (hipStream_t) stream>>>(act, codes, scales, y,
                                                                                          n_in, n_out,
                                                                                          threads_per_row);
-    const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "s2_gemv_q8 launch: %s\n", cudaGetErrorString(e));
+    const hipError_t e = hipGetLastError();
+    if (e != hipSuccess) {
+        std::fprintf(stderr, "s2_gemv_q8 launch: %s\n", hipGetErrorString(e));
         std::exit(1);
     }
-    if (stream == nullptr) cudaDeviceSynchronize();
+    if (stream == nullptr) hipDeviceSynchronize();
 }
 
 }  // namespace strata::kernels

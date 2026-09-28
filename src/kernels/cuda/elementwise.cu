@@ -1,10 +1,12 @@
+#include "hip/hip_runtime.h"
 // src/kernels/cuda/elementwise.cu - P2.S5's glue kernels.  See the header for why each exists.
 #include "strata/kernels/elementwise.hpp"
 
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/f16_bits.hpp"
 
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
+#include "strata/hip_compat.h"
 
 #include <cmath>
 #include <cstdio>
@@ -99,29 +101,29 @@ __global__ void rms_norm_weighted_kernel(float* __restrict__ x, const float* __r
     float* r = x + row * cols;
     float acc = 0.0f;
     for (int64_t c = lane; c < cols; c += 32) acc += r[c] * r[c];
-    for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, acc, off, 32);
     // The MEAN, not the sum: `ref/qsa.py::rms_norm` divides by `np.mean(np.square(x))`.  Broadcasting the
     // reciprocal from lane 0 keeps all 32 lanes on the same value - computing `rsqrt` per lane would be the
     // same number but a needless 32-way divergence in the last bit.
     float inv = 0.0f;
     if (lane == 0) inv = rsqrtf(acc / (float) cols + eps);
-    inv = __shfl_sync(0xFFFFFFFFu, inv, 0);
+    inv = __shfl_sync(0xFFFFFFFFFFFFFFFFull, inv, 0);
     for (int64_t c = lane; c < cols; c += 32) r[c] = (w ? r[c] * w[c] : r[c]) * inv;
 }
 
 void sync_if_needed(void* stream, const char* what) {
     if (stream != nullptr) return;
-    const cudaError_t e = cudaDeviceSynchronize();
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e));
+    const hipError_t e = hipDeviceSynchronize();
+    if (e != hipSuccess) {
+        std::fprintf(stderr, "%s: %s\n", what, hipGetErrorString(e));
         std::exit(1);
     }
 }
 
 bool check_launch(const char* what) {
-    const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "%s launch: %s\n", what, cudaGetErrorString(e));
+    const hipError_t e = hipGetLastError();
+    if (e != hipSuccess) {
+        std::fprintf(stderr, "%s launch: %s\n", what, hipGetErrorString(e));
         std::exit(1);
     }
     return true;
@@ -133,7 +135,7 @@ void embedding_gather(const uint8_t* codes, const float* scales, const float* of
                       int64_t n, int code_bits, int code_bias, int group_elems,
                       float* out, void* stream) {
     if (n <= 0) return;
-    embedding_gather_kernel<<<grid_for(n), THREADS, 0, (cudaStream_t) stream>>>(
+    embedding_gather_kernel<<<grid_for(n), THREADS, 0, (hipStream_t) stream>>>(
         codes, scales, offsets, n, code_bits, code_bias, group_elems, out);
     check_launch("embedding_gather");
 }
@@ -142,42 +144,42 @@ void gdn_gate(const float* alpha, const float* dt, const float* ssm_a, float* ga
               int64_t h_v, void* stream) {
     if (n_tokens <= 0 || h_v <= 0) return;
     const int64_t n = n_tokens * h_v;
-    gdn_gate_kernel<<<grid_for(n), THREADS, 0, (cudaStream_t) stream>>>(alpha, dt, ssm_a, gate, h_v);
+    gdn_gate_kernel<<<grid_for(n), THREADS, 0, (hipStream_t) stream>>>(alpha, dt, ssm_a, gate, h_v);
     check_launch("gdn_gate");
     sync_if_needed(stream, "gdn_gate");
 }
 
 void scale_inplace(float* x, int64_t n, float s, void* stream) {
     if (n <= 0) return;
-    scale_kernel<<<grid_for(n), THREADS, 0, (cudaStream_t) stream>>>(x, n, s);
+    scale_kernel<<<grid_for(n), THREADS, 0, (hipStream_t) stream>>>(x, n, s);
     check_launch("scale_inplace");
     sync_if_needed(stream, "scale_inplace");
 }
 
 void add_inplace(float* dst, const float* src, int64_t n, void* stream) {
     if (n <= 0) return;
-    add_kernel<<<grid_for(n), THREADS, 0, (cudaStream_t) stream>>>(dst, src, n);
+    add_kernel<<<grid_for(n), THREADS, 0, (hipStream_t) stream>>>(dst, src, n);
     check_launch("add_inplace");
     sync_if_needed(stream, "add_inplace");
 }
 
 void f32_to_f16_bulk(const float* x, uint16_t* y, int64_t n, void* stream) {
     if (n <= 0) return;
-    to_f16_kernel<<<grid_for(n), THREADS, 0, (cudaStream_t) stream>>>(x, y, n);
+    to_f16_kernel<<<grid_for(n), THREADS, 0, (hipStream_t) stream>>>(x, y, n);
     check_launch("f32_to_f16_bulk");
     sync_if_needed(stream, "f32_to_f16_bulk");
 }
 
 void f32_to_bf16_bulk(const float* x, uint16_t* y, int64_t n, void* stream) {
     if (n <= 0) return;
-    to_bf16_kernel<<<grid_for(n), THREADS, 0, (cudaStream_t) stream>>>(x, y, n);
+    to_bf16_kernel<<<grid_for(n), THREADS, 0, (hipStream_t) stream>>>(x, y, n);
     check_launch("f32_to_bf16_bulk");
     sync_if_needed(stream, "f32_to_bf16_bulk");
 }
 
 void silu_inplace(float* x, int64_t n, void* stream) {
     if (n <= 0) return;
-    silu_kernel<<<grid_for(n), THREADS, 0, (cudaStream_t) stream>>>(x, n);
+    silu_kernel<<<grid_for(n), THREADS, 0, (hipStream_t) stream>>>(x, n);
     check_launch("silu_inplace");
     sync_if_needed(stream, "silu_inplace");
 }
@@ -214,7 +216,7 @@ __global__ void doorbell_wait_kernel(const volatile uint32_t* flag, const volati
 
 void doorbell_wait(const uint32_t* d_flag, const uint32_t* d_seq, void* stream) {
     if (d_flag == nullptr || d_seq == nullptr) return;
-    doorbell_wait_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(d_flag, d_seq);
+    doorbell_wait_kernel<<<1, 1, 0, (hipStream_t) stream>>>(d_flag, d_seq);
     check_launch("doorbell_wait");
 }
 
@@ -233,7 +235,7 @@ void copy_from_mapped(float* dst, const float* src, int64_t n, void* stream) {
     }
     const int64_t n4 = n / 4;
     const int blocks = (int) ((n4 + 255) / 256 < 64 ? (n4 + 255) / 256 : 64);
-    copy_from_mapped_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>((float4*) dst, (const volatile float4*) src, n4);
+    copy_from_mapped_kernel<<<blocks, 256, 0, (hipStream_t) stream>>>((float4*) dst, (const volatile float4*) src, n4);
     check_launch("copy_from_mapped");
 }
 
@@ -253,7 +255,7 @@ __global__ void doorbell_publish_kernel(const float* __restrict__ x, const int32
 void doorbell_publish(const float* x, const int32_t* ids, const float* weights, int64_t n, int64_t k, float* x_out,
                       int32_t* ids_out, float* weights_out, uint32_t* d_seq, void* stream) {
     if (k > 1024) { std::fprintf(stderr, "doorbell_publish: k too large\n"); std::exit(1); }
-    doorbell_publish_kernel<<<1, 1024, 0, (cudaStream_t) stream>>>(x, ids, weights, (int) n, (int) k, x_out, ids_out,
+    doorbell_publish_kernel<<<1, 1024, 0, (hipStream_t) stream>>>(x, ids, weights, (int) n, (int) k, x_out, ids_out,
                                                                     weights_out, d_seq);
     check_launch("doorbell_publish");
 }
@@ -264,13 +266,13 @@ __global__ void copy_i32_from_mapped_kernel(int32_t* __restrict__ dst, const vol
 
 void copy_i32_from_mapped(int32_t* dst, const int32_t* src, int64_t n, void* stream) {
     if (n <= 0) return;
-    copy_i32_from_mapped_kernel<<<1, 128, 0, (cudaStream_t) stream>>>(dst, (const volatile int32_t*) src, (int) n);
+    copy_i32_from_mapped_kernel<<<1, 128, 0, (hipStream_t) stream>>>(dst, (const volatile int32_t*) src, (int) n);
     check_launch("copy_i32_from_mapped");
 }
 
 void doorbell_ring(uint32_t* d_seq, void* stream) {
     if (d_seq == nullptr) return;
-    doorbell_ring_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(d_seq);
+    doorbell_ring_kernel<<<1, 1, 0, (hipStream_t) stream>>>(d_seq);
     check_launch("doorbell_ring");
     sync_if_needed(stream, "doorbell_ring");
 }
@@ -281,7 +283,7 @@ void rms_norm_weighted(float* x, const float* w, int64_t rows, int64_t cols, flo
     // launching a block per row for a 2-row call.
     const unsigned warps_per_block = 4;
     const unsigned grid = (unsigned) ((rows + warps_per_block - 1) / warps_per_block);
-    rms_norm_weighted_kernel<<<grid, warps_per_block * 32, 0, (cudaStream_t) stream>>>(x, w, rows, cols, eps);
+    rms_norm_weighted_kernel<<<grid, warps_per_block * 32, 0, (hipStream_t) stream>>>(x, w, rows, cols, eps);
     check_launch("rms_norm_weighted");
     sync_if_needed(stream, "rms_norm_weighted");
 }

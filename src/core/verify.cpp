@@ -1,3 +1,4 @@
+#include "hip/hip_runtime.h"
 // src/core/verify.cpp - see include/strata/core/verify.hpp.
 #include "strata/core/verify.hpp"
 #if defined(_WIN32)
@@ -61,9 +62,9 @@ struct Bump {
 };
 
 bool mapped(size_t bytes, void** h, void** d) {
-    if (cudaHostAlloc(h, bytes, cudaHostAllocMapped) != cudaSuccess) return false;
+    if (hipHostAlloc(h, bytes, hipHostMallocMapped) != hipSuccess) return false;
     std::memset(*h, 0, bytes);
-    return cudaHostGetDevicePointer(d, *h, 0) == cudaSuccess;
+    return hipHostGetDevicePointer(d, *h, 0) == hipSuccess;
 }
 
 strata::kernels::QsaShapes shapes_of(const ModelGeometry& g) {
@@ -110,17 +111,17 @@ void Verifier::diag(std::FILE* f) const {
 Verifier::~Verifier() {
     const Verifier* self = this;
     g_diag_verifier.compare_exchange_strong(self, nullptr);
-    if (cs_) cudaStreamSynchronize(cs_);
+    if (cs_) hipStreamSynchronize(cs_);
     for (auto& e : exec_)
-        if (e) cudaGraphExecDestroy(e);
-    if (commit_exec_) cudaGraphExecDestroy(commit_exec_);
-    if (cs_) cudaStreamDestroy(cs_);
-    if (copy_) { cudaStreamSynchronize(copy_); cudaStreamDestroy(copy_); }
-    if (arena_) cudaFree(arena_);
+        if (e) hipGraphExecDestroy(e);
+    if (commit_exec_) hipGraphExecDestroy(commit_exec_);
+    if (cs_) hipStreamDestroy(cs_);
+    if (copy_) { hipStreamSynchronize(copy_); hipStreamDestroy(copy_); }
+    if (arena_) hipFree(arena_);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_,
                      h_flagA_, h_plan_, h_flagB_};
     for (void* h : hosts)
-        if (h) cudaFreeHost(h);
+        if (h) hipHostFree(h);
 }
 
 bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState& ss, const VerifyHits& hits,
@@ -247,22 +248,22 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     };
     Bump count;
     carve(count);
-    if (cudaMalloc(&arena_, count.used) != cudaSuccess) {
+    if (hipMalloc(&arena_, count.used) != hipSuccess) {
         err = "verify: the device arena (" + std::to_string(count.used >> 20) + " MiB) does not fit";
         return false;
     }
-    cudaMemset(arena_, 0, count.used);
+    hipMemset(arena_, 0, count.used);
     Bump real;
     real.base = (uint8_t*) arena_;
     carve(real);
     sink_.staging = (unsigned long long) staging_;
     sink_.staging_cap = kStagingBlobs;
     (void) TS;
-    if (cudaStreamCreateWithFlags(&copy_, cudaStreamNonBlocking) != cudaSuccess) {
+    if (hipStreamCreateWithFlags(&copy_, hipStreamNonBlocking) != hipSuccess) {
         err = "verify: copy stream create failed";
         return false;
     }
-    if (cudaStreamCreateWithFlags(&cs_, cudaStreamNonBlocking) != cudaSuccess) {
+    if (hipStreamCreateWithFlags(&cs_, hipStreamNonBlocking) != hipSuccess) {
         err = "verify: stream create failed";
         return false;
     }
@@ -283,7 +284,7 @@ const float* Verifier::final_R(int t) const { return R_ + (size_t) t * (size_t) 
 // so the CPU computes A's experts of layer l while the GPU runs B's mixer and router of layer l, and B's experts
 // while the GPU combines A and runs A's layer l+1.  B's mixer only needs A's mixer of the same layer (K/V, GDN
 // state), never A's experts, so nothing waits that did not wait before.  Every token's arithmetic is unchanged.
-bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+bool Verifier::record_window(int T, hipStream_t cs, std::string& err) {
     using namespace strata::kernels;
     const ModelGeometry& g = *g_;
     const WeightTable& wt = *wt_;
@@ -471,8 +472,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                             n, cs);
                 for (int t = tb; t < te; ++t) {
                     float* qc = qcur_ + t * NH * HD;
-                    if (cudaMemcpy2DAsync(qc, (size_t) HD * 4, qfull_ + t * NH * 2 * HD, (size_t) HD * 2 * 4,
-                                          (size_t) HD * 4, (size_t) NH, cudaMemcpyDeviceToDevice, cs) != cudaSuccess) {
+                    if (hipMemcpy2DAsync(qc, (size_t) HD * 4, qfull_ + t * NH * 2 * HD, (size_t) HD * 2 * 4,
+                                          (size_t) HD * 4, (size_t) NH, hipMemcpyDeviceToDevice, cs) != hipSuccess) {
                         err = "verify: the q/gate split failed";
                         return false;
                     }
@@ -646,33 +647,33 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
 
 bool Verifier::capture(int T, std::string& err) {
     if (exec_[T] != nullptr) return true;
-    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
+    if (hipStreamBeginCapture(cs_, hipStreamCaptureModeThreadLocal) != hipSuccess) {
         err = "verify: begin capture failed";
         return false;
     }
     std::string rerr;
     const bool ok = record_window(T, cs_, rerr);
-    cudaGraph_t graph = nullptr;
-    const cudaError_t ce = cudaStreamEndCapture(cs_, &graph);
+    hipGraph_t graph = nullptr;
+    const hipError_t ce = hipStreamEndCapture(cs_, &graph);
     if (!ok) {
-        if (graph) cudaGraphDestroy(graph);
+        if (graph) hipGraphDestroy(graph);
         err = rerr;
         return false;
     }
-    if (ce != cudaSuccess) {
-        err = std::string("verify: end capture: ") + cudaGetErrorString(ce);
+    if (ce != hipSuccess) {
+        err = std::string("verify: end capture: ") + hipGetErrorString(ce);
         return false;
     }
-    const cudaError_t ie = cudaGraphInstantiate(&exec_[T], graph, 0);
-    cudaGraphDestroy(graph);
-    if (ie != cudaSuccess) {
-        err = std::string("verify: instantiate: ") + cudaGetErrorString(ie);
+    const hipError_t ie = hipGraphInstantiateWithFlags(&exec_[T], graph, 0);
+    hipGraphDestroy(graph);
+    if (ie != hipSuccess) {
+        err = std::string("verify: instantiate: ") + hipGetErrorString(ie);
         return false;
     }
-    const cudaError_t ue = cudaGraphUpload(exec_[T], cs_);
-    const cudaError_t us = cudaStreamSynchronize(cs_);
+    const hipError_t ue = hipGraphUpload(exec_[T], cs_);
+    const hipError_t us = hipStreamSynchronize(cs_);
     std::fprintf(stderr, "strata verify: captured the %d-token window (upload %s, sync %s)\n", T,
-                 cudaGetErrorString(ue), cudaGetErrorString(us));
+                 hipGetErrorString(ue), hipGetErrorString(us));
     return true;
 }
 
@@ -687,7 +688,7 @@ bool Verifier::capture_commit(std::string& err) {
                                 (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
     const int64_t TS = (s.idx_block - 1) * ID;
     const int64_t HS = (int64_t) NG_HIST * NG_HC_DIM;
-    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
+    if (hipStreamBeginCapture(cs_, hipStreamCaptureModeThreadLocal) != hipSuccess) {
         err = "verify: begin commit capture failed";
         return false;
     }
@@ -726,18 +727,18 @@ bool Verifier::capture_commit(std::string& err) {
         err = std::string("verify commit: ") + e.what();
         ok = false;
     }
-    cudaGraph_t graph = nullptr;
-    const cudaError_t ce = cudaStreamEndCapture(cs_, &graph);
+    hipGraph_t graph = nullptr;
+    const hipError_t ce = hipStreamEndCapture(cs_, &graph);
     if (!ok) {
-        if (graph) cudaGraphDestroy(graph);
+        if (graph) hipGraphDestroy(graph);
         return false;
     }
-    if (ce != cudaSuccess || cudaGraphInstantiate(&commit_exec_, graph, 0) != cudaSuccess) {
-        if (graph) cudaGraphDestroy(graph);
-        err = std::string("verify: commit capture: ") + cudaGetErrorString(ce);
+    if (ce != hipSuccess || hipGraphInstantiateWithFlags(&commit_exec_, graph, 0) != hipSuccess) {
+        if (graph) hipGraphDestroy(graph);
+        err = std::string("verify: commit capture: ") + hipGetErrorString(ce);
         return false;
     }
-    cudaGraphDestroy(graph);
+    hipGraphDestroy(graph);
     return true;
 }
 
@@ -777,9 +778,9 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     for (int t = 0; t < T; ++t) last_tokens_[t] = tokens[t];
     ms_host += ms_since(t0);
     VDBG("staged; launching\n");
-    const cudaError_t le = cudaGraphLaunch(exec_[T], cs_);
-    if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
-    (void) cudaStreamQuery(cs_);
+    const hipError_t le = hipGraphLaunch(exec_[T], cs_);
+    if (le != hipSuccess) { err = std::string("verify: launch: ") + hipGetErrorString(le); return false; }
+    (void) hipStreamQuery(cs_);
     VDBG("launched\n");
     volatile uint32_t* const seq = h_seq_;
     volatile uint32_t* const flag = h_flag_;
@@ -799,10 +800,10 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             const auto now = Clock::now();
             if (now - last_flush > std::chrono::microseconds(2000)) {
                 last_flush = now;
-                const cudaError_t q = cudaStreamQuery(cs_);
-                if (q != cudaErrorNotReady && *seq < want) {
+                const hipError_t q = hipStreamQuery(cs_);
+                if (q != hipErrorNotReady && *seq < want) {
                     err = "verify: layer " + std::to_string(l) + " never rang (" +
-                          (q == cudaSuccess ? std::string("graph finished") : std::string(cudaGetErrorString(q))) + ")";
+                          (q == hipSuccess ? std::string("graph finished") : std::string(hipGetErrorString(q))) + ")";
                     return false;
                 }
             }
@@ -836,10 +837,10 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         ms_pool += ms_since(b);
     }
     progress_at("verify window: waiting for the GPU to finish the window (flags A/B/M raised)", (int64_t) T);
-    const cudaError_t se = cudaStreamSynchronize(cs_);
-    if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
+    const hipError_t se = hipStreamSynchronize(cs_);
+    if (se != hipSuccess) { err = std::string("verify: ") + hipGetErrorString(se); return false; }
     progress_at("verify window: waiting for the expert copies", (int64_t) T);
-    cudaStreamSynchronize(copy_);   // no host function of this window may raise flag B in the next one
+    hipStreamSynchronize(copy_);   // no host function of this window may raise flag B in the next one
     // ---- a sampled or penalized request: the head's sampling again, host-side so its parameters are this call's
     // own (a captured kernel would replay the same draws forever).  Row t's draw is Philox(seed, pos0 + t): tied to
     // the POSITION it samples, not to how the text was cut into windows, so a seed replays the same text whatever
@@ -849,7 +850,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         SamplerParams sp = sampling_;
         sp.counter = (uint64_t) pos0;
         sample_tokens(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, cs_);
-        if (cudaStreamSynchronize(cs_) != cudaSuccess) {   // m_out_ is the mapped h_out_: synced, it is readable
+        if (hipStreamSynchronize(cs_) != hipSuccess) {   // m_out_ is the mapped h_out_: synced, it is readable
             err = "verify: the head sampling failed";
             return false;
         }
@@ -859,7 +860,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         static bool reported = false;
         if (!reported) {
             std::vector<float> h((size_t) T * (size_t) n_vocab_);
-            cudaMemcpy(h.data(), head_logits_, h.size() * 4, cudaMemcpyDeviceToHost);
+            hipMemcpy(h.data(), head_logits_, h.size() * 4, hipMemcpyDeviceToHost);
             for (int t = 0; t < T && !reported; ++t) {
                 int64_t bad = 0;
                 for (int64_t v = 0; v < n_vocab_; ++v) bad += !std::isfinite(h[(size_t) t * n_vocab_ + v]);
@@ -920,11 +921,11 @@ void Verifier::fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t byt
     const uint32_t want = v->cur_layer_ + 1;
     if (n <= 0) { raise_flag(v->h_flagB_, want); return; }
     uint8_t* stage = (uint8_t*) v->sink_.staging;                  // this group's half in a split window
-    for (int i = 0; i < n; ++i) cudaMemcpyAsync(stage + (size_t) i * bytes, src[i], bytes, cudaMemcpyHostToDevice, v->copy_);
+    for (int i = 0; i < n; ++i) hipMemcpyAsync(stage + (size_t) i * bytes, src[i], bytes, hipMemcpyHostToDevice, v->copy_);
     FlagSet& fs = v->flag_sets_[v->cur_layer_ % (sizeof v->flag_sets_ / sizeof v->flag_sets_[0])];
     fs.flag = v->h_flagB_;
     fs.value = want;
-    cudaLaunchHostFunc(v->copy_, [](void* p) { FlagSet* s = (FlagSet*) p; raise_flag(s->flag, s->value); }, &fs);
+    hipLaunchHostFunc(v->copy_, [](void* p) { FlagSet* s = (FlagSet*) p; raise_flag(s->flag, s->value); }, &fs);
 }
 
 void Verifier::publish_plan(void* ctx) {
@@ -940,10 +941,10 @@ bool Verifier::commit(int n_keep, std::string& err) {
     h_commit_[1] = n_keep - 1;
     for (int t = 0; t < max_t_; ++t) h_commit_[2 + t] = t < n_keep ? (int32_t) (last_pos0_ + t) : -1;
     std::atomic_thread_fence(std::memory_order_seq_cst);
-    const cudaError_t le = cudaGraphLaunch(commit_exec_, cs_);
-    if (le != cudaSuccess) { err = std::string("verify: commit launch: ") + cudaGetErrorString(le); return false; }
-    const cudaError_t se = cudaStreamSynchronize(cs_);
-    if (se != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(se); return false; }
+    const hipError_t le = hipGraphLaunch(commit_exec_, cs_);
+    if (le != hipSuccess) { err = std::string("verify: commit launch: ") + hipGetErrorString(le); return false; }
+    const hipError_t se = hipStreamSynchronize(cs_);
+    if (se != hipSuccess) { err = std::string("verify: commit: ") + hipGetErrorString(se); return false; }
     for (int t = 0; t < n_keep; ++t) {
         ss_->ple_prev[0] = ss_->ple_prev[1];
         ss_->ple_prev[1] = last_tokens_[t];

@@ -1,3 +1,4 @@
+#include "hip/hip_runtime.h"
 // src/core/expert_source.cpp - the adapter.  See the header for the three clauses of the contract.
 #include "strata/core/expert_source.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
@@ -7,7 +8,7 @@
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
 
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
 
 #include <algorithm>
 #include <atomic>
@@ -440,7 +441,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
 void expert_hit_run(void* user, void* stream, HitPhase phase, const int32_t* ids, int64_t k) {
     ExpertDispatch& d = *(ExpertDispatch*) user;
     if (d.failed) return;
-    cudaStream_t cs = (cudaStream_t) stream;
+    hipStream_t cs = (hipStream_t) stream;
 
     if (phase == HitPhase::Launch) {
         d.decided = false;
@@ -493,9 +494,9 @@ void expert_hit_run(void* user, void* stream, HitPhase phase, const int32_t* ids
         // `hit_out` is ZEROED rather than overwritten: the kernel writes only the rows this layer's hits own,
         // so a row that was a hit last layer and a miss this one would still hold last layer's expert and
         // `add_inplace` would sum it in.  Finite, plausible, wrong.
-        if (cudaMemsetAsync(d.hit_out, 0, (size_t) d.parts_elems * sizeof(float), cs) != cudaSuccess ||
-            cudaMemcpyAsync(d.d_slot, d.h_slot.data(), list_bytes, cudaMemcpyHostToDevice, cs) != cudaSuccess ||
-            cudaMemcpyAsync(d.d_dst, d.h_dst.data(), list_bytes, cudaMemcpyHostToDevice, cs) != cudaSuccess) {
+        if (hipMemsetAsync(d.hit_out, 0, (size_t) d.parts_elems * sizeof(float), cs) != hipSuccess ||
+            hipMemcpyAsync(d.d_slot, d.h_slot.data(), list_bytes, hipMemcpyHostToDevice, cs) != hipSuccess ||
+            hipMemcpyAsync(d.d_dst, d.h_dst.data(), list_bytes, hipMemcpyHostToDevice, cs) != hipSuccess) {
             d.hit_fail = "the hit list could not be staged";
             d.failed = true;
             d.fail = d.hit_fail;
@@ -524,10 +525,10 @@ void expert_hit_run(void* user, void* stream, HitPhase phase, const int32_t* ids
             strata::kernels::moe_hit_grouped_s2(d.cache_base, d.d_slot, d.d_dst, d.n_hits, d.cache_blob,
                 d.x_q8_0_hit, d.hit_scratch, d.hit_out, cs, d.x_q8_0_hit_scale);
         d.hit_pending = true;
-        if (d.hit_done != nullptr) cudaEventRecord((cudaEvent_t) d.hit_done, cs);
+        if (d.hit_done != nullptr) hipEventRecord((hipEvent_t) d.hit_done, cs);
         // The A/B arm: ONE driver entry here, and nothing else changes.  If the work was waiting for the host
         // to enter the driver, this is what lets it start while the pool runs.
-        if (d.hit_poke && d.hit_done != nullptr) (void) cudaEventQuery((cudaEvent_t) d.hit_done);
+        if (d.hit_poke && d.hit_done != nullptr) (void) hipEventQuery((hipEvent_t) d.hit_done);
         return;
     }
 
@@ -538,7 +539,7 @@ void expert_hit_run(void* user, void* stream, HitPhase phase, const int32_t* ids
     // so it is the LAST chance to observe a late start: a NOT-READY here means the work had not finished by the
     // time the pool returned, and with no poke in front of it that can only be because it began after.
     if (d.hit_done != nullptr) {
-        if (cudaEventQuery((cudaEvent_t) d.hit_done) == cudaSuccess) ++d.hit_ready;
+        if (hipEventQuery((hipEvent_t) d.hit_done) == hipSuccess) ++d.hit_ready;
         else ++d.hit_late;
     }
     strata::kernels::add_inplace(d.parts_out, d.hit_out, d.parts_elems, cs);
@@ -680,8 +681,8 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
         std::vector<uint64_t> starts = a->slice_bytes > 0 ? a->slice_starts : std::vector<uint64_t>{0};
         for (uint64_t off : starts) {
             void* d = nullptr;
-            if (cudaHostGetDevicePointer(&d, (void*) (base_ + off), 0) != cudaSuccess) {
-                (void) cudaGetLastError();
+            if (hipHostGetDevicePointer(&d, (void*) (base_ + off), 0) != hipSuccess) {
+                (void) hipGetLastError();
                 dev_slice_.clear();
                 break;
             }

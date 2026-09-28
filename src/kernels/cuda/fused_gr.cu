@@ -1,8 +1,9 @@
+#include "hip/hip_runtime.h"
 // src/kernels/cuda/fused_gr.cu - see include/strata/kernels/fused_gr.hpp.
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -22,7 +23,7 @@ constexpr int UP_BLOCKS = N / UP_COLS;           // 80
 
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffffffffffull, v, o, 32);
     return v;
 }
 __device__ __forceinline__ float sigmoidf_(float x) { return 1.0f / (1.0f + __expf(-x)); }
@@ -313,19 +314,31 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
     }
     m.xn = xn_scratch;
     m.T = n_tok;
-    cudaStream_t st = (cudaStream_t) stream;
+    hipStream_t st = (hipStream_t) stream;
     gr_norm_multi_kernel<<<n_tok, THREADS, 0, st>>>(m);
     static bool attr = false;
     if (!attr) {
-        cudaFuncSetAttribute(gr_down_multi_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             (int) (kFusedGrMaxT * TILE * sizeof(float)));
+        // The old code asked for kFusedGrMaxT*TILE*4 = 80 KB.  RDNA4's opt-in LDS ceiling is 64 KB, so
+        // hipFuncSetAttribute returned hipErrorInvalidValue (ignored) and the 60 KB launch then ran against
+        // the 32 KB default -> hipErrorInvalidValue here.  Clamp to what the device actually allows.
+        int dev_max = 0;
+        (void) hipDeviceGetAttribute(&dev_max, hipDeviceAttributeMaxSharedMemoryPerBlock, 0);
+        const int want = (int) (kFusedGrMaxT * TILE * sizeof(float));
+        const int fit = (dev_max > 0 && want > dev_max) ? dev_max : want;
+        (void) hipFuncSetAttribute(reinterpret_cast<const void*>(gr_down_multi_kernel),
+                                   hipFuncAttributeMaxDynamicSharedMemorySize, fit);
         attr = true;
+    }
+    if ((size_t) n_tok * TILE * sizeof(float) > 65536) {
+        std::fprintf(stderr, "fused_gr_read_multi: %d tokens need %zu B of LDS, over the device limit\n",
+                     n_tok, (size_t) n_tok * TILE * sizeof(float));
+        std::exit(1);
     }
     gr_down_multi_kernel<<<DOWN_BLOCKS + 1, THREADS, (size_t) n_tok * TILE * sizeof(float), st>>>(m);
     gr_up_multi_kernel<<<UPM_BLOCKS, THREADS, 0, st>>>(m);
-    const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "fused_gr_read_multi: %s\n", cudaGetErrorString(e));
+    const hipError_t e = hipGetLastError();
+    if (e != hipSuccess) {
+        std::fprintf(stderr, "fused_gr_read_multi: %s\n", hipGetErrorString(e));
         std::exit(1);
     }
 }
@@ -341,12 +354,12 @@ void fused_gr_read(const FusedGrArgs& a, void* stream) {
         std::fprintf(stderr, "fused_gr_read: invalid arguments\n");
         std::exit(1);
     }
-    cudaStream_t st = (cudaStream_t) stream;
+    hipStream_t st = (hipStream_t) stream;
     gr_down_kernel<<<DOWN_BLOCKS + 1, THREADS, 0, st>>>(a);
     gr_up_kernel<<<UP_BLOCKS, THREADS, 0, st>>>(a);
-    const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "fused_gr_read: %s\n", cudaGetErrorString(e));
+    const hipError_t e = hipGetLastError();
+    if (e != hipSuccess) {
+        std::fprintf(stderr, "fused_gr_read: %s\n", hipGetErrorString(e));
         std::exit(1);
     }
 }

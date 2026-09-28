@@ -1,3 +1,4 @@
+﻿#include "hip/hip_runtime.h"
 // src/kernels/elementwise_parity.cpp - P2.S5's test for the layer glue.
 //
 // The ops are small; the CONVENTIONS in them are not, and each one is a place where a plausible reading
@@ -15,7 +16,7 @@
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/f16_bits.hpp"
 
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
 
 #include <cmath>
 #include <cstdio>
@@ -27,9 +28,9 @@
 
 namespace {
 
-void check(cudaError_t e, const char* what) {
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e));
+void check(hipError_t e, const char* what) {
+    if (e != hipSuccess) {
+        std::fprintf(stderr, "%s: %s\n", what, hipGetErrorString(e));
         std::exit(1);
     }
 }
@@ -98,16 +99,16 @@ int main(int argc, char** argv) {
         if (positive) ++bad;
 
         float *d_a = nullptr, *d_dt = nullptr, *d_sa = nullptr, *d_g = nullptr;
-        check(cudaMalloc(&d_a, n * 4), "a");
-        check(cudaMalloc(&d_dt, n * 4), "dt");
-        check(cudaMalloc(&d_sa, n * 4), "sa");
-        check(cudaMalloc(&d_g, n * 4), "g");
-        check(cudaMemcpy(d_a, alpha.data(), n * 4, cudaMemcpyHostToDevice), "ca");
-        check(cudaMemcpy(d_dt, dt.data(), n * 4, cudaMemcpyHostToDevice), "cd");
-        check(cudaMemcpy(d_sa, a.data(), n * 4, cudaMemcpyHostToDevice), "cs");
+        check(hipMalloc(&d_a, n * 4), "a");
+        check(hipMalloc(&d_dt, n * 4), "dt");
+        check(hipMalloc(&d_sa, n * 4), "sa");
+        check(hipMalloc(&d_g, n * 4), "g");
+        check(hipMemcpy(d_a, alpha.data(), n * 4, hipMemcpyHostToDevice), "ca");
+        check(hipMemcpy(d_dt, dt.data(), n * 4, hipMemcpyHostToDevice), "cd");
+        check(hipMemcpy(d_sa, a.data(), n * 4, hipMemcpyHostToDevice), "cs");
         strata::kernels::gdn_gate(d_a, d_dt, d_sa, d_g, 1, H_V, nullptr);
         std::vector<float> got((size_t) n);
-        check(cudaMemcpy(got.data(), d_g, n * 4, cudaMemcpyDeviceToHost), "cg");
+        check(hipMemcpy(got.data(), d_g, n * 4, hipMemcpyDeviceToHost), "cg");
 
         const double rel = rel_l1(want, got);
         std::printf("  %-44s rel %.3e\n", "gdn_gate vs the reference", rel);
@@ -151,7 +152,7 @@ int main(int argc, char** argv) {
                         over ? "*** NO ***" : "yes", over, n);
             if (over) ++bad;
         }
-        cudaFree(d_a); cudaFree(d_dt); cudaFree(d_sa); cudaFree(d_g);
+        hipFree(d_a); hipFree(d_dt); hipFree(d_sa); hipFree(d_g);
     }
 
     // ---- 2. silu, in double then cast
@@ -166,15 +167,15 @@ int main(int argc, char** argv) {
             want[(size_t) i] = (float) (v / (1.0 + std::exp(-v)));
         }
         float* d_x = nullptr;
-        check(cudaMalloc(&d_x, n * 4), "sx");
-        check(cudaMemcpy(d_x, x.data(), n * 4, cudaMemcpyHostToDevice), "csx");
+        check(hipMalloc(&d_x, n * 4), "sx");
+        check(hipMemcpy(d_x, x.data(), n * 4, hipMemcpyHostToDevice), "csx");
         strata::kernels::silu_inplace(d_x, n, nullptr);
         std::vector<float> got((size_t) n);
-        check(cudaMemcpy(got.data(), d_x, n * 4, cudaMemcpyDeviceToHost), "csg");
+        check(hipMemcpy(got.data(), d_x, n * 4, hipMemcpyDeviceToHost), "csg");
         const double rel = rel_l1(want, got);
         std::printf("\n  %-44s rel %.3e\n", "silu (double) vs the reference", rel);
         if (!(rel <= 1e-7)) { std::printf("    *** over 1e-7 ***\n"); ++bad; }
-        cudaFree(d_x);
+        hipFree(d_x);
     }
 
     // ---- 3. scale and the f32->f16 bridge
@@ -187,12 +188,12 @@ int main(int argc, char** argv) {
 
         float* d_x = nullptr;
         uint16_t* d_h = nullptr;
-        check(cudaMalloc(&d_x, n * 4), "ex");
-        check(cudaMalloc(&d_h, n * 2), "eh");
-        check(cudaMemcpy(d_x, x.data(), n * 4, cudaMemcpyHostToDevice), "cex");
+        check(hipMalloc(&d_x, n * 4), "ex");
+        check(hipMalloc(&d_h, n * 2), "eh");
+        check(hipMemcpy(d_x, x.data(), n * 4, hipMemcpyHostToDevice), "cex");
         strata::kernels::scale_inplace(d_x, n, s, nullptr);
         std::vector<float> got((size_t) n);
-        check(cudaMemcpy(got.data(), d_x, n * 4, cudaMemcpyDeviceToHost), "ceg");
+        check(hipMemcpy(got.data(), d_x, n * 4, hipMemcpyDeviceToHost), "ceg");
         int diff = 0;
         for (int i = 0; i < n; ++i) if (got[(size_t) i] != want[(size_t) i]) ++diff;
         std::printf("  %-44s %d of %d differ\n", "scale_inplace is exact", diff, n);
@@ -200,13 +201,13 @@ int main(int argc, char** argv) {
 
         strata::kernels::f32_to_f16_bulk(d_x, d_h, n, nullptr);
         std::vector<uint16_t> h((size_t) n);
-        check(cudaMemcpy(h.data(), d_h, n * 2, cudaMemcpyDeviceToHost), "ceh");
+        check(hipMemcpy(h.data(), d_h, n * 2, hipMemcpyDeviceToHost), "ceh");
         int hbad = 0;
         for (int i = 0; i < n; ++i)
             if (h[(size_t) i] != strata::kernels::f16_from_f32(got[(size_t) i])) ++hbad;
         std::printf("  %-44s %d of %d differ\n", "f32_to_f16_bulk uses the shared conversion", hbad, n);
         if (hbad) ++bad;
-        cudaFree(d_x); cudaFree(d_h);
+        hipFree(d_x); hipFree(d_h);
     }
 
     // ---- 4. rms_norm_weighted, and the TWO RIVAL READINGS it exists to be told apart from.
@@ -264,13 +265,13 @@ int main(int argc, char** argv) {
 
         float* d_x = nullptr;
         float* d_w = nullptr;
-        check(cudaMalloc(&d_x, x.size() * 4), "m rmsx");
-        check(cudaMalloc(&d_w, w.size() * 4), "m rmsw");
-        check(cudaMemcpy(d_x, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "c rmsx");
-        check(cudaMemcpy(d_w, w.data(), w.size() * 4, cudaMemcpyHostToDevice), "c rmsw");
+        check(hipMalloc(&d_x, x.size() * 4), "m rmsx");
+        check(hipMalloc(&d_w, w.size() * 4), "m rmsw");
+        check(hipMemcpy(d_x, x.data(), x.size() * 4, hipMemcpyHostToDevice), "c rmsx");
+        check(hipMemcpy(d_w, w.data(), w.size() * 4, hipMemcpyHostToDevice), "c rmsw");
         strata::kernels::rms_norm_weighted(d_x, d_w, rows, cols, eps, nullptr);
         std::vector<float> got((size_t) (rows * cols));
-        check(cudaMemcpy(got.data(), d_x, got.size() * 4, cudaMemcpyDeviceToHost), "c rmsg");
+        check(hipMemcpy(got.data(), d_x, got.size() * 4, hipMemcpyDeviceToHost), "c rmsg");
 
         const double r_got = rel(want, got);
         double worst = 0;
@@ -295,24 +296,24 @@ int main(int argc, char** argv) {
         // and it is a fixture bug rather than a kernel bug: the oracle reads the ORIGINAL `x`, so the two
         // sides were never looking at the same input.
         const std::vector<float> want_null = ref(false, false);
-        check(cudaMemcpy(d_x, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "c rmsx2");
+        check(hipMemcpy(d_x, x.data(), x.size() * 4, hipMemcpyHostToDevice), "c rmsx2");
         strata::kernels::rms_norm_weighted(d_x, nullptr, rows, cols, eps, nullptr);
-        check(cudaMemcpy(got.data(), d_x, got.size() * 4, cudaMemcpyDeviceToHost), "c rmsn");
+        check(hipMemcpy(got.data(), d_x, got.size() * 4, hipMemcpyDeviceToHost), "c rmsn");
         int null_bad = 0;
         for (size_t i = 0; i < got.size(); ++i)
             if (std::fabs((double) got[i] - (double) want_null[i]) > 1e-6) ++null_bad;
         std::printf("  %-44s %d of %zu differ\n", "a null weight is legal", null_bad, got.size());
         if (null_bad) ++bad;
-        cudaFree(d_x);
-        cudaFree(d_w);
+        hipFree(d_x);
+        hipFree(d_w);
     }
 
     // Packed embedding rows: every code width, scale-group size, optional offset,
     // row boundary and partial CUDA block. Compare bits with a scalar CPU decoder.
     // Volatile materializes the multiply so this oracle cannot silently use FMA.
     {
-        cudaStream_t stream;
-        check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "embedding stream");
+        hipStream_t stream;
+        check(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), "embedding stream");
         std::mt19937 rng(77);
         std::uniform_real_distribution<float> values(-2.0f, 2.0f);
         int mismatches = 0, guards = 0, fma_diff = 0, cases = 0;
@@ -339,14 +340,14 @@ int main(int argc, char** argv) {
                     offsets[0] = 0.0f;
                     uint8_t* dc = nullptr;
                     float *ds = nullptr, *dof = nullptr, *out = nullptr;
-                    check(cudaMalloc(&dc, codes.size()), "embedding codes");
-                    check(cudaMalloc(&ds, scales.size() * sizeof(float)), "embedding scales");
-                    check(cudaMalloc(&dof, offsets.size() * sizeof(float)), "embedding offsets");
-                    check(cudaMalloc(&out, ((size_t) n + 2) * sizeof(float)), "embedding output");
-                    check(cudaMemcpyAsync(dc, codes.data(), codes.size(), cudaMemcpyHostToDevice, stream), "embedding codes upload");
-                    check(cudaMemcpyAsync(ds, scales.data(), scales.size() * sizeof(float), cudaMemcpyHostToDevice, stream), "embedding scales upload");
-                    check(cudaMemcpyAsync(dof, offsets.data(), offsets.size() * sizeof(float), cudaMemcpyHostToDevice, stream), "embedding offsets upload");
-                    check(cudaStreamSynchronize(stream), "embedding upload sync");
+                    check(hipMalloc(&dc, codes.size()), "embedding codes");
+                    check(hipMalloc(&ds, scales.size() * sizeof(float)), "embedding scales");
+                    check(hipMalloc(&dof, offsets.size() * sizeof(float)), "embedding offsets");
+                    check(hipMalloc(&out, ((size_t) n + 2) * sizeof(float)), "embedding output");
+                    check(hipMemcpyAsync(dc, codes.data(), codes.size(), hipMemcpyHostToDevice, stream), "embedding codes upload");
+                    check(hipMemcpyAsync(ds, scales.data(), scales.size() * sizeof(float), hipMemcpyHostToDevice, stream), "embedding scales upload");
+                    check(hipMemcpyAsync(dof, offsets.data(), offsets.size() * sizeof(float), hipMemcpyHostToDevice, stream), "embedding offsets upload");
+                    check(hipStreamSynchronize(stream), "embedding upload sync");
 
                     for (const bool with_offset : {false, true}) {
                         for (int row = 0; row < 3; ++row) {
@@ -360,13 +361,13 @@ int main(int argc, char** argv) {
                                 const float fused = std::fma(code, scales[gi], offset);
                                 if (std::memcmp(&fused, &want[(size_t) i], sizeof(float)) != 0) ++fma_diff;
                             }
-                            check(cudaMemcpyAsync(out, got.data(), got.size() * sizeof(float), cudaMemcpyHostToDevice, stream), "embedding output guards");
+                            check(hipMemcpyAsync(out, got.data(), got.size() * sizeof(float), hipMemcpyHostToDevice, stream), "embedding output guards");
                             strata::kernels::embedding_gather(dc + (size_t) row * row_bytes,
                                 ds + (size_t) row * row_groups,
                                 with_offset ? dof + (size_t) row * row_groups : nullptr,
                                 n, bits, bias, group, out + 1, stream);
-                            check(cudaMemcpyAsync(got.data(), out, got.size() * sizeof(float), cudaMemcpyDeviceToHost, stream), "embedding result");
-                            check(cudaStreamSynchronize(stream), "embedding sync");
+                            check(hipMemcpyAsync(got.data(), out, got.size() * sizeof(float), hipMemcpyDeviceToHost, stream), "embedding result");
+                            check(hipStreamSynchronize(stream), "embedding sync");
                             for (int i = 0; i < n; ++i) {
                                 if (std::memcmp(&want[(size_t) i], &got[(size_t) i + 1], sizeof(float)) != 0) ++mismatches;
                             }
@@ -376,34 +377,34 @@ int main(int argc, char** argv) {
                             // Capturing the gather proves that it has no hidden synchronization.
                             // A following scale also checks that it uses the caller's stream.
                             if (row == 1) {
-                                cudaGraph_t graph;
-                                cudaGraphExec_t exec;
-                                check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "embedding capture");
+                                hipGraph_t graph;
+                                hipGraphExec_t exec;
+                                check(hipStreamBeginCapture(stream, hipStreamCaptureModeThreadLocal), "embedding capture");
                                 strata::kernels::embedding_gather(dc + (size_t) row * row_bytes,
                                     ds + (size_t) row * row_groups,
                                     with_offset ? dof + (size_t) row * row_groups : nullptr,
                                     n, bits, bias, group, out + 1, stream);
                                 strata::kernels::scale_inplace(out + 1, n, 2.0f, stream);
-                                check(cudaStreamEndCapture(stream, &graph), "embedding capture end");
-                                check(cudaGraphInstantiate(&exec, graph, 0), "embedding instantiate");
-                                check(cudaGraphLaunch(exec, stream), "embedding replay");
-                                check(cudaMemcpyAsync(got.data(), out, got.size() * sizeof(float), cudaMemcpyDeviceToHost, stream), "embedding graph result");
-                                check(cudaStreamSynchronize(stream), "embedding graph sync");
+                                check(hipStreamEndCapture(stream, &graph), "embedding capture end");
+                                check(hipGraphInstantiateWithFlags(&exec, graph, 0), "embedding instantiate");
+                                check(hipGraphLaunch(exec, stream), "embedding replay");
+                                check(hipMemcpyAsync(got.data(), out, got.size() * sizeof(float), hipMemcpyDeviceToHost, stream), "embedding graph result");
+                                check(hipStreamSynchronize(stream), "embedding graph sync");
                                 for (int i = 0; i < n; ++i) {
                                     const float expected = want[(size_t) i] * 2.0f;
                                     if (std::memcmp(&expected, &got[(size_t) i + 1], sizeof(float)) != 0) ++mismatches;
                                 }
                                 if (got.front() != -12345.0f || got.back() != -12345.0f) ++guards;
-                                check(cudaGraphExecDestroy(exec), "embedding exec destroy");
-                                check(cudaGraphDestroy(graph), "embedding graph destroy");
+                                check(hipGraphExecDestroy(exec), "embedding exec destroy");
+                                check(hipGraphDestroy(graph), "embedding graph destroy");
                             }
                         }
                     }
-                    cudaFree(dc); cudaFree(ds); cudaFree(dof); cudaFree(out);
+                    hipFree(dc); hipFree(ds); hipFree(dof); hipFree(out);
                 }
             }
         }
-        check(cudaStreamDestroy(stream), "embedding stream destroy");
+        check(hipStreamDestroy(stream), "embedding stream destroy");
         std::printf("  embedding gather: %d row cases, %d bit mismatches, %d guard failures, %d FMA differences\n",
                     cases, mismatches, guards, fma_diff);
         if (mismatches || guards || fma_diff == 0) ++bad;
@@ -414,3 +415,4 @@ int main(int argc, char** argv) {
     if (selftest) std::printf("elementwise_parity OK\n");
     return 0;
 }
+

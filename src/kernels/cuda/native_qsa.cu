@@ -1,3 +1,4 @@
+#include "hip/hip_runtime.h"
 // Adapted from llama.cpp 3cf03257f219afbe7334045ff7c6a06ac68c627d:
 // ggml/src/ggml-cuda/{norm.cu,common.cuh,unary.cu}.
 //
@@ -23,7 +24,7 @@
 // SOFTWARE.
 
 #include "strata/kernels/native_qsa.hpp"
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
 #include <atomic>
 #include <cmath>
 #include <cstddef>
@@ -38,7 +39,7 @@ std::atomic<bool> enabled{false};
 __device__ __forceinline__ float warp_sum(float value) {
 #pragma unroll
     for (int offset = 16; offset; offset >>= 1)
-        value += __shfl_xor_sync(0xffffffffu, value, offset, 32);
+        value += __shfl_xor_sync(0xffffffffffffffffull, value, offset, 32);
     return value;
 }
 template<int BlockSize>
@@ -96,9 +97,9 @@ void buffers(const float* input, std::size_t in_bytes, const float* weight, std:
         throw std::invalid_argument("native QSA requires a stream, aligned spans, and disjoint buffers or exact input/output alias");
 }
 void check_launch() {
-    const auto result = cudaGetLastError();
-    if (result != cudaSuccess)
-        throw std::runtime_error(std::string("native QSA launch: ") + cudaGetErrorString(result));
+    const auto result = hipGetLastError();
+    if (result != hipSuccess)
+        throw std::runtime_error(std::string("native QSA launch: ") + hipGetErrorString(result));
 }
 } // namespace
 
@@ -112,16 +113,16 @@ void native_qsa_rms_norm_weighted(const float* input, const float* gamma, float*
         throw std::invalid_argument("native QSA requires finite nonnegative epsilon");
     buffers(input, count * 4, gamma, std::size_t(n_cols) * 4, output, stream);
     if (n_cols < 1024)
-        norm<256><<<unsigned(n_rows), 256, 0, static_cast<cudaStream_t>(stream)>>>(input, gamma, output, n_cols, epsilon);
+        norm<256><<<unsigned(n_rows), 256, 0, static_cast<hipStream_t>(stream)>>>(input, gamma, output, n_cols, epsilon);
     else
-        norm<1024><<<unsigned(n_rows), 1024, 0, static_cast<cudaStream_t>(stream)>>>(input, gamma, output, n_cols, epsilon);
+        norm<1024><<<unsigned(n_rows), 1024, 0, static_cast<hipStream_t>(stream)>>>(input, gamma, output, n_cols, epsilon);
     check_launch();
 }
 void native_qsa_gate_apply(const float* attn, const float* q_full, float* output,
                            int n_head, int head_dim, void* stream) {
     const auto count = elements(head_dim, n_head);
     buffers(attn, count * 4, q_full, count * 8, output, stream);
-    gate<<<unsigned((count + 255) / 256), 256, 0, static_cast<cudaStream_t>(stream)>>>(attn, q_full, output, n_head, head_dim);
+    gate<<<unsigned((count + 255) / 256), 256, 0, static_cast<hipStream_t>(stream)>>>(attn, q_full, output, n_head, head_dim);
     check_launch();
 }
 } // namespace strata::kernels

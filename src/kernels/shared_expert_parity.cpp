@@ -1,3 +1,4 @@
+﻿#include "hip/hip_runtime.h"
 // src/kernels/shared_expert_parity.cpp - P2.S2's test for the shared expert.
 //
 // WHAT THIS CAN AND CANNOT CHECK TIGHTLY.  The weights are driven with FP16 activations because Q8_K is not
@@ -20,7 +21,7 @@
 #include "strata/kernels/s_gemv.hpp"
 #include "strata/kernels/shared_expert.hpp"
 
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
 
 #include <cmath>
 #include <stdexcept>
@@ -32,9 +33,9 @@
 
 namespace {
 
-void check(cudaError_t e, const char* what) {
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e));
+void check(hipError_t e, const char* what) {
+    if (e != hipSuccess) {
+        std::fprintf(stderr, "%s: %s\n", what, hipGetErrorString(e));
         std::exit(1);
     }
 }
@@ -196,27 +197,27 @@ int main(int argc, char** argv) {
     uint16_t *d_xb = nullptr, *d_ginpb = nullptr;
     uint8_t *d_gc = nullptr, *d_uc = nullptr, *d_dc = nullptr;
     float *d_gs = nullptr, *d_us = nullptr, *d_ds = nullptr, *d_ginp = nullptr, *d_out = nullptr;
-    check(cudaMalloc(&d_x, hx.size() * sizeof(uint16_t)), "m x");
-    check(cudaMalloc(&d_gc, gc.size()), "m gc");
-    check(cudaMalloc(&d_uc, uc.size()), "m uc");
-    check(cudaMalloc(&d_dc, dc.size()), "m dc");
-    check(cudaMalloc(&d_gs, gs.size() * sizeof(float)), "m gs");
-    check(cudaMalloc(&d_us, us.size() * sizeof(float)), "m us");
-    check(cudaMalloc(&d_ds, ds.size() * sizeof(float)), "m ds");
-    check(cudaMalloc(&d_ginp, ginp.size() * sizeof(float)), "m ginp");
-    check(cudaMalloc(&d_xb, hx_bf16.size() * sizeof(uint16_t)), "m xb");
-    check(cudaMalloc(&d_ginpb, hginp_bf16.size() * sizeof(uint16_t)), "m ginpb");
-    check(cudaMalloc(&d_out, (size_t) n_embd * sizeof(float)), "m out");
-    check(cudaMemcpy(d_x, hx.data(), hx.size() * sizeof(uint16_t), cudaMemcpyHostToDevice), "c x");
-    check(cudaMemcpy(d_gc, gc.data(), gc.size(), cudaMemcpyHostToDevice), "c gc");
-    check(cudaMemcpy(d_uc, uc.data(), uc.size(), cudaMemcpyHostToDevice), "c uc");
-    check(cudaMemcpy(d_dc, dc.data(), dc.size(), cudaMemcpyHostToDevice), "c dc");
-    check(cudaMemcpy(d_gs, gs.data(), gs.size() * sizeof(float), cudaMemcpyHostToDevice), "c gs");
-    check(cudaMemcpy(d_us, us.data(), us.size() * sizeof(float), cudaMemcpyHostToDevice), "c us");
-    check(cudaMemcpy(d_ds, ds.data(), ds.size() * sizeof(float), cudaMemcpyHostToDevice), "c ds");
-    check(cudaMemcpy(d_ginp, ginp.data(), ginp.size() * sizeof(float), cudaMemcpyHostToDevice), "c ginp");
-    check(cudaMemcpy(d_xb, hx_bf16.data(), hx_bf16.size() * sizeof(uint16_t), cudaMemcpyHostToDevice), "c xb");
-    check(cudaMemcpy(d_ginpb, hginp_bf16.data(), hginp_bf16.size() * sizeof(uint16_t), cudaMemcpyHostToDevice),
+    check(hipMalloc(&d_x, hx.size() * sizeof(uint16_t)), "m x");
+    check(hipMalloc(&d_gc, gc.size()), "m gc");
+    check(hipMalloc(&d_uc, uc.size()), "m uc");
+    check(hipMalloc(&d_dc, dc.size()), "m dc");
+    check(hipMalloc(&d_gs, gs.size() * sizeof(float)), "m gs");
+    check(hipMalloc(&d_us, us.size() * sizeof(float)), "m us");
+    check(hipMalloc(&d_ds, ds.size() * sizeof(float)), "m ds");
+    check(hipMalloc(&d_ginp, ginp.size() * sizeof(float)), "m ginp");
+    check(hipMalloc(&d_xb, hx_bf16.size() * sizeof(uint16_t)), "m xb");
+    check(hipMalloc(&d_ginpb, hginp_bf16.size() * sizeof(uint16_t)), "m ginpb");
+    check(hipMalloc(&d_out, (size_t) n_embd * sizeof(float)), "m out");
+    check(hipMemcpy(d_x, hx.data(), hx.size() * sizeof(uint16_t), hipMemcpyHostToDevice), "c x");
+    check(hipMemcpy(d_gc, gc.data(), gc.size(), hipMemcpyHostToDevice), "c gc");
+    check(hipMemcpy(d_uc, uc.data(), uc.size(), hipMemcpyHostToDevice), "c uc");
+    check(hipMemcpy(d_dc, dc.data(), dc.size(), hipMemcpyHostToDevice), "c dc");
+    check(hipMemcpy(d_gs, gs.data(), gs.size() * sizeof(float), hipMemcpyHostToDevice), "c gs");
+    check(hipMemcpy(d_us, us.data(), us.size() * sizeof(float), hipMemcpyHostToDevice), "c us");
+    check(hipMemcpy(d_ds, ds.data(), ds.size() * sizeof(float), hipMemcpyHostToDevice), "c ds");
+    check(hipMemcpy(d_ginp, ginp.data(), ginp.size() * sizeof(float), hipMemcpyHostToDevice), "c ginp");
+    check(hipMemcpy(d_xb, hx_bf16.data(), hx_bf16.size() * sizeof(uint16_t), hipMemcpyHostToDevice), "c xb");
+    check(hipMemcpy(d_ginpb, hginp_bf16.data(), hginp_bf16.size() * sizeof(uint16_t), hipMemcpyHostToDevice),
           "c ginpb");
 
     const strata::kernels::SForm f{2, -1, 64, strata::kernels::Codebook::Affine, false, /*act_kind=*/0};
@@ -228,23 +229,23 @@ int main(int argc, char** argv) {
     {
         float* d_xf = nullptr;
         uint8_t* d_x0 = nullptr;
-        check(cudaMalloc(&d_xf, (size_t) n_embd * 4), "xf");
-        check(cudaMalloc(&d_x0, hx0.size()), "x0");
-        check(cudaMemcpy(d_xf, fx.data(), (size_t) n_embd * 4, cudaMemcpyHostToDevice), "cxf");
+        check(hipMalloc(&d_xf, (size_t) n_embd * 4), "xf");
+        check(hipMalloc(&d_x0, hx0.size()), "x0");
+        check(hipMemcpy(d_xf, fx.data(), (size_t) n_embd * 4, hipMemcpyHostToDevice), "cxf");
         strata::kernels::quantize_q8_0(d_xf, d_x0, n_embd, nullptr);
-        check(cudaMemcpy(hx0.data(), d_x0, hx0.size(), cudaMemcpyDeviceToHost), "cx0");
+        check(hipMemcpy(hx0.data(), d_x0, hx0.size(), hipMemcpyDeviceToHost), "cx0");
         d_x_used = d_x0;
-        cudaFree(d_xf);
+        hipFree(d_xf);
     }
     // THE SCRATCH IS THE CALLER'S NOW.  It used to be four `cudaMalloc`s inside the kernel - illegal during
     // stream capture AND a token-path allocation that P2.T10 forbids.  The fixture owns it here, exactly as the
     // layer does, so the test exercises the real contract instead of a private one.
     float* d_scratch = nullptr;
-    check(cudaMalloc(&d_scratch, strata::kernels::shared_expert_scratch_bytes(n_ff)), "m scratch");
+    check(hipMalloc(&d_scratch, strata::kernels::shared_expert_scratch_bytes(n_ff)), "m scratch");
     strata::kernels::shared_expert(d_x_used, nullptr, d_xb, f, d_gc, d_gs, nullptr, f, d_uc, d_us, nullptr, f,
                                    d_dc, d_ds, nullptr, d_ginpb, d_scratch, d_out, n_embd, n_ff, tpr, nullptr);
     std::vector<float> got((size_t) n_embd);
-    check(cudaMemcpy(got.data(), d_out, got.size() * sizeof(float), cudaMemcpyDeviceToHost), "c out");
+    check(hipMemcpy(got.data(), d_out, got.size() * sizeof(float), hipMemcpyDeviceToHost), "c out");
 
     int bad = 0;
     const std::vector<float> want = reference(false, false);
@@ -340,29 +341,29 @@ int main(int argc, char** argv) {
         std::vector<uint16_t> witness_bf16((size_t) n_embd, 0);
         witness_bf16[0] = bf16_from_f32(witness[0]);
         float* d_witness = nullptr;
-        check(cudaMalloc(&d_witness, witness.size() * sizeof(float)), "native shared x");
-        check(cudaMemcpy(d_witness, witness.data(), witness.size() * sizeof(float), cudaMemcpyHostToDevice), "native shared upload x");
+        check(hipMalloc(&d_witness, witness.size() * sizeof(float)), "native shared x");
+        check(hipMemcpy(d_witness, witness.data(), witness.size() * sizeof(float), hipMemcpyHostToDevice), "native shared upload x");
         auto run = [&](void* stream, const float* x_float = nullptr) {
             shared_expert(d_x_used, nullptr, d_xb, f, d_gc, d_gs, nullptr, f, d_uc, d_us, nullptr, f,
                           d_dc, d_ds, nullptr, d_ginpb, d_scratch, d_out, n_embd, n_ff, tpr, stream, x_float);
         };
-        check(cudaMemcpy(d_ginpb, zeros.data(), zeros.size() * sizeof(uint16_t), cudaMemcpyHostToDevice), "zero shared gate");
+        check(hipMemcpy(d_ginpb, zeros.data(), zeros.size() * sizeof(uint16_t), hipMemcpyHostToDevice), "zero shared gate");
         run(nullptr);
         std::vector<float> half_output((size_t) n_embd), legacy((size_t) n_embd), native((size_t) n_embd), replay((size_t) n_embd);
-        check(cudaMemcpy(half_output.data(), d_out, half_output.size() * sizeof(float), cudaMemcpyDeviceToHost), "half shared output");
-        check(cudaMemcpy(d_ginpb, basis.data(), basis.size() * sizeof(uint16_t), cudaMemcpyHostToDevice), "basis shared gate");
-        check(cudaMemcpy(d_xb, witness_bf16.data(), witness_bf16.size() * sizeof(uint16_t), cudaMemcpyHostToDevice), "witness shared bf16");
+        check(hipMemcpy(half_output.data(), d_out, half_output.size() * sizeof(float), hipMemcpyDeviceToHost), "half shared output");
+        check(hipMemcpy(d_ginpb, basis.data(), basis.size() * sizeof(uint16_t), hipMemcpyHostToDevice), "basis shared gate");
+        check(hipMemcpy(d_xb, witness_bf16.data(), witness_bf16.size() * sizeof(uint16_t), hipMemcpyHostToDevice), "witness shared bf16");
         run(nullptr);
-        check(cudaMemcpy(legacy.data(), d_out, legacy.size() * sizeof(float), cudaMemcpyDeviceToHost), "legacy witness output");
+        check(hipMemcpy(legacy.data(), d_out, legacy.size() * sizeof(float), hipMemcpyDeviceToHost), "legacy witness output");
         shared_expert_set_native_bf16(true);
         bool refused_missing = false;
         try { run(nullptr); } catch (const std::invalid_argument&) { refused_missing = true; }
         if (!refused_missing) ++bad;
-        cudaStream_t stream;
-        check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "native shared stream");
+        hipStream_t stream;
+        check(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), "native shared stream");
         run(stream, d_witness);
-        check(cudaStreamSynchronize(stream), "native shared sync");
-        check(cudaMemcpy(native.data(), d_out, native.size() * sizeof(float), cudaMemcpyDeviceToHost), "native witness output");
+        check(hipStreamSynchronize(stream), "native shared sync");
+        check(hipMemcpy(native.data(), d_out, native.size() * sizeof(float), hipMemcpyDeviceToHost), "native witness output");
         const float expected_gate = 1.0f / (1.0f + std::exp(-witness[0]));
         double error = 0.0, magnitude = 0.0;
         for (size_t i = 0; i < native.size(); ++i) {
@@ -376,30 +377,30 @@ int main(int argc, char** argv) {
         std::printf("  native shared scalar gate: %s (ref rel %.3e, BF16 separation %.3e, missing input %s)\n",
                     correct ? "pass" : "FAIL", rel, visible, refused_missing ? "refused" : "FAIL");
         if (!correct) ++bad;
-        cudaGraph_t graph;
-        cudaGraphExec_t executable;
-        check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "native shared capture");
+        hipGraph_t graph;
+        hipGraphExec_t executable;
+        check(hipStreamBeginCapture(stream, hipStreamCaptureModeThreadLocal), "native shared capture");
         run(stream, d_witness);
-        check(cudaStreamEndCapture(stream, &graph), "native shared capture end");
-        check(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0), "native shared graph instantiate");
+        check(hipStreamEndCapture(stream, &graph), "native shared capture end");
+        check(hipGraphInstantiateWithFlags(&executable, graph, 0), "native shared graph instantiate");
         shared_expert_set_native_bf16(false);
-        check(cudaGraphLaunch(executable, stream), "native shared graph replay");
-        check(cudaStreamSynchronize(stream), "native shared graph sync");
-        check(cudaMemcpy(replay.data(), d_out, replay.size() * sizeof(float), cudaMemcpyDeviceToHost), "native shared graph read");
+        check(hipGraphLaunch(executable, stream), "native shared graph replay");
+        check(hipStreamSynchronize(stream), "native shared graph sync");
+        check(hipMemcpy(replay.data(), d_out, replay.size() * sizeof(float), hipMemcpyDeviceToHost), "native shared graph read");
         const bool captured = std::memcmp(native.data(), replay.data(), native.size() * sizeof(float)) == 0;
         std::printf("  native shared captured selection: %s\n", captured ? "byte-identical" : "FAIL");
         if (!captured) ++bad;
-        check(cudaGraphExecDestroy(executable), "native shared graph exec destroy");
-        check(cudaGraphDestroy(graph), "native shared graph destroy");
-        check(cudaStreamDestroy(stream), "native shared stream destroy");
-        check(cudaMemcpy(d_ginpb, hginp_bf16.data(), hginp_bf16.size() * sizeof(uint16_t), cudaMemcpyHostToDevice), "restore shared gate");
-        check(cudaMemcpy(d_xb, hx_bf16.data(), hx_bf16.size() * sizeof(uint16_t), cudaMemcpyHostToDevice), "restore shared bf16");
+        check(hipGraphExecDestroy(executable), "native shared graph exec destroy");
+        check(hipGraphDestroy(graph), "native shared graph destroy");
+        check(hipStreamDestroy(stream), "native shared stream destroy");
+        check(hipMemcpy(d_ginpb, hginp_bf16.data(), hginp_bf16.size() * sizeof(uint16_t), hipMemcpyHostToDevice), "restore shared gate");
+        check(hipMemcpy(d_xb, hx_bf16.data(), hx_bf16.size() * sizeof(uint16_t), hipMemcpyHostToDevice), "restore shared bf16");
         run(nullptr);
-        check(cudaMemcpy(replay.data(), d_out, replay.size() * sizeof(float), cudaMemcpyDeviceToHost), "restored shared output");
+        check(hipMemcpy(replay.data(), d_out, replay.size() * sizeof(float), hipMemcpyDeviceToHost), "restored shared output");
         const bool restored = std::memcmp(got.data(), replay.data(), got.size() * sizeof(float)) == 0;
         std::printf("  restored shared default: %s\n", restored ? "byte-identical" : "FAIL");
         if (!restored) ++bad;
-        cudaFree(d_witness);
+        hipFree(d_witness);
     }
 
     // ================= moe_combine: the two readings it exists to pin =================
@@ -439,16 +440,16 @@ int main(int argc, char** argv) {
         const std::vector<float> want = ref(true, false);
 
         float *d_p = nullptr, *d_w = nullptr, *d_s = nullptr, *d_y = nullptr;
-        check(cudaMalloc(&d_p, parts.size() * 4), "mc p");
-        check(cudaMalloc(&d_w, w.size() * 4), "mc w");
-        check(cudaMalloc(&d_s, shared.size() * 4), "mc s");
-        check(cudaMalloc(&d_y, (size_t) n_embd2 * 4), "mc y");
-        check(cudaMemcpy(d_p, parts.data(), parts.size() * 4, cudaMemcpyHostToDevice), "mc cp");
-        check(cudaMemcpy(d_w, w.data(), w.size() * 4, cudaMemcpyHostToDevice), "mc cw");
-        check(cudaMemcpy(d_s, shared.data(), shared.size() * 4, cudaMemcpyHostToDevice), "mc cs");
+        check(hipMalloc(&d_p, parts.size() * 4), "mc p");
+        check(hipMalloc(&d_w, w.size() * 4), "mc w");
+        check(hipMalloc(&d_s, shared.size() * 4), "mc s");
+        check(hipMalloc(&d_y, (size_t) n_embd2 * 4), "mc y");
+        check(hipMemcpy(d_p, parts.data(), parts.size() * 4, hipMemcpyHostToDevice), "mc cp");
+        check(hipMemcpy(d_w, w.data(), w.size() * 4, hipMemcpyHostToDevice), "mc cw");
+        check(hipMemcpy(d_s, shared.data(), shared.size() * 4, hipMemcpyHostToDevice), "mc cs");
         strata::kernels::moe_combine(d_p, d_w, d_s, d_y, n_embd2, k2, nullptr);
         std::vector<float> got((size_t) n_embd2);
-        check(cudaMemcpy(got.data(), d_y, got.size() * 4, cudaMemcpyDeviceToHost), "mc cy");
+        check(hipMemcpy(got.data(), d_y, got.size() * 4, hipMemcpyDeviceToHost), "mc cy");
 
         for (const auto& trap : {std::make_pair(false, false), std::make_pair(true, true)}) {
             const std::vector<float> wrong = ref(trap.first, trap.second);
@@ -467,13 +468,13 @@ int main(int argc, char** argv) {
 
         // a null `shared` must mean "no shared expert", not "add nothing but leave it undefined"
         strata::kernels::moe_combine(d_p, d_w, nullptr, d_y, n_embd2, k2, nullptr);
-        check(cudaMemcpy(got.data(), d_y, got.size() * 4, cudaMemcpyDeviceToHost), "mc cy2");
+        check(hipMemcpy(got.data(), d_y, got.size() * 4, hipMemcpyDeviceToHost), "mc cy2");
         const double rel_no_shared = rel_l1(want, got);
         const bool differs = rel_no_shared > 0.05;
         std::printf("  %-42s %s (%.2f%% apart - null shared really omits it)\n",
                     "a null `shared` is observable", differs ? "yes" : "*** NO ***", rel_no_shared * 100);
         if (!differs) ++bad;
-        cudaFree(d_p); cudaFree(d_w); cudaFree(d_s); cudaFree(d_y);
+        hipFree(d_p); hipFree(d_w); hipFree(d_s); hipFree(d_y);
     }
 
     std::printf("\nshared_expert: %d failures\n", bad);
@@ -481,3 +482,4 @@ int main(int argc, char** argv) {
     if (selftest) std::printf("shared_expert_parity OK\n");
     return 0;
 }
+

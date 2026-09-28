@@ -2,7 +2,7 @@
 #include "strata/core/pinned.hpp"
 #include "strata/platform/memory.hpp"
 
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
 
 #include <atomic>
 #include <cstdlib>
@@ -112,7 +112,7 @@ uint64_t fnv1a64(const uint8_t* p, uint64_t n, uint64_t seed) {
 }
 
 namespace {
-bool clear_error() { (void) cudaGetLastError(); return true; }
+bool clear_error() { (void) hipGetLastError(); return true; }
 }  // namespace
 
 namespace {
@@ -136,9 +136,9 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds) : 
     // Register with CUDA BEFORE any page is touched: cudaHostRegister pins what is resident now, and a region
     // that has already been faulted in page by page is far more expensive to register and may fail outright.
     if (base) {
-        const cudaError_t e = cudaHostRegister(base, (size_t) bytes, cudaHostRegisterPortable | cudaHostRegisterMapped);
-        if (e == cudaSuccess) {
-            note = "cudaHostRegister PORTABLE ok; " + note;
+        const hipError_t e = hipHostRegister(base, (size_t) bytes, hipHostRegisterPortable | hipHostRegisterMapped);
+        if (e == hipSuccess) {
+            note = "hipHostRegister PORTABLE ok; " + note;
             registered_bytes = bytes;
         } else if (bounds.size() >= 2 && clear_error()) {
             // Plan v0.3 P5: the whole range is refused, so pin it slice by slice from the start.  The rest stays
@@ -146,15 +146,15 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds) : 
             slice_bytes = 1;   // sliced; the uniform constructor records the size
             for (size_t i = 0; i + 1 < bounds.size(); ++i) {
                 const uint64_t off = bounds[i], n = bounds[i + 1] - bounds[i];
-                if (cudaHostRegister((uint8_t*) base + off, (size_t) n, cudaHostRegisterPortable | cudaHostRegisterMapped) != cudaSuccess) {
-                    (void) cudaGetLastError();
+                if (hipHostRegister((uint8_t*) base + off, (size_t) n, hipHostRegisterPortable | hipHostRegisterMapped) != hipSuccess) {
+                    (void) hipGetLastError();
                     break;
                 }
                 slice_starts.push_back(off);
                 registered_bytes = off + n;
                 ++registered_slices;
             }
-            note = "cudaHostRegister of the whole arena FAILED (" + std::string(cudaGetErrorString(e)) + "); " +
+            note = "hipHostRegister of the whole arena FAILED (" + std::string(hipGetErrorString(e)) + "); " +
                    std::to_string(registered_slices) + " slices pinned (" + std::to_string(registered_bytes >> 30) +
                    " GiB); " + note;
             if (registered_bytes < bytes) {
@@ -167,7 +167,7 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds) : 
                 }
             }
         } else {
-            note = std::string("cudaHostRegister FAILED (") + cudaGetErrorString(e) +
+            note = std::string("hipHostRegister FAILED (") + hipGetErrorString(e) +
                    ") - the arena is NOT pinned, so copies will be slow; " + note;
             // **CONSUME THE ERROR, OR IT LIES ABOUT SOMETHING ELSE LATER.**
             //
@@ -180,7 +180,7 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds) : 
             //
             // It is the same trap `gr.cu` warns about for ASYNC faults, in the other direction: a synchronous
             // failure is sticky too, and it lies about where it happened just as convincingly.
-            (void) cudaGetLastError();
+            (void) hipGetLastError();
             // Plan v0.3 P0.1: keep it RESIDENT instead. Unpinned, Windows trims the arena under memory pressure
             // and the CPU pool's rate then depends on the OS; locking it through the working set needs no
             // special privilege. STRATA_ARENA_LOCK=0 is the A/B arm.
@@ -200,9 +200,9 @@ PinnedArena::~PinnedArena() {
     if (base) {
         if (locked_bytes) strata::platform::unlock_resident((uint8_t*) base + (slice_bytes ? registered_bytes : 0), locked_bytes);
         if (slice_bytes) {
-            for (uint64_t off : slice_starts) cudaHostUnregister((uint8_t*) base + off);
+            for (uint64_t off : slice_starts) hipHostUnregister((uint8_t*) base + off);
         } else {
-            cudaHostUnregister(base);
+            hipHostUnregister(base);
         }
         release(base, capacity);
         base = nullptr;
@@ -257,7 +257,7 @@ LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::
                     err = "short read in layer " + std::to_string(L);
                     return;
                 }
-                std::memcpy(dst + off + pos, buf.data(), (size_t) n);
+                __builtin_memcpy(dst + off + pos, buf.data(), (size_t) n);
                 h = fnv1a64(buf.data(), n, h);
                 pos += n;
                 remaining -= n;
@@ -286,31 +286,31 @@ StreamStats stream_bandwidth(const uint8_t* src, uint64_t bytes, uint64_t chunk,
     st.bytes = bytes * (uint64_t) iters;
     st.chunk = chunk;
     uint8_t* dst = nullptr;
-    cudaStream_t s{};
-    if (cudaMalloc(&dst, (size_t) chunk) != cudaSuccess) {
-        std::fprintf(stderr, "stream_bandwidth: cudaMalloc failed for %llu B\n", (unsigned long long) chunk);
+    hipStream_t s{};
+    if (hipMalloc(&dst, (size_t) chunk) != hipSuccess) {
+        std::fprintf(stderr, "stream_bandwidth: hipMalloc failed for %llu B\n", (unsigned long long) chunk);
         st.seconds = -1.0;
         return st;
     }
-    cudaStreamCreate(&s);
+    hipStreamCreate(&s);
 
     // one untimed pass so the first transfer's page-fault and setup cost is not in the measurement
     for (uint64_t off = 0; off + chunk <= bytes; off += chunk) {
-        cudaMemcpyAsync(dst, src + off, (size_t) chunk, cudaMemcpyHostToDevice, s);
+        hipMemcpyAsync(dst, src + off, (size_t) chunk, hipMemcpyHostToDevice, s);
     }
-    cudaStreamSynchronize(s);
+    hipStreamSynchronize(s);
 
     const auto t0 = std::chrono::steady_clock::now();
     for (int it = 0; it < iters; ++it) {
         for (uint64_t off = 0; off + chunk <= bytes; off += chunk) {
-            cudaMemcpyAsync(dst, src + off, (size_t) chunk, cudaMemcpyHostToDevice, s);
+            hipMemcpyAsync(dst, src + off, (size_t) chunk, hipMemcpyHostToDevice, s);
         }
     }
-    cudaStreamSynchronize(s);
+    hipStreamSynchronize(s);
     st.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 
-    cudaStreamDestroy(s);
-    cudaFree(dst);
+    hipStreamDestroy(s);
+    hipFree(dst);
     return st;
 }
 

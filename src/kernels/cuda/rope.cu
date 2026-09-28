@@ -1,3 +1,4 @@
+#include "hip/hip_runtime.h"
 // src/kernels/cuda/rope.cu - P2.S2: NEOX partial RoPE.
 //
 // Semantics from `ref/qsa.py` (`rope_freqs` + `rope_neox`), which `bench/micro/rope_xcheck` validates against
@@ -23,7 +24,7 @@
 #include "strata/kernels/rope.hpp"
 #include "strata/kernels/mrope.hpp"
 
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
 
 #include <cmath>
 #include <cstdio>
@@ -82,14 +83,14 @@ void rope_neox_apply(const float* x, float* out, int64_t rows, int head_dim, int
     }
     const int threads = 128;
     const unsigned grid = (unsigned) ((rows + threads - 1) / threads);
-    rope_neox_kernel<<<grid, threads, 0, (cudaStream_t) stream>>>(x, out, rows, head_dim, n_rot, cos_tab,
+    rope_neox_kernel<<<grid, threads, 0, (hipStream_t) stream>>>(x, out, rows, head_dim, n_rot, cos_tab,
                                                                  sin_tab, pos, mrope_table());
-    const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "rope_neox_apply launch: %s\n", cudaGetErrorString(e));
+    const hipError_t e = hipGetLastError();
+    if (e != hipSuccess) {
+        std::fprintf(stderr, "rope_neox_apply launch: %s\n", hipGetErrorString(e));
         std::exit(1);
     }
-    if (stream == nullptr) cudaDeviceSynchronize();
+    if (stream == nullptr) hipDeviceSynchronize();
 }
 
 }  // namespace strata::kernels

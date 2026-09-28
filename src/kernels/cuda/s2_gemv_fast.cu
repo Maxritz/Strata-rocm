@@ -1,3 +1,4 @@
+#include "hip/hip_runtime.h"
 // src/kernels/cuda/s2_gemv_fast.cu - two levers on the hottest kernel, BOTH MEASURED NEGATIVE OR NEUTRAL.
 //
 // *** THIS FILE IS NAMED "fast" AND IS NOT FASTER.  DO NOT ADOPT IT AS THE FAST PATH. ***
@@ -28,8 +29,8 @@
 // either.
 #include "strata/kernels/s_gemv.hpp"
 
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
+#include <hip/hip_fp16.h>
+#include <hip/hip_runtime.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -53,9 +54,9 @@ void ensure_lut() {
             host[b][k] = (float) (((b >> (2 * k)) & 3) - 1);
         }
     }
-    const cudaError_t e = cudaMemcpyToSymbol(c_codes, host, sizeof(host));
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "s2_gemv_fast: cudaMemcpyToSymbol failed: %s\n", cudaGetErrorString(e));
+    const hipError_t e = hipMemcpyToSymbol(HIP_SYMBOL(c_codes), host, sizeof(host));
+    if (e != hipSuccess) {
+        std::fprintf(stderr, "s2_gemv_fast: hipMemcpyToSymbol failed: %s\n", hipGetErrorString(e));
         std::exit(1);
     }
     g_lut_ready = true;
@@ -140,9 +141,9 @@ void s2_gemv_fast(const uint16_t* x, const uint8_t* codes, const float* scales, 
         s2_gemv_fast_kernel<false><<<(unsigned) n_out, threads_per_row, smem>>>(x, codes, scales, y, n_in, n_out,
                                                                               threads_per_row);
     }
-    const cudaError_t e = cudaDeviceSynchronize();
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "s2_gemv_fast: %s\n", cudaGetErrorString(e));
+    const hipError_t e = hipDeviceSynchronize();
+    if (e != hipSuccess) {
+        std::fprintf(stderr, "s2_gemv_fast: %s\n", hipGetErrorString(e));
         std::exit(1);
     }
 }

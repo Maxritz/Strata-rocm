@@ -1,3 +1,4 @@
+﻿#include "hip/hip_runtime.h"
 // src/kernels/router_top10_parity.cpp - P2.S2's parity test for the MoE router.
 //
 // The reference here is a HOST implementation of `ref/moe.py::router` written from the same specification the
@@ -11,7 +12,7 @@
 // model's geometry - see below - so the absence of a clamp test is a proven fact rather than an omission.
 #include "strata/kernels/router_top10.hpp"
 
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
 
 #include <algorithm>
 #include <cmath>
@@ -23,9 +24,9 @@
 
 namespace {
 
-void check(cudaError_t e, const char* what) {
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e));
+void check(hipError_t e, const char* what) {
+    if (e != hipSuccess) {
+        std::fprintf(stderr, "%s: %s\n", what, hipGetErrorString(e));
         std::exit(1);
     }
 }
@@ -72,13 +73,13 @@ int run_case(const char* name, const std::vector<float>& logits, int n_tokens, i
     float* d_l = nullptr;
     int* d_ids = nullptr;
     float* d_w = nullptr;
-    check(cudaMalloc(&d_l, logits.size() * sizeof(float)), "malloc logits");
-    check(cudaMalloc(&d_ids, h_ids.size() * sizeof(int)), "malloc ids");
-    check(cudaMalloc(&d_w, h_w.size() * sizeof(float)), "malloc w");
-    check(cudaMemcpy(d_l, logits.data(), logits.size() * sizeof(float), cudaMemcpyHostToDevice), "copy");
+    check(hipMalloc(&d_l, logits.size() * sizeof(float)), "malloc logits");
+    check(hipMalloc(&d_ids, h_ids.size() * sizeof(int)), "malloc ids");
+    check(hipMalloc(&d_w, h_w.size() * sizeof(float)), "malloc w");
+    check(hipMemcpy(d_l, logits.data(), logits.size() * sizeof(float), hipMemcpyHostToDevice), "copy");
     strata::kernels::router_top10(d_l, n_tokens, n_expert, k, d_ids, d_w, nullptr);
-    check(cudaMemcpy(h_ids.data(), d_ids, h_ids.size() * sizeof(int), cudaMemcpyDeviceToHost), "back ids");
-    check(cudaMemcpy(h_w.data(), d_w, h_w.size() * sizeof(float), cudaMemcpyDeviceToHost), "back w");
+    check(hipMemcpy(h_ids.data(), d_ids, h_ids.size() * sizeof(int), hipMemcpyDeviceToHost), "back ids");
+    check(hipMemcpy(h_w.data(), d_w, h_w.size() * sizeof(float), hipMemcpyDeviceToHost), "back w");
 
     long long id_bad = 0, w_bad = 0;
     double worst = 0;
@@ -101,9 +102,9 @@ int run_case(const char* name, const std::vector<float>& logits, int n_tokens, i
     }
     std::printf("  %-26s ids %s (%lld bad)   weights worst rel %.3e (%lld over tol)   |sum-1| %.1e\n", name,
                 id_bad ? "*** WRONG ***" : "exact", id_bad, worst, w_bad, worst_sum);
-    cudaFree(d_l);
-    cudaFree(d_ids);
-    cudaFree(d_w);
+    hipFree(d_l);
+    hipFree(d_ids);
+    hipFree(d_w);
     return (int) (id_bad + w_bad);
 }
 
@@ -165,3 +166,4 @@ int main(int argc, char** argv) {
     if (selftest) std::printf("router_top10_parity OK\n");
     return 0;
 }
+

@@ -1,3 +1,4 @@
+#include "hip/hip_runtime.h"
 // Adapted from llama.cpp 3cf03257f219afbe7334045ff7c6a06ac68c627d:
 // ggml/src/ggml-cuda/{dsv4-hc.cu,scale.cu,unary.cu,unary.cuh}.
 //
@@ -23,7 +24,8 @@
 // SOFTWARE.
 
 #include "strata/kernels/native_gr_postops.hpp"
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
+#include "strata/hip_compat.h"
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -82,16 +84,16 @@ void check_shape(int n, int hc) {
 }
 unsigned blocks(std::size_t n) { return unsigned((n + THREADS - 1) / THREADS); }
 void check_launch() {
-    const auto error = cudaGetLastError();
-    if (error != cudaSuccess)
-        throw std::runtime_error(std::string("native GR postops launch: ") + cudaGetErrorString(error));
+    const auto error = hipGetLastError();
+    if (error != hipSuccess)
+        throw std::runtime_error(std::string("native GR postops launch: ") + hipGetErrorString(error));
 }
 } // namespace
 
 void native_gr_down_silu(float* lo, int hc_lr, int hc, void* stream) {
     check_shape(hc_lr, hc);
     check_pointer(lo);
-    down_silu<<<blocks(hc_lr), THREADS, 0, static_cast<cudaStream_t>(stream)>>>(lo, hc_lr, 1.0f / float(hc));
+    down_silu<<<blocks(hc_lr), THREADS, 0, static_cast<hipStream_t>(stream)>>>(lo, hc_lr, 1.0f / float(hc));
     check_launch();
 }
 void native_gr_pre_gated(const float* xn, float* gate, float* mixed,
@@ -99,16 +101,16 @@ void native_gr_pre_gated(const float* xn, float* gate, float* mixed,
     check_shape(n_embd, hc);
     check_pointer(xn); check_pointer(gate); check_pointer(mixed);
     if (fused_layer)
-        pre_gated<true><<<blocks(n_embd), THREADS, 0, static_cast<cudaStream_t>(stream)>>>(xn, gate, mixed, n_embd, hc, 1.0f / float(hc));
+        pre_gated<true><<<blocks(n_embd), THREADS, 0, static_cast<hipStream_t>(stream)>>>(xn, gate, mixed, n_embd, hc, 1.0f / float(hc));
     else
-        pre_gated<false><<<blocks(n_embd), THREADS, 0, static_cast<cudaStream_t>(stream)>>>(xn, gate, mixed, n_embd, hc, 1.0f / float(hc));
+        pre_gated<false><<<blocks(n_embd), THREADS, 0, static_cast<hipStream_t>(stream)>>>(xn, gate, mixed, n_embd, hc, 1.0f / float(hc));
     check_launch();
 }
 void native_gr_post(const float* residual, const float* block_out, const float* inject,
                     float* output, int n_embd, int hc, void* stream) {
     check_shape(n_embd, hc);
     check_pointer(residual); check_pointer(block_out); check_pointer(inject); check_pointer(output);
-    post<<<blocks(std::size_t(n_embd) * hc), THREADS, 0, static_cast<cudaStream_t>(stream)>>>(
+    post<<<blocks(std::size_t(n_embd) * hc), THREADS, 0, static_cast<hipStream_t>(stream)>>>(
         residual, block_out, inject, output, n_embd, hc, 1.0f / float(hc));
     check_launch();
 }

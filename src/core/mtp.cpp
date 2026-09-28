@@ -1,3 +1,4 @@
+#include "hip/hip_runtime.h"
 // src/core/mtp.cpp - see include/strata/core/mtp.hpp.
 #include "strata/core/mtp.hpp"
 
@@ -53,9 +54,9 @@ struct Bump {
 };
 
 bool mapped(size_t bytes, void** h, void** d) {
-    if (cudaHostAlloc(h, bytes, cudaHostAllocMapped) != cudaSuccess) return false;
+    if (hipHostAlloc(h, bytes, hipHostMallocMapped) != hipSuccess) return false;
     std::memset(*h, 0, bytes);
-    return cudaHostGetDevicePointer(d, *h, 0) == cudaSuccess;
+    return hipHostGetDevicePointer(d, *h, 0) == hipSuccess;
 }
 
 strata::kernels::QsaShapes shapes_of(const ModelGeometry& g) {
@@ -80,20 +81,20 @@ bool read_file(const std::string& path, std::vector<uint8_t>& out) {
 }  // namespace
 
 MtpDrafter::~MtpDrafter() {
-    if (cs_) cudaStreamSynchronize(cs_);
-    for (auto& e : prefill_exec_) if (e) cudaGraphExecDestroy(e);
-    for (auto& e : round_exec_) if (e) cudaGraphExecDestroy(e);
-    for (auto& e : step_exec_) if (e) cudaGraphExecDestroy(e);
-    if (cs_) cudaStreamDestroy(cs_);
-    if (dense_) cudaFree(dense_);
-    if (experts_) cudaFree(experts_);
-    if (state_arena_) cudaFree(state_arena_);
-    if (arena_) cudaFree(arena_);
-    if (head_logits_) cudaFree(head_logits_);
-    if (dhead_) cudaFree(dhead_);
-    if (dvocab_) cudaFree(dvocab_);
+    if (cs_) hipStreamSynchronize(cs_);
+    for (auto& e : prefill_exec_) if (e) hipGraphExecDestroy(e);
+    for (auto& e : round_exec_) if (e) hipGraphExecDestroy(e);
+    for (auto& e : step_exec_) if (e) hipGraphExecDestroy(e);
+    if (cs_) hipStreamDestroy(cs_);
+    if (dense_) hipFree(dense_);
+    if (experts_) hipFree(experts_);
+    if (state_arena_) hipFree(state_arena_);
+    if (arena_) hipFree(arena_);
+    if (head_logits_) hipFree(head_logits_);
+    if (dhead_) hipFree(dhead_);
+    if (dvocab_) hipFree(dvocab_);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_row_, h_out_, h_prob_};
-    for (void* h : hosts) if (h) cudaFreeHost(h);
+    for (void* h : hosts) if (h) hipHostFree(h);
 }
 
 const float* MtpDrafter::f32(const char* name) const {
@@ -131,8 +132,8 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         }
         std::vector<uint8_t> blob;
         if (!read_file(rt_dir + "/dense.bin", blob)) { err = "mtp: cannot read dense.bin"; return false; }
-        if (cudaMalloc((void**) &dense_, blob.size()) != cudaSuccess) { err = "mtp: dense weights do not fit"; return false; }
-        cudaMemcpy(dense_, blob.data(), blob.size(), cudaMemcpyHostToDevice);
+        if (hipMalloc((void**) &dense_, blob.size()) != hipSuccess) { err = "mtp: dense weights do not fit"; return false; }
+        hipMemcpy(dense_, blob.data(), blob.size(), hipMemcpyHostToDevice);
         vram_ += blob.size();
     }
     // ---- the 512 routed experts, one blob each
@@ -140,12 +141,12 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         const uint64_t bytes = (uint64_t) g.n_expert * strata::kernels::cpu::BLOB;
         std::ifstream f(rt_dir + "/experts.bin", std::ios::binary);
         if (!f) { err = "mtp: cannot open experts.bin"; return false; }
-        if (cudaMalloc((void**) &experts_, bytes) != cudaSuccess) { err = "mtp: the 512 experts do not fit in VRAM"; return false; }
+        if (hipMalloc((void**) &experts_, bytes) != hipSuccess) { err = "mtp: the 512 experts do not fit in VRAM"; return false; }
         std::vector<uint8_t> chunk(64u << 20);
         for (uint64_t off = 0; off < bytes;) {
             const uint64_t n = std::min<uint64_t>(chunk.size(), bytes - off);
             if (!f.read((char*) chunk.data(), (std::streamsize) n)) { err = "mtp: experts.bin is truncated"; return false; }
-            cudaMemcpy(experts_ + off, chunk.data(), n, cudaMemcpyHostToDevice);
+            hipMemcpy(experts_ + off, chunk.data(), n, hipMemcpyHostToDevice);
             off += n;
         }
         vram_ += bytes;
@@ -163,20 +164,20 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     // is pinned after the expert arena has pinned what it could: if it does not fit, the K/V stays whole in VRAM.
     int64_t ring = (window > 0 && window < max_cells) ? window + 4 * (int64_t) max_t + 64 : 0;
     uint64_t sb = qsa_state_bytes(g, max_cells, false, ring);
-    if (cudaMalloc(&state_arena_, sb) != cudaSuccess) { err = "mtp: the K/V state does not fit"; return false; }
+    if (hipMalloc(&state_arena_, sb) != hipSuccess) { err = "mtp: the K/V state does not fit"; return false; }
     if (qsa_state_init(g, max_cells, state_arena_, st_, &ss.qsa_states[0], ring) == 0) {
         if (st_.kv_mode == 0) { err = "mtp: state init failed"; return false; }
         std::fprintf(stderr, "strata mtp: no pinned RAM left for the draft layer's K/V copy; keeping it in VRAM\n");
-        cudaGetLastError();
-        cudaFree(state_arena_);
+        hipGetLastError();
+        hipFree(state_arena_);
         st_ = QsaState{};
         ring = -1;   // fully resident
         sb = qsa_state_bytes(g, max_cells, false, ring);
-        if (cudaMalloc(&state_arena_, sb) != cudaSuccess) { err = "mtp: the K/V state does not fit"; return false; }
+        if (hipMalloc(&state_arena_, sb) != hipSuccess) { err = "mtp: the K/V state does not fit"; return false; }
         if (qsa_state_init(g, max_cells, state_arena_, st_, &ss.qsa_states[0], ring) == 0) { err = "mtp: state init failed"; return false; }
     }
     qsa_state_zero(st_, g, nullptr);
-    cudaDeviceSynchronize();
+    hipDeviceSynchronize();
     vram_ += sb;
 
     // ---- buffers
@@ -223,8 +224,8 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     };
     Bump count;
     carve(count);
-    if (cudaMalloc(&arena_, count.used) != cudaSuccess) { err = "mtp: buffers do not fit"; return false; }
-    cudaMemset(arena_, 0, count.used);
+    if (hipMalloc(&arena_, count.used) != hipSuccess) { err = "mtp: buffers do not fit"; return false; }
+    hipMemset(arena_, 0, count.used);
     Bump real;
     real.base = (uint8_t*) arena_;
     carve(real);
@@ -233,9 +234,9 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         std::vector<int32_t> id((size_t) (T * (uint64_t) cap_));
         for (uint64_t t = 0; t < T; ++t)
             for (int64_t i = 0; i < cap_; ++i) id[(size_t) (t * (uint64_t) cap_ + (uint64_t) i)] = (int32_t) i;
-        cudaMemcpy(ident_, id.data(), id.size() * 4, cudaMemcpyHostToDevice);
+        hipMemcpy(ident_, id.data(), id.size() * 4, hipMemcpyHostToDevice);
     }
-    if (cudaStreamCreateWithFlags(&cs_, cudaStreamNonBlocking) != cudaSuccess) { err = "mtp: stream"; return false; }
+    if (hipStreamCreateWithFlags(&cs_, hipStreamNonBlocking) != hipSuccess) { err = "mtp: stream"; return false; }
     std::fprintf(stderr, "strata mtp: draft layer loaded, %.0f MiB of VRAM (experts %.0f, dense %.0f)\n",
                  (double) vram_ / 1048576.0, (double) g.n_expert * strata::kernels::cpu::BLOB / 1048576.0,
                  (double) tensors_.back().off / 1048576.0);
@@ -251,7 +252,7 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
     n_vocab_ = wo->ne1;
     if (head == nullptr || !head->loaded()) { err = "mtp: the draft layer needs the native head (--native)"; return false; }
     if (head_logits_ == nullptr &&
-        cudaMalloc((void**) &head_logits_, (size_t) max_t_ * (size_t) n_vocab_ * sizeof(float)) != cudaSuccess) {
+        hipMalloc((void**) &head_logits_, (size_t) max_t_ * (size_t) n_vocab_ * sizeof(float)) != hipSuccess) {
         err = "mtp: the draft logits do not fit";
         return false;
     }
@@ -261,14 +262,14 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
         if (read_file(rt_dir_ + "/draft_vocab.bin", raw) && raw.size() >= 4 && raw.size() % 4 == 0) {
             n_dvocab_ = (int64_t) (raw.size() / 4);
             const int64_t row_bytes = (int64_t) head->row_bytes();   // a vocabulary row of the native head
-            if (cudaMalloc((void**) &dvocab_, raw.size()) != cudaSuccess ||
-                cudaMalloc((void**) &dhead_, (size_t) (n_dvocab_ * row_bytes)) != cudaSuccess) {
+            if (hipMalloc((void**) &dvocab_, raw.size()) != hipSuccess ||
+                hipMalloc((void**) &dhead_, (size_t) (n_dvocab_ * row_bytes)) != hipSuccess) {
                 err = "mtp: the draft head does not fit";
                 return false;
             }
-            cudaMemcpy(dvocab_, raw.data(), raw.size(), cudaMemcpyHostToDevice);
+            hipMemcpy(dvocab_, raw.data(), raw.size(), hipMemcpyHostToDevice);
             strata::kernels::gather_rows((const uint8_t*) head->weights(), row_bytes, dvocab_, n_dvocab_, dhead_, nullptr);
-            cudaDeviceSynchronize();
+            hipDeviceSynchronize();
             vram_ += (uint64_t) (n_dvocab_ * row_bytes) + raw.size();
             std::fprintf(stderr, "strata mtp: draft head over %lld tokens (%.1f MiB)\n", (long long) n_dvocab_,
                          (double) (n_dvocab_ * row_bytes) / 1048576.0);
@@ -278,7 +279,7 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
 }
 
 // The layer for T rows.  full = false stops after the K/V append (the prompt only needs the cache).
-bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::string& err) {
+bool MtpDrafter::record_forward(int T, int step_row0, hipStream_t cs, std::string& err) {
     using namespace strata::kernels;
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
@@ -355,8 +356,8 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
         native_mmvq(GGML_Q8_0, q8("self_attn.q_proj.weight"), xq_, qfull_, (int) N, (int) (NH * 2 * HD), T, cs);
         for (int t = 0; t < T; ++t) {
             float* qc = qcur_ + t * NH * HD;
-            if (cudaMemcpy2DAsync(qc, (size_t) HD * 4, qfull_ + t * NH * 2 * HD, (size_t) HD * 2 * 4, (size_t) HD * 4,
-                                  (size_t) NH, cudaMemcpyDeviceToDevice, cs) != cudaSuccess) {
+            if (hipMemcpy2DAsync(qc, (size_t) HD * 4, qfull_ + t * NH * 2 * HD, (size_t) HD * 2 * 4, (size_t) HD * 4,
+                                  (size_t) NH, hipMemcpyDeviceToDevice, cs) != hipSuccess) {
                 err = "mtp: q split failed";
                 return false;
             }
@@ -438,22 +439,22 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
 }
 
 namespace {
-bool finish_capture(cudaStream_t cs, bool ok, cudaGraphExec_t& exec, const char* what, std::string& err) {
-    cudaGraph_t graph = nullptr;
-    const cudaError_t ce = cudaStreamEndCapture(cs, &graph);
+bool finish_capture(hipStream_t cs, bool ok, hipGraphExec_t& exec, const char* what, std::string& err) {
+    hipGraph_t graph = nullptr;
+    const hipError_t ce = hipStreamEndCapture(cs, &graph);
     if (!ok) {
-        if (graph) cudaGraphDestroy(graph);
+        if (graph) hipGraphDestroy(graph);
         return false;
     }
-    if (ce != cudaSuccess || cudaGraphInstantiate(&exec, graph, 0) != cudaSuccess) {
-        if (graph) cudaGraphDestroy(graph);
-        err = std::string("mtp: ") + what + " capture: " + cudaGetErrorString(ce);
+    if (ce != hipSuccess || hipGraphInstantiateWithFlags(&exec, graph, 0) != hipSuccess) {
+        if (graph) hipGraphDestroy(graph);
+        err = std::string("mtp: ") + what + " capture: " + hipGetErrorString(ce);
         return false;
     }
-    cudaGraphDestroy(graph);
+    hipGraphDestroy(graph);
     // an explicit upload: the first launch's implicit one blocked behind a device-side spin (verify.cpp)
-    cudaGraphUpload(exec, cs);
-    cudaStreamSynchronize(cs);
+    hipGraphUpload(exec, cs);
+    hipStreamSynchronize(cs);
     return true;
 }
 }  // namespace
@@ -461,7 +462,7 @@ bool finish_capture(cudaStream_t cs, bool ok, cudaGraphExec_t& exec, const char*
 bool MtpDrafter::capture_prefill(int T, std::string& err) {
     if (prefill_exec_[T]) return true;
     using namespace strata::kernels;
-    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
+    if (hipStreamBeginCapture(cs_, hipStreamCaptureModeThreadLocal) != hipSuccess) { err = "mtp: begin capture"; return false; }
     copy_i32_from_mapped(tok_, m_tok_, T, cs_);
     copy_i32_from_mapped(step_, m_step_, (int64_t) T * 4, cs_);
     copy_i32_from_mapped(pos_, m_pos_, (int64_t) T * g_->n_head, cs_);
@@ -473,7 +474,7 @@ bool MtpDrafter::capture_round(int T, std::string& err) {
     if (round_exec_[T]) return true;
     using namespace strata::kernels;
     const int64_t HCN = g_->hc * g_->n_embd;
-    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
+    if (hipStreamBeginCapture(cs_, hipStreamCaptureModeThreadLocal) != hipSuccess) { err = "mtp: begin capture"; return false; }
     bool ok = true;
     copy_i32_from_mapped(tok_, m_tok_, T, cs_);
     copy_i32_from_mapped(step_, m_step_, (int64_t) 2 * T * 4, cs_);
@@ -502,7 +503,7 @@ bool MtpDrafter::capture_step(int j, std::string& err) {
     using namespace strata::kernels;
     const int64_t HCN = g_->hc * g_->n_embd;
     const int row = max_t_ + j - 1;
-    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
+    if (hipStreamBeginCapture(cs_, hipStreamCaptureModeThreadLocal) != hipSuccess) { err = "mtp: begin capture"; return false; }
     copy_i32_from_mapped(step_ + row * 4, m_step_ + row * 4, 4, cs_);
     copy_i32_from_mapped(pos_ + row * g_->n_head, m_pos_ + row * g_->n_head, g_->n_head, cs_);
     bool ok = record_forward(1, row, cs_, err);
@@ -516,7 +517,7 @@ void MtpDrafter::kv_restore(int64_t upto) {
     const strata::kernels::QsaShapes s = shapes_of(*g_);
     const int64_t b1 = (upto + s.page_size - 1) / s.page_size, b0 = std::max<int64_t>(0, b1 - st_.n_slots);
     strata::kernels::kv_ring_restore(qsa_attn_pools(st_), st_.host, qsa_kv_format(st_), b0, b1, st_.n_slots, s, cs_);
-    cudaStreamSynchronize(cs_);
+    hipStreamSynchronize(cs_);
 }
 
 bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0, std::string& err) {
@@ -537,11 +538,11 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
             h_step_[t * 4 + 3] = (int32_t) (cell + 1);
             for (int64_t h = 0; h < g_->n_head; ++h) h_pos_[t * g_->n_head + h] = (int32_t) cell;
         }
-        if (cudaMemcpyAsync(Rin_, R_rows + (size_t) c * HCN, (size_t) T * HCN * sizeof(float), cudaMemcpyDeviceToDevice,
-                            cs_) != cudaSuccess ||
-            cudaGraphLaunch(prefill_exec_[T], cs_) != cudaSuccess ||
-            cudaStreamSynchronize(cs_) != cudaSuccess) {
-            err = std::string("mtp prefill: ") + cudaGetErrorString(cudaGetLastError());
+        if (hipMemcpyAsync(Rin_, R_rows + (size_t) c * HCN, (size_t) T * HCN * sizeof(float), hipMemcpyDeviceToDevice,
+                            cs_) != hipSuccess ||
+            hipGraphLaunch(prefill_exec_[T], cs_) != hipSuccess ||
+            hipStreamSynchronize(cs_) != hipSuccess) {
+            err = std::string("mtp prefill: ") + hipGetErrorString(hipGetLastError());
             return false;
         }
     }
@@ -570,8 +571,8 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     h_row_[0] = a;
     h_row_[1] = 0;
     std::atomic_thread_fence(std::memory_order_seq_cst);
-    if (cudaGraphLaunch(round_exec_[T], cs_) != cudaSuccess || cudaStreamSynchronize(cs_) != cudaSuccess) {
-        err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
+    if (hipGraphLaunch(round_exec_[T], cs_) != hipSuccess || hipStreamSynchronize(cs_) != hipSuccess) {
+        err = std::string("mtp draft: ") + hipGetErrorString(hipGetLastError());
         return false;
     }
     drafts[0] = ((volatile int32_t*) h_out_)[0];
@@ -583,8 +584,8 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         if (!capture_step(j, err)) return false;
         put(max_t_ + j - 1, p + a + j);
         std::atomic_thread_fence(std::memory_order_seq_cst);
-        if (cudaGraphLaunch(step_exec_[j], cs_) != cudaSuccess || cudaStreamSynchronize(cs_) != cudaSuccess) {
-            err = std::string("mtp draft step: ") + cudaGetErrorString(cudaGetLastError());
+        if (hipGraphLaunch(step_exec_[j], cs_) != hipSuccess || hipStreamSynchronize(cs_) != hipSuccess) {
+            err = std::string("mtp draft step: ") + hipGetErrorString(hipGetLastError());
             return false;
         }
         drafts[j] = ((volatile int32_t*) h_out_)[j];
@@ -604,8 +605,8 @@ bool MtpDrafter::draft_first(int T, const float* R_row, int32_t token, int64_t c
     // row 0 is the real pair; rows 1.. repeat it and only write cells the next round overwrites
     const int64_t HCN = g_->hc * g_->n_embd;
     for (int t = 0; t < T; ++t)
-        if (cudaMemcpy((void*) (window_R_ + (size_t) t * HCN), R_row, (size_t) HCN * sizeof(float),
-                       cudaMemcpyDeviceToDevice) != cudaSuccess) {
+        if (hipMemcpy((void*) (window_R_ + (size_t) t * HCN), R_row, (size_t) HCN * sizeof(float),
+                       hipMemcpyDeviceToDevice) != hipSuccess) {
             err = "mtp: staging the first residual failed";
             return false;
         }

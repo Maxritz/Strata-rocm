@@ -1,9 +1,10 @@
+#include "hip/hip_runtime.h"
 // src/kernels/cuda/bf16_gemv.cu - the BF16 GEMV.  See the header for why it is not `s_gemv`.
 #include "strata/kernels/bf16_gemv.hpp"
 
 #include "strata/kernels/bf16_bits.hpp"
 
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -39,7 +40,7 @@ __global__ void bf16_gemv_warp_kernel(const uint16_t* __restrict__ x, const uint
     float acc = 0.0f;
     for (long long i = lane; i < n_in; i += 32)
         acc += f32_from_bf16(x[i]) * f32_from_bf16(row[i]);
-    for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, acc, off, 32);
     if (lane == 0) y[o] = acc;
 }
 
@@ -66,15 +67,15 @@ __global__ void bf16_gemv_split_kernel(const uint16_t* __restrict__ x, const uin
 }
 
 inline void finish(void* stream, const char* what) {
-    const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "%s launch: %s\n", what, cudaGetErrorString(e));
+    const hipError_t e = hipGetLastError();
+    if (e != hipSuccess) {
+        std::fprintf(stderr, "%s launch: %s\n", what, hipGetErrorString(e));
         std::exit(1);
     }
     if (stream != nullptr) return;
-    const cudaError_t s = cudaDeviceSynchronize();
-    if (s != cudaSuccess) {
-        std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(s));
+    const hipError_t s = hipDeviceSynchronize();
+    if (s != hipSuccess) {
+        std::fprintf(stderr, "%s: %s\n", what, hipGetErrorString(s));
         std::exit(1);
     }
 }
@@ -102,7 +103,7 @@ void bf16_gemv(const uint16_t* x, const uint16_t* w, float* y, int64_t n_in, int
     if (n_out >= 64) {
         const int warps = THREADS / 32;
         const unsigned grid = (unsigned) ((n_out + warps - 1) / warps);
-        bf16_gemv_warp_kernel<<<grid, THREADS, 0, (cudaStream_t) stream>>>(x, w, y, n_in, n_out);
+        bf16_gemv_warp_kernel<<<grid, THREADS, 0, (hipStream_t) stream>>>(x, w, y, n_in, n_out);
         finish(stream, "bf16_gemv(warp)");
         return;
     }
@@ -110,7 +111,7 @@ void bf16_gemv(const uint16_t* x, const uint16_t* w, float* y, int64_t n_in, int
     // not wasting warps.  It is still uncoalesced, so this is the branch to revisit if a small-output caller
     // ever shows up hot in the profile.
     const unsigned grid = (unsigned) ((n_out + THREADS - 1) / THREADS);
-    bf16_gemv_naive_kernel<<<grid, THREADS, 0, (cudaStream_t) stream>>>(x, w, y, n_in, n_out);
+    bf16_gemv_naive_kernel<<<grid, THREADS, 0, (hipStream_t) stream>>>(x, w, y, n_in, n_out);
     finish(stream, "bf16_gemv");
 }
 
@@ -123,7 +124,7 @@ void bf16_gemv_split(const uint16_t* x, const uint16_t* w, float* y, int64_t n_i
     if (threads_per_row == 32) {
         const int warps = THREADS / 32;
         const unsigned grid = (unsigned) ((n_out + warps - 1) / warps);
-        bf16_gemv_warp_kernel<<<grid, THREADS, 0, (cudaStream_t) stream>>>(x, w, y, n_in, n_out);
+        bf16_gemv_warp_kernel<<<grid, THREADS, 0, (hipStream_t) stream>>>(x, w, y, n_in, n_out);
         finish(stream, "bf16_gemv_split(warp)");
         return;
     }
@@ -134,7 +135,7 @@ void bf16_gemv_split(const uint16_t* x, const uint16_t* w, float* y, int64_t n_i
     }
     const unsigned grid = (unsigned) n_out;
     bf16_gemv_split_kernel<<<grid, threads_per_row, (size_t) threads_per_row * sizeof(float),
-                             (cudaStream_t) stream>>>(x, w, y, n_in, n_out, threads_per_row);
+                             (hipStream_t) stream>>>(x, w, y, n_in, n_out, threads_per_row);
     finish(stream, "bf16_gemv_split");
 }
 

@@ -1,3 +1,4 @@
+#include "hip/hip_runtime.h"
 // src/kernels/cuda/dequant_s2.cu - P2.S2's first naive kernel.
 //
 // S2 is Q2_0's canonical form and 31.64 GiB of the artifact is Q2_0, so this is the single hottest decode in
@@ -10,7 +11,7 @@
 // file and the parity test in src/kernels/dequant_s2_parity.cpp is what says whether a change is still right.
 #include "strata/kernels/dequant_s2.hpp"
 
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -41,9 +42,9 @@ void dequant_s2(const uint8_t* codes, const float* scales, float* out, int64_t n
     const int threads = 256;
     const long long blocks = (n_blocks + threads - 1) / threads;
     dequant_s2_kernel<<<(unsigned) blocks, threads>>>(codes, scales, out, n_blocks);
-    const cudaError_t e = cudaDeviceSynchronize();
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "dequant_s2: %s\n", cudaGetErrorString(e));
+    const hipError_t e = hipDeviceSynchronize();
+    if (e != hipSuccess) {
+        std::fprintf(stderr, "dequant_s2: %s\n", hipGetErrorString(e));
         std::exit(1);
     }
 }

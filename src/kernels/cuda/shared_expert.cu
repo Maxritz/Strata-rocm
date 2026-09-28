@@ -1,3 +1,4 @@
+#include "hip/hip_runtime.h"
 // src/kernels/cuda/shared_expert.cu - P2.S2: the shared expert.
 //
 // `ref/moe.py::shared_expert`, transcribed:
@@ -27,7 +28,7 @@
 #include "strata/kernels/s_gemv.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
 
 #include <cmath>
 #include <climits>
@@ -102,8 +103,8 @@ __global__ void to_f16_kernel(const float* __restrict__ in, uint16_t* __restrict
 // A wrong scalar here is the quiet failure mode: sigmoid bounds the damage to [0,1], so a gate that should be
 // 0.5 and reads 1.0 scales the shared expert by 2x and produces perfectly finite, perfectly plausible logits.
 __device__ __forceinline__ double warp_sum_d(double v) {
-    for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xFFFFFFFFu, v, off);
-    return __shfl_sync(0xFFFFFFFFu, v, 0);
+    for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, v, off, 32);
+    return __shfl_sync(0xFFFFFFFFFFFFFFFFull, v, 0);
 }
 
 __global__ void scalar_gate_kernel(const uint16_t* __restrict__ x_bf16, const uint16_t* __restrict__ w_bf16,
@@ -168,7 +169,7 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
                          int64_t n_ff, void* stream) {
     if (n_tok < 1 || n_tok > 8 || !nw.q8_1 || !nw.gate_data || !nw.up_data || !nw.down_data || !stream)
         throw std::invalid_argument("shared_expert_multi: needs 1..8 tokens, native weights, scratch and a stream");
-    cudaStream_t cs = (cudaStream_t) stream;
+    hipStream_t cs = (hipStream_t) stream;
     native_quantize_q8_1(x, nw.q8_1, (int) n_embd, n_tok, stream);
     native_mmvq(nw.gate_type, nw.gate_data, nw.q8_1, gate, (int) n_embd, (int) n_ff, n_tok, stream);
     native_mmvq(nw.up_type, nw.up_data, nw.q8_1, up, (int) n_embd, (int) n_ff, n_tok, stream);
@@ -186,8 +187,8 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
     }
     scale_rows_kernel<<<dim3((unsigned) ((n_embd + THREADS - 1) / THREADS), (unsigned) n_tok), THREADS, 0, cs>>>(
         out, g, (int) n_embd);
-    const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) throw std::runtime_error(std::string("shared_expert_multi: ") + cudaGetErrorString(e));
+    const hipError_t e = hipGetLastError();
+    if (e != hipSuccess) throw std::runtime_error(std::string("shared_expert_multi: ") + hipGetErrorString(e));
 }
 
 uint64_t shared_expert_scratch_bytes(int64_t n_ff) {
@@ -266,9 +267,9 @@ void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* 
     else
         gemv(up_form, up_codes, up_scales, up_off, x_q8_0, x_q8k, up, n_embd, n_ff);
     if (native_projection)
-        native_swiglu_kernel<<<g_ff, THREADS, 0, (cudaStream_t) stream>>>(gate, up, gate, (int) n_ff);
+        native_swiglu_kernel<<<g_ff, THREADS, 0, (hipStream_t) stream>>>(gate, up, gate, (int) n_ff);
     else
-        swiglu_kernel<<<g_ff, THREADS, 0, (cudaStream_t) stream>>>(gate, up, gate, (int) n_ff);
+        swiglu_kernel<<<g_ff, THREADS, 0, (hipStream_t) stream>>>(gate, up, gate, (int) n_ff);
 
     // down: (n_ff) -> (n_embd), and THE INTERMEDIATE IS QUANTIZED TO THE DOWN WEIGHT'S OWN CONTRACT - which is
     // what `ggml_mul_mat` does for every matmul in the model.  It used to be rounded to fp16 with no
@@ -299,16 +300,16 @@ void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* 
     // round trip.  256 threads is the reduction's width, not the problem's size.
     if (use_native) {
         bf16_gemv_fp32_mmvf(x_f32, gate_inp_bf16, g, n_embd, 1, stream);
-        native_scalar_sigmoid_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(g);
+        native_scalar_sigmoid_kernel<<<1, 1, 0, (hipStream_t) stream>>>(g);
     } else {
-        scalar_gate_kernel<<<1, 256, 0, (cudaStream_t) stream>>>(x_bf16, gate_inp_bf16, g, (int) n_embd);
+        scalar_gate_kernel<<<1, 256, 0, (hipStream_t) stream>>>(x_bf16, gate_inp_bf16, g, (int) n_embd);
     }
-    scale_kernel<<<g_embd, THREADS, 0, (cudaStream_t) stream>>>(out, g, (int) n_embd);
+    scale_kernel<<<g_embd, THREADS, 0, (hipStream_t) stream>>>(out, g, (int) n_embd);
 
     if (stream == nullptr) {
-        const cudaError_t e = cudaDeviceSynchronize();
-        if (e != cudaSuccess) {
-            std::fprintf(stderr, "shared_expert: %s\n", cudaGetErrorString(e));
+        const hipError_t e = hipDeviceSynchronize();
+        if (e != hipSuccess) {
+            std::fprintf(stderr, "shared_expert: %s\n", hipGetErrorString(e));
             std::exit(1);
         }
     }
@@ -324,12 +325,12 @@ void moe_combine(const float* parts, const float* weights, const float* shared, 
         std::exit(1);
     }
     const unsigned grid = (unsigned) ((n_embd + THREADS - 1) / THREADS);
-    moe_combine_kernel<<<grid, THREADS, 0, (cudaStream_t) stream>>>(parts, weights, shared, y, (int) n_embd,
+    moe_combine_kernel<<<grid, THREADS, 0, (hipStream_t) stream>>>(parts, weights, shared, y, (int) n_embd,
                                                                    (int) k, shared != nullptr);
     if (stream == nullptr) {
-        const cudaError_t e = cudaDeviceSynchronize();
-        if (e != cudaSuccess) {
-            std::fprintf(stderr, "moe_combine: %s\n", cudaGetErrorString(e));
+        const hipError_t e = hipDeviceSynchronize();
+        if (e != hipSuccess) {
+            std::fprintf(stderr, "moe_combine: %s\n", hipGetErrorString(e));
             std::exit(1);
         }
     }

@@ -1,3 +1,4 @@
+#include "hip/hip_runtime.h"
 // src/prefill/moe_mmq.cu - see include/strata/prefill/moe_mmq.hpp.  llama.cpp's MMQ (ggml-cuda, MIT) is compiled
 // from the pinned llama.cpp checkout the build already takes ggml from; src/prefill/ggml_cuda_host.cu supplies the
 // few host symbols of ggml-cuda.cu it references.
@@ -13,9 +14,9 @@
 namespace strata::prefill::mmq {
 namespace {
 
-void ck(cudaError_t e, const char* what) {
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "prefill mmq: %s: %s\n", what, cudaGetErrorString(e));
+void ck(hipError_t e, const char* what) {
+    if (e != hipSuccess) {
+        std::fprintf(stderr, "prefill mmq: %s: %s\n", what, hipGetErrorString(e));
         std::exit(1);
     }
 }
@@ -110,13 +111,13 @@ size_t q8_bytes(int64_t rows, int64_t cols) {
 void quantize(const float* x, const int32_t* ids, void* xq, int t, int64_t cols, int64_t ld, int64_t rows, void* stream) {
     if (rows <= 0) return;
     quantize_mmq_q8_1_cuda(x, ids, xq, (ggml_type) t, cols, ld, rows * ld, rows * ld, pad512(cols), rows, 1, 1,
-                           (cudaStream_t) stream);
-    ck(cudaGetLastError(), "quantize");
+                           (hipStream_t) stream);
+    ck(hipGetLastError(), "quantize");
 }
 
 Context::Context() {
     int dev = 0;
-    cudaGetDevice(&dev);
+    hipGetDevice(&dev);
     ctx_ = new ggml_backend_cuda_context(dev);
 }
 Context::~Context() { delete (ggml_backend_cuda_context*) ctx_; }
@@ -131,7 +132,7 @@ void Context::run(const Product& p, void* stream) {
                         1, 1, 0, 0, 0,
                         p.max_rows, p.max_rows};
     auto& ctx = *(ggml_backend_cuda_context*) ctx_;
-    const cudaStream_t s = (cudaStream_t) stream;
+    const hipStream_t s = (hipStream_t) stream;
     switch (t) {
         case GGML_TYPE_Q2_0: mul_mat_q_case<GGML_TYPE_Q2_0>(ctx, a, s); break;
         case GGML_TYPE_IQ2_XXS: mul_mat_q_case<GGML_TYPE_IQ2_XXS>(ctx, a, s); break;
@@ -145,12 +146,12 @@ void Context::run(const Product& p, void* stream) {
             std::fprintf(stderr, "prefill mmq: type %d is not covered\n", (int) t);
             std::exit(1);
     }
-    ck(cudaGetLastError(), "mul_mat_q");
+    ck(hipGetLastError(), "mul_mat_q");
 }
 
 void gather_native(const void* gate, const void* up, size_t gu_half_bytes, const void* down, size_t d_bytes,
                    void* gu_dst, void* d_dst, void* stream) {
-    const cudaStream_t s = (cudaStream_t) stream;
+    const hipStream_t s = (hipStream_t) stream;
     const bool a16 = ((uintptr_t) gate | (uintptr_t) up | (uintptr_t) down | (uintptr_t) gu_dst | (uintptr_t) d_dst |
                       gu_half_bytes | d_bytes) % 16 == 0;
     if (a16) {
@@ -162,25 +163,25 @@ void gather_native(const void* gate, const void* up, size_t gu_half_bytes, const
         copy1_kernel<<<blocks(2 * na + nc), 256, 0, s>>>((const uint8_t*) gate, na, (const uint8_t*) up, na,
                                                          (uint8_t*) gu_dst, (const uint8_t*) down, nc, (uint8_t*) d_dst);
     }
-    ck(cudaGetLastError(), "gather_native");
+    ck(hipGetLastError(), "gather_native");
 }
 
 void gather_strata_q2(const uint8_t* blob, void* gu_dst, void* d_dst, void* stream) {
-    strata_q2_kernel<<<blocks(1280LL * 40 + 2560LL * 10), 256, 0, (cudaStream_t) stream>>>(blob, (uint16_t*) gu_dst,
+    strata_q2_kernel<<<blocks(1280LL * 40 + 2560LL * 10), 256, 0, (hipStream_t) stream>>>(blob, (uint16_t*) gu_dst,
                                                                                          (uint16_t*) d_dst);
-    ck(cudaGetLastError(), "gather_strata_q2");
+    ck(hipGetLastError(), "gather_strata_q2");
 }
 
 void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interleaved, void* stream) {
     if (rows <= 0) return;
-    swiglu_kernel<<<blocks(rows * n_ff), 256, 0, (cudaStream_t) stream>>>(gu, h, rows, n_ff, interleaved);
-    ck(cudaGetLastError(), "swiglu");
+    swiglu_kernel<<<blocks(rows * n_ff), 256, 0, (hipStream_t) stream>>>(gu, h, rows, n_ff, interleaved);
+    ck(hipGetLastError(), "swiglu");
 }
 
 void iota(int32_t* dst, int64_t n, void* stream) {
     if (n <= 0) return;
-    iota_kernel<<<blocks(n), 256, 0, (cudaStream_t) stream>>>(dst, n);
-    ck(cudaGetLastError(), "iota");
+    iota_kernel<<<blocks(n), 256, 0, (hipStream_t) stream>>>(dst, n);
+    ck(hipGetLastError(), "iota");
 }
 
 }  // namespace strata::prefill::mmq

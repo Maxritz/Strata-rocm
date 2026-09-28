@@ -206,9 +206,10 @@ def sha256(path: pathlib.Path, chunk: int = 1 << 24) -> str:
 def build(gguf: pathlib.Path, out_dir: pathlib.Path, n_layers: int | None, skip_hash: bool) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     g = G.GGUFFile(gguf)
+    PL.NE = int(g.metadata.get("qwen4exp.expert_count", PL.NE))
     head, flen = open_shard(gguf)
     data_off = data_section_offset(g, flen)
-    print("source %s: %d tensors, data at %d" % (gguf.name, len(g.tensors), data_off))
+    print("source %s: %d tensors, data at %d, experts %d" % (gguf.name, len(g.tensors), data_off, PL.NE))
 
     n_layers = 48 if n_layers is None else n_layers
     man = {

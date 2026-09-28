@@ -3,7 +3,7 @@
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
 #include <climits>
 #include <cstring>
 #include <exception>
@@ -11,8 +11,8 @@
 namespace strata::core {
 
 NativeHead::~NativeHead() {
-    if (scratch_) cudaFree(scratch_);
-    if (weights_) cudaFree(weights_);
+    if (scratch_) hipFree(scratch_);
+    if (weights_) hipFree(weights_);
 }
 
 bool NativeHead::load(const std::string& path, int64_t n_in, int64_t n_out, std::string& err) {
@@ -44,15 +44,15 @@ bool NativeHead::load(const std::string& path, int64_t n_in, int64_t n_out, std:
         }
         void* weights = nullptr;
         void* scratch = nullptr;
-        cudaError_t status = cudaMalloc(&weights, bytes);
-        if (status == cudaSuccess)
-            status = cudaMalloc(&scratch, strata::kernels::native_q8_1_bytes((int) n_in, 1));
-        if (status == cudaSuccess)
-            status = cudaMemcpy(weights, gguf.tensor_data(*tensor), bytes, cudaMemcpyHostToDevice);
-        if (status != cudaSuccess) {
-            if (scratch) cudaFree(scratch);
-            if (weights) cudaFree(weights);
-            err = std::string("native head upload: ") + cudaGetErrorString(status);
+        hipError_t status = hipMalloc(&weights, bytes);
+        if (status == hipSuccess)
+            status = hipMalloc(&scratch, strata::kernels::native_q8_1_bytes((int) n_in, 1));
+        if (status == hipSuccess)
+            status = hipMemcpy(weights, gguf.tensor_data(*tensor), bytes, hipMemcpyHostToDevice);
+        if (status != hipSuccess) {
+            if (scratch) hipFree(scratch);
+            if (weights) hipFree(weights);
+            err = std::string("native head upload: ") + hipGetErrorString(status);
             return false;
         }
         weights_ = weights;
@@ -84,9 +84,9 @@ bool NativeHead::run(const float* mixed, float* logits, void* stream, std::strin
         err = std::string("native head launch: ") + error.what();
         return false;
     }
-    const cudaError_t status = cudaPeekAtLastError();
-    if (status != cudaSuccess) {
-        err = std::string("native head launch: ") + cudaGetErrorString(status);
+    const hipError_t status = hipPeekAtLastError();
+    if (status != hipSuccess) {
+        err = std::string("native head launch: ") + hipGetErrorString(status);
         return false;
     }
     return true;
@@ -101,7 +101,7 @@ void set_native_embed(const NativeEmbed* e) { g_embed = e; }
 const NativeEmbed* native_embed() { return g_embed; }
 
 NativeEmbed::~NativeEmbed() {
-    if (host_) cudaFreeHost(host_);
+    if (host_) hipHostFree(host_);
 }
 
 bool NativeEmbed::load(const std::string& path, int64_t n_embd, int64_t n_vocab, std::string& err) {
@@ -118,14 +118,14 @@ bool NativeEmbed::load(const std::string& path, int64_t n_embd, int64_t n_vocab,
         }
         row_ = strata::kernels::iq_row_bytes((int) t->type, n_embd);
         bytes_ = (uint64_t) row_ * (uint64_t) n_vocab;
-        if (cudaHostAlloc(&host_, bytes_, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
+        if (hipHostAlloc(&host_, bytes_, hipHostMallocMapped | hipHostMallocPortable) != hipSuccess) {
             host_ = nullptr;
             err = "native embedding: cannot pin " + std::to_string(bytes_ >> 20) + " MiB";
             return false;
         }
         std::memcpy(host_, gguf.tensor_data(*t), bytes_);
         void* d = nullptr;
-        if (cudaHostGetDevicePointer(&d, host_, 0) != cudaSuccess) {
+        if (hipHostGetDevicePointer(&d, host_, 0) != hipSuccess) {
             err = "native embedding: no device alias for the mapped table";
             return false;
         }

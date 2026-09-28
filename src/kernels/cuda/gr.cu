@@ -1,3 +1,4 @@
+#include "hip/hip_runtime.h"
 // src/kernels/cuda/gr.cu - P2.S2: the gated residual / hyper-connection, `gr_read` and `gr_write`.
 //
 // See include/strata/kernels/gr.hpp for the semantics, for why the weights are bf16, and for the history of
@@ -27,7 +28,7 @@
 #include "strata/kernels/native_gr_norm.hpp"
 #include "strata/kernels/native_gr_postops.hpp"
 
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
 
 #include <cmath>
 #include <cstdio>
@@ -67,13 +68,13 @@ __device__ __forceinline__ float silu_f(float x) { return x / (1.0f + expf(-x));
 __device__ __forceinline__ float sigmoid_f(float x) { return 1.0f / (1.0f + expf(-x)); }
 
 __device__ __forceinline__ double warp_sum(double v) {
-    for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xFFFFFFFFu, v, off);
-    return __shfl_sync(0xFFFFFFFFu, v, 0);
+    for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, v, off, 32);
+    return __shfl_sync(0xFFFFFFFFFFFFFFFFull, v, 0);
 }
 
 __device__ __forceinline__ float warp_sumf(float v) {
-    for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xFFFFFFFFu, v, off);
-    return __shfl_sync(0xFFFFFFFFu, v, 0);
+    for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, v, off, 32);
+    return __shfl_sync(0xFFFFFFFFFFFFFFFFull, v, 0);
 }
 
 /// The FP32 block-wide sum, for the reason the review's G5 states: this is a GeForce part and FP64 runs at a
@@ -356,7 +357,7 @@ void gr_read(const float* R, const float* w_norm, const uint16_t* w_down, const 
     }
     const int n_embd = (int) s.n_embd, hc = (int) s.hc, hc_lr = (int) s.hc_lr;
     const int hc_dim = (int) (s.hc * s.n_embd);
-    cudaStream_t st = (cudaStream_t) stream;
+    hipStream_t st = (hipStream_t) stream;
 
     // One setting selects every projection in this call. Captured graphs retain these kernel variants.
     const bool use_native = native_mmvf;
@@ -396,15 +397,15 @@ void gr_read(const float* R, const float* w_norm, const uint16_t* w_down, const 
             gr_inject_kernel<uint16_t><<<1, nthreads, 0, st>>>(ws.xq, w_inject, hc_dim, hc, inject);
     }
 
-    const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "gr_read launch: %s\n", cudaGetErrorString(e));
+    const hipError_t e = hipGetLastError();
+    if (e != hipSuccess) {
+        std::fprintf(stderr, "gr_read launch: %s\n", hipGetErrorString(e));
         std::exit(1);
     }
     if (stream == nullptr) {
-        const cudaError_t se = cudaDeviceSynchronize();
-        if (se != cudaSuccess) {
-            std::fprintf(stderr, "gr_read: %s\n", cudaGetErrorString(se));
+        const hipError_t se = hipDeviceSynchronize();
+        if (se != hipSuccess) {
+            std::fprintf(stderr, "gr_read: %s\n", hipGetErrorString(se));
             std::exit(1);
         }
     }
@@ -418,12 +419,12 @@ void gr_write(const float* R, const float* block_out, const float* inject, const
     if (native_mmvf)
         native_gr_post(R, block_out, inject, R_out, (int) s.n_embd, (int) s.hc, stream);
     else
-        gr_write_kernel<<<blocks, THREADS, (size_t) s.hc * sizeof(float), (cudaStream_t) stream>>>(
+        gr_write_kernel<<<blocks, THREADS, (size_t) s.hc * sizeof(float), (hipStream_t) stream>>>(
             R, block_out, inject, (int) s.n_embd, (int) s.hc, R_out);
     if (stream == nullptr) {
-        const cudaError_t e = cudaDeviceSynchronize();
-        if (e != cudaSuccess) {
-            std::fprintf(stderr, "gr_write: %s\n", cudaGetErrorString(e));
+        const hipError_t e = hipDeviceSynchronize();
+        if (e != hipSuccess) {
+            std::fprintf(stderr, "gr_write: %s\n", hipGetErrorString(e));
             std::exit(1);
         }
     }

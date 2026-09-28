@@ -1,10 +1,11 @@
+#include "hip/hip_runtime.h"
 // src/kernels/cuda/qsa_decode_attn.cu - see include/strata/kernels/qsa_decode_attn.hpp.
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/kv_q4.hpp"
 
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
+#include <hip/hip_fp16.h>
+#include <hip/hip_runtime.h>
 
 #include <cfloat>
 #include <cstdio>
@@ -21,12 +22,12 @@ constexpr int WARPS = THREADS / 32;
 
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffffffffffull, v, o, 32);
     return v;
 }
 __device__ __forceinline__ float warp_max(float v) {
 #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffffffffffull, v, o, 32));
     return v;
 }
 
@@ -211,7 +212,7 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
     float* part_l = part_m + (size_t) n_chunks * s.n_head;
     const float scale = 1.0f / sqrtf((float) HD);
     const dim3 grid((unsigned) n_chunks, (unsigned) s.n_head_kv, (unsigned) n_q);
-    cudaStream_t st = (cudaStream_t) stream;
+    hipStream_t st = (hipStream_t) stream;
     if (kv_mode == 2)
         attn_chunk_kernel<2><<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size,
                                                         scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride);
@@ -223,9 +224,9 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
                                                         scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride);
     attn_merge_kernel<<<dim3((unsigned) s.n_head, (unsigned) n_q), HD, 0, st>>>(part_acc, part_m, part_l, n_chunks,
                                                                                   attn, stride);
-    const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "qsa_decode_attn_batch: %s\n", cudaGetErrorString(e));
+    const hipError_t e = hipGetLastError();
+    if (e != hipSuccess) {
+        std::fprintf(stderr, "qsa_decode_attn_batch: %s\n", hipGetErrorString(e));
         std::exit(1);
     }
 }
@@ -253,7 +254,7 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
     float* part_l = part_m + (size_t) n_chunks * s.n_head;
     const float scale = 1.0f / sqrtf((float) HD);
     const dim3 grid((unsigned) n_chunks, (unsigned) s.n_head_kv);
-    cudaStream_t st = (cudaStream_t) stream;
+    hipStream_t st = (hipStream_t) stream;
     if (kv_mode == 2)
         attn_chunk_kernel<2><<<grid, THREADS, 0, st>>>(q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size,
                                                         scale, part_acc, part_m, part_l, n_chunks);
@@ -264,9 +265,9 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
         attn_chunk_kernel<0><<<grid, THREADS, 0, st>>>(q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size,
                                                         scale, part_acc, part_m, part_l, n_chunks);
     attn_merge_kernel<<<(unsigned) s.n_head, HD, 0, st>>>(part_acc, part_m, part_l, n_chunks, attn);
-    const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "qsa_decode_attn: %s\n", cudaGetErrorString(e));
+    const hipError_t e = hipGetLastError();
+    if (e != hipSuccess) {
+        std::fprintf(stderr, "qsa_decode_attn: %s\n", hipGetErrorString(e));
         std::exit(1);
     }
 }

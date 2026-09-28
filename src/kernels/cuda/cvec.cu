@@ -1,7 +1,8 @@
+#include "hip/hip_runtime.h"
 // src/kernels/cuda/cvec.cu - see include/strata/kernels/cvec.hpp.
 #include "strata/kernels/cvec.hpp"
 
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
 
 #include <stdexcept>
 
@@ -47,13 +48,13 @@ __global__ void cvec_kernel(float* __restrict__ R, const float* __restrict__ dir
     if (steer && mode == 0) {
         __shared__ float part[THREADS / 32];
 #pragma unroll
-        for (int o = 16; o > 0; o >>= 1) dot += __shfl_xor_sync(0xffffffffu, dot, o);
+        for (int o = 16; o > 0; o >>= 1) dot += __shfl_xor_sync(0xffffffffffffffffull, dot, o, 32);
         if ((threadIdx.x & 31) == 0) part[threadIdx.x >> 5] = dot;
         __syncthreads();
         if (threadIdx.x < 32) {
             float p = threadIdx.x < THREADS / 32 ? part[threadIdx.x] : 0.0f;
 #pragma unroll
-            for (int o = 16; o > 0; o >>= 1) p += __shfl_xor_sync(0xffffffffu, p, o);
+            for (int o = 16; o > 0; o >>= 1) p += __shfl_xor_sync(0xffffffffffffffffull, p, o, 32);
             if (threadIdx.x == 0) part[0] = p;
         }
         __syncthreads();
@@ -82,11 +83,11 @@ bool cvec_upload(const std::vector<float>& dir, const std::vector<float>& s, int
     float* d_s = nullptr;
     int* d_on = nullptr;
     const int one = 1;
-    if (cudaMalloc(&d_dir, dir.size() * sizeof(float)) != cudaSuccess ||
-        cudaMalloc(&d_s, s.size() * sizeof(float)) != cudaSuccess || cudaMalloc(&d_on, sizeof(int)) != cudaSuccess ||
-        cudaMemcpy(d_dir, dir.data(), dir.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess ||
-        cudaMemcpy(d_s, s.data(), s.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess ||
-        cudaMemcpy(d_on, &one, sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) {
+    if (hipMalloc(&d_dir, dir.size() * sizeof(float)) != hipSuccess ||
+        hipMalloc(&d_s, s.size() * sizeof(float)) != hipSuccess || hipMalloc(&d_on, sizeof(int)) != hipSuccess ||
+        hipMemcpy(d_dir, dir.data(), dir.size() * sizeof(float), hipMemcpyHostToDevice) != hipSuccess ||
+        hipMemcpy(d_s, s.data(), s.size() * sizeof(float), hipMemcpyHostToDevice) != hipSuccess ||
+        hipMemcpy(d_on, &one, sizeof(int), hipMemcpyHostToDevice) != hipSuccess) {
         err = "control vector: device allocation failed";
         return false;
     }
@@ -107,9 +108,9 @@ bool cvec_upload(const std::vector<float>& dir, const std::vector<float>& s, int
 
 void cvec_set_enabled(bool on) {
     if (g_on == nullptr || on == g_on_host) return;
-    cudaDeviceSynchronize();   // nothing in flight may still read the flag
+    hipDeviceSynchronize();   // nothing in flight may still read the flag
     const int v = on ? 1 : 0;
-    cudaMemcpy(g_on, &v, sizeof(int), cudaMemcpyHostToDevice);
+    hipMemcpy(g_on, &v, sizeof(int), hipMemcpyHostToDevice);
     g_on_host = on;
 }
 
@@ -119,10 +120,10 @@ void cvec_apply(float* R, int64_t layer, int64_t T, int64_t r_ld, const float* b
                 int64_t inj_ld, bool write, void* stream) {
     if (!g_cvec.loaded() || T < 1) return;
     const dim3 grid((unsigned) g_cvec.hc, (unsigned) T);
-    cvec_kernel<<<grid, THREADS, 0, (cudaStream_t) stream>>>(R, g_cvec.dir, g_cvec.s, g_cvec.on, g_cvec.mode, layer,
+    cvec_kernel<<<grid, THREADS, 0, (hipStream_t) stream>>>(R, g_cvec.dir, g_cvec.s, g_cvec.on, g_cvec.mode, layer,
                                                             (int) g_cvec.n_embd, (int) g_cvec.hc, r_ld, bo, bo_ld,
                                                             inj, inj_ld, write ? 1 : 0);
-    if (cudaPeekAtLastError() != cudaSuccess) throw std::runtime_error("cvec_apply: launch failed");
+    if (hipPeekAtLastError() != hipSuccess) throw std::runtime_error("cvec_apply: launch failed");
 }
 
 }  // namespace strata::kernels

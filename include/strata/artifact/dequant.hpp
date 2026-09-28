@@ -50,14 +50,14 @@ inline float fp16_to_fp32(uint16_t h) {
     else
         f = (sign << 31) | ((exp - 15 + 127) << 23) | (man << 13);
     float out;
-    std::memcpy(&out, &f, 4);
+    __builtin_memcpy(&out, &f, 4);
     return out;
 }
 
 inline float bf16_to_fp32(uint16_t h) {
     const uint32_t f = (uint32_t)h << 16;
     float out;
-    std::memcpy(&out, &f, 4);
+    __builtin_memcpy(&out, &f, 4);
     return out;
 }
 
@@ -230,7 +230,7 @@ inline void dequantize_q3_K(const uint8_t* block, float* out) {
 
     const uint32_t kmask1 = 0x03030303u, kmask2 = 0x0f0f0f0fu;
     uint32_t aux[4] = {0, 0, 0, 0};
-    std::memcpy(aux, block + 96, 12);
+    __builtin_memcpy(aux, block + 96, 12);
     const uint32_t tmp = aux[2];
     aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
     aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
@@ -280,7 +280,7 @@ inline void dequantize_iq4_xs(const uint8_t* block, float* out) {
 }
 // ---- element types
 inline void dequantize_f32(const uint8_t* p, float* out, int n) {
-    std::memcpy(out, p, (size_t)n * 4);
+    __builtin_memcpy(out, p, (size_t)n * 4);
 }
 inline void dequantize_f16(const uint8_t* p, float* out, int n) {
     for (int i = 0; i < n; ++i) out[i] = fp16_to_fp32(read_u16(p + 2 * i));

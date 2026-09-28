@@ -1,7 +1,7 @@
 // src/core/expert_cache.cpp - R4's slot storage and residency table.  Read the header first.
 #include "strata/core/expert_cache.hpp"
 
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
 
 #include <cstdio>
 #include <utility>
@@ -90,7 +90,7 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
     // `device_slot()` walks off the end. So the free-VRAM figure is read and compared BEFORE the allocation,
     // and the two numbers are named in the refusal.
     size_t free_b = 0, total_b = 0;
-    if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
+    if (hipMemGetInfo(&free_b, &total_b) == hipSuccess) {
         if ((uint64_t) free_b < want) {
             char buf[320];
             std::snprintf(buf, sizeof buf,
@@ -104,18 +104,18 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
         }
     }
 
-    if (cudaMalloc((void**) &base_, (size_t) want) != cudaSuccess) {
+    if (hipMalloc((void**) &base_, (size_t) want) != hipSuccess) {
         base_ = nullptr;
         char buf[256];
-        std::snprintf(buf, sizeof buf, "ExpertCache: cudaMalloc(%.2f GiB) failed: %s",
-                      (double) want / 1073741824.0, cudaGetErrorString(cudaGetLastError()));
+        std::snprintf(buf, sizeof buf, "ExpertCache: hipMalloc(%.2f GiB) failed: %s",
+                      (double) want / 1073741824.0, hipGetErrorString(hipGetLastError()));
         err = buf;
         return false;
     }
     // Zeroed so a slot read before it is filled is a DETERMINISTIC wrong answer rather than whatever the
     // allocator handed back.  A stale block of a previous process's memory would still sum to finite floats.
-    if (cudaMemset(base_, 0, (size_t) want) != cudaSuccess) {
-        err = "ExpertCache: cudaMemset of the slot arena failed";
+    if (hipMemset(base_, 0, (size_t) want) != hipSuccess) {
+        err = "ExpertCache: hipMemset of the slot arena failed";
         close();
         return false;
     }
@@ -161,7 +161,7 @@ bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_l
 void ExpertCache::close() {
     off_.clear();
     if (base_ != nullptr) {
-        cudaFree(base_);
+        hipFree(base_);
         base_ = nullptr;
     }
     residency_.clear();
@@ -235,10 +235,10 @@ bool ExpertCache::fill_slot(int32_t slot, const uint8_t* host_blob, void* stream
         err = "ExpertCache::fill_slot: the host blob is null";
         return false;
     }
-    const cudaError_t e = cudaMemcpyAsync(dst, host_blob, n, cudaMemcpyHostToDevice,
-                                          (cudaStream_t) stream);
-    if (e != cudaSuccess) {
-        err = std::string("ExpertCache::fill_slot: ") + cudaGetErrorString(e);
+    const hipError_t e = hipMemcpyAsync(dst, host_blob, n, hipMemcpyHostToDevice,
+                                          (hipStream_t) stream);
+    if (e != hipSuccess) {
+        err = std::string("ExpertCache::fill_slot: ") + hipGetErrorString(e);
         return false;
     }
     ++fills_;
@@ -256,9 +256,9 @@ bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std
         err = "ExpertCache::fill_slot_blocking: the host blob is null";
         return false;
     }
-    const cudaError_t e = cudaMemcpy(dst, host_blob, n, cudaMemcpyHostToDevice);
-    if (e != cudaSuccess) {
-        err = std::string("ExpertCache::fill_slot_blocking: ") + cudaGetErrorString(e);
+    const hipError_t e = hipMemcpy(dst, host_blob, n, hipMemcpyHostToDevice);
+    if (e != hipSuccess) {
+        err = std::string("ExpertCache::fill_slot_blocking: ") + hipGetErrorString(e);
         return false;
     }
     ++fills_;
@@ -276,9 +276,9 @@ bool ExpertCache::verify_slot(int32_t slot, const uint8_t* host_blob, std::strin
     // has happened is not a check.  It also synchronises the fills queued before it, which is what makes the
     // comparison meaningful.
     std::vector<uint8_t> got((size_t) nb);
-    const cudaError_t e = cudaMemcpy(got.data(), src, (size_t) nb, cudaMemcpyDeviceToHost);
-    if (e != cudaSuccess) {
-        err = std::string("ExpertCache::verify_slot: ") + cudaGetErrorString(e);
+    const hipError_t e = hipMemcpy(got.data(), src, (size_t) nb, hipMemcpyDeviceToHost);
+    if (e != hipSuccess) {
+        err = std::string("ExpertCache::verify_slot: ") + hipGetErrorString(e);
         return false;
     }
     if (std::memcmp(got.data(), host_blob, (size_t) nb) != 0) {
