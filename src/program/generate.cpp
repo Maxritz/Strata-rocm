@@ -773,6 +773,38 @@ bool load_control_vectors(const Options& o, const strata::core::ModelGeometry& g
     return true;
 }
 
+// PR #44: the effective host->device bandwidth of the PCIe link, measured once so the native pack's PCIe
+// share of the missed experts can shrink on a slow link.  The 0.55 default was measured on x16 links; the
+// GPU's SMs read that share over the link, so a x8 link (half the bandwidth) must not carry the same share.
+double probe_pcie_h2d_gbps() {
+    constexpr size_t kBytes = 256ull << 20;
+    constexpr int kIters = 4;
+    void* h = nullptr;
+    void* d = nullptr;
+    hipEvent_t ev0, ev1;
+    if (hipHostMalloc(&h, kBytes) != hipSuccess) return -1.0;
+    if (hipMalloc(&d, kBytes) != hipSuccess || hipEventCreate(&ev0) != hipSuccess ||
+        hipEventCreate(&ev1) != hipSuccess) {
+        if (d != nullptr) hipFree(d);
+        hipHostFree(h);
+        return -1.0;
+    }
+    std::memset(h, 0, kBytes);   // fault the pages in before timing
+    hipMemcpyAsync(d, h, kBytes, hipMemcpyHostToDevice, nullptr);   // warmup: context up, copy engine primed
+    hipEventRecord(ev0, nullptr);
+    for (int i = 0; i < kIters; ++i) hipMemcpyAsync(d, h, kBytes, hipMemcpyHostToDevice, nullptr);
+    hipEventRecord(ev1, nullptr);
+    const bool ok = hipEventSynchronize(ev1) == hipSuccess;
+    float ms = 0.f;
+    const bool timed = ok && hipEventElapsedTime(&ms, ev0, ev1) == hipSuccess && ms > 0.01f;
+    const double bw = timed ? ((double) kIters * (double) kBytes / (ms * 1e-3)) / 1e9 : -1.0;
+    hipEventDestroy(ev0);
+    hipEventDestroy(ev1);
+    hipFree(d);
+    hipHostFree(h);
+    return bw;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1104,8 +1136,25 @@ int main(int argc, char** argv) {
         }
     }
     const bool native_pack = strata::kernels::cpu::expert_layout().native;
-    // plan v0.3 P6: the PCIe share of the missed experts, measured per kind of pack (the paper, finding on PCIe)
-    if (o.pcie_frac < 0.0) o.pcie_frac = native_pack ? 0.55 : 0.2;
+    // plan v0.3 P6: the PCIe share of the missed experts, measured per kind of pack (the paper, finding on PCIe).
+    // PR #44: a x8 link carries half of what the native default assumes - the GPU's SMs read that share over the
+    // link (the copy kernel, since 0.1.14), so on a slower link it must shrink or the window waits for it.  The
+    // real H2D bandwidth is probed once; from 20 GB/s up (x16 PCIe 4/5) the measured default stays.  The canonical
+    // pack's 0.2 was never measured against the link, so it is left alone.
+    if (o.pcie_frac < 0.0) {
+        const double base = native_pack ? 0.55 : 0.2;
+        const double bw = native_pack ? probe_pcie_h2d_gbps() : -1.0;
+        if (!native_pack) {
+            o.pcie_frac = base;
+        } else if (bw > 0.0) {
+            o.pcie_frac = bw >= 20.0 ? base : std::min(base, std::max(0.05, base * (bw / 26.0)));
+            std::fprintf(stderr, "strata generate: PCIe probe: %.1f GB/s host->device -> pcie_frac %.2f (default %.2f)\n",
+                         bw, o.pcie_frac, base);
+        } else {
+            o.pcie_frac = base;
+            std::fprintf(stderr, "strata generate: PCIe probe failed -> pcie_frac default %.2f\n", base);
+        }
+    }
     // the canonical Q2_0 pack's CPU kernels are AVX-512 only; a native pack runs on AVX2 CPUs as well
     if (!native_pack) strata::kernels::cpu::cpu_require_expert_support();
     else if (!strata::kernels::cpu::cpu_avx512_ok())
@@ -1217,7 +1266,20 @@ int main(int argc, char** argv) {
     // The artifact is authoritative over the engine default: a 288-expert Flash-Next pack must not be run
     // through the compiled-in 512.  expert_layout_load() above already resolved this from the pack manifest.
     g.n_expert = strata::kernels::cpu::expert_layout().n_expert;
-    const int64_t K = 10;
+    int64_t K = 10;
+    if (!o.native_preset.empty()) {
+        // a pruned variant (GSQ-RCO Coder) ships fewer experts than the canonical 512x10; the model file
+        // is the authority on its own MoE shape - everything else in the geometry is unchanged
+        try {
+            strata::GgufFile model_gguf(o.native_preset);
+            if (const strata::MetaValue* v = model_gguf.get("qwen4exp.expert_count")) g.n_expert = (int64_t) v->u;
+            if (const strata::MetaValue* v = model_gguf.get("qwen4exp.expert_used_count")) K = (int64_t) v->u;
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "strata generate: reading the model's expert shape from %s: %s\n",
+                         o.native_preset.c_str(), e.what());
+            return 1;
+        }
+    }
     // before session_init: every graph captured from here on has the vector's kernels where it applies
     std::string cvec_summary = "0";
     if (!o.cvec_files.empty()) {
