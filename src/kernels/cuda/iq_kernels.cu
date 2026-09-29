@@ -498,17 +498,20 @@ __global__ void quantize_q8_1_kernel(const float* __restrict__ x, block_q8_1* __
     const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     const float xi = x[i];
-    float amax = fabsf(xi), sum = xi;
+    float amax = fabsf(xi);
 #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) {
-        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffffffffffull, amax, o));
-        sum += __shfl_xor_sync(0xffffffffffffffffull, sum, o);
-    }
+    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffffffffffull, amax, o));
     const float d = amax / 127.0f;
-    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+    const int8_t q = amax == 0.0f ? (int8_t) 0 : (int8_t) roundf(xi / d);
+    // ggml's q8_1 `s` is d * sum(quantized q), not the sum of the raw inputs: the Q4_0/Q5_0/K-quant
+    // dots subtract a closed-form bias times this term, so a raw-input sum leaves the bias partly
+    // uncancelled (the Q5_0 expert-down projection drifted ~4e-2 on the layers whose experts are Q5_0).
+    int sum = q;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffffffffffull, sum, o);
     const long long ib = i / 32, iqs = i % 32;
     y[ib].qs[iqs] = q;
-    if (iqs == 0) y[ib].ds = make_half2(d, sum);
+    if (iqs == 0) y[ib].ds = make_half2(d, d * (float) sum);
 }
 
 // ---------------------------------------------------------------- dequant (dequantize.cuh)
