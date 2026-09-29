@@ -75,7 +75,16 @@ constexpr int STAGE = 8;           // host->device expert staging ring (chunks b
 // RING_MAX-slot ring (nearly all 512 are routed at such a chunk), so the copy engine keeps working through the
 // attention halves instead of waiting for each layer's routing.
 constexpr int RING_MAX = 512;           // the arrays; the ring itself is ring_slots()
-constexpr int64_t STREAM_ALL_MIN = 2048;
+// The chunk size at/above which every non-resident expert streams through the ring instead of the resident path.
+// The measured optimum is format-dependent (Q2_0 streams well; IQ2_S was faster resident), so it is tunable:
+// STRATA_STREAM_ALL_MIN overrides (a huge value keeps large chunks on the resident/direct path).
+inline int64_t stream_all_min() {
+    static const int64_t v = [] {
+        const char* e = std::getenv("STRATA_STREAM_ALL_MIN");
+        return e ? (int64_t) std::atoll(e) : (int64_t) 2048;
+    }();
+    return v;
+}
 double g_pinned_share = 1.0;
 // The streamed ring: 384 slots when (nearly) every streamed expert is DMA'd from pinned RAM - measured on Q2_0,
 // 8192-token chunks: 96 slots 1153 tok/s, 384 1294 (the next layer's experts arrive during its attention half) -
@@ -85,7 +94,7 @@ inline int ring_slots(size_t T) {
     const char* v = std::getenv("STRATA_PREFILL_RING");
     const int r = v ? std::atoi(v) : (g_pinned_share >= 0.9 ? 384 : 96);
     const int big = r < 16 ? 16 : r > RING_MAX ? RING_MAX : r;
-    return (int64_t) T >= STREAM_ALL_MIN ? big : STAGE;
+    return (int64_t) T >= stream_all_min() ? big : STAGE;
 }
 constexpr int DQ = 2;              // dequantized-expert ring (FP16 gate/up + down)
 
@@ -883,7 +892,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         // k lands in ring slot k % ring); a copy is issued once the entry `ring` before it is consumed (its slot's
         // `used` event recorded), so the copy stream never waits on an event that is not queued yet
         const strata::kernels::cpu::ExpertLayout& lay0 = strata::kernels::cpu::expert_layout();
-        const bool stream_all = m.ring > STAGE && T >= STREAM_ALL_MIN && m.src != nullptr;
+        const bool stream_all = m.ring > STAGE && T >= stream_all_min() && m.src != nullptr;
         struct StreamEntry { int32_t l, e; const uint8_t* blob; int job; };
         std::vector<StreamEntry> seq;
         std::vector<size_t> seq_start;

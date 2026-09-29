@@ -640,6 +640,32 @@ Targets: prefill 800 tok/s (**met on large chunks**), decode 40+ (**open**).
 | 9 | **[LIT-7] FP4/FP8 expert weights** | cuts PCIe bytes only above ~4 bpw; subordinate to #3 | open |
 | 10 | **KV cache in VRAM** (block layout) | keep KV from displacing the expert hot set | open |
 
+## 13. Measured scores (gfx1201, RX 9070 XT, PCIe 4.0 x16)
+
+All runs: Qwen3.8-Flash-Next Swift (IQ2_XS, 512 experts) via the native pack, `--expert-cache 2600
+--expert-profile data/expert-profile.bin`.
+
+| path | config | result | note |
+|------|--------|--------|------|
+| prefill, 39 tok | baseline (pre-fix) | 1153 ms / 33 tok/s | |
+| prefill, 39 tok | + warm-up + VRAM-cache read (§11.8) | **485 ms / 80 tok/s** | 2.4x; small-chunk, PCIe-dominated (~8 GiB for 39 tok) |
+| prefill, 2047 tok | default (`stream_all`) | 2168 ms / **943 tok/s** (871 e2e) | real prompt; experts mostly resident |
+| prefill, 4096 tok | default (`stream_all`) | 579 tok/s | crosses `STREAM_ALL_MIN`, expert DMA streaming |
+| prefill, 4096 tok | **resident** (`STRATA_STREAM_ALL_MIN` high) | **1191.8 tok/s** | **2.06x vs streaming; above the 800 tok/s target** |
+| decode, 48 tok | `--spec 2` | **22.1 tok/s** | best; `--spec 4` 19.3, `--spec 6` 16.5 |
+| coherence | real question via tokenizer | correct `<think>…</think>` + `def add(a, b): return a + b` | **model verified coherent** |
+
+**Headline:** prefill target (800 tok/s) is **met and exceeded** (943–1192 tok/s depending on chunk);
+the 80 tok/s figure was the 39-token-chunk artifact. Decode (22 tok/s) is the one open category vs the
+40+ target. New tuning knob: `STRATA_STREAM_ALL_MIN` — the resident path is ~2x faster than the streamed
+ring for IQ2_S at large chunks, so keep large chunks resident unless the streamed ring measured faster
+for the format (it does for Q2_0).
+
+**Known correctness bug:** under `--spec` the generator does not stop at `<|im_end|>` (248046) /
+`<|endoftext|>` (248044) — it runs to `--max-new` and degenerates into `<|im_start|>` repetition after a
+correct answer. The answer itself is coherent.
+
+
 
 
 
