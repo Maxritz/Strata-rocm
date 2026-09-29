@@ -306,6 +306,19 @@ namespace {
 // streamed run lends the prompt path exactly the slots a resident one does (a lent expert runs on the CPU, which
 // rounds differently: without this an A/B compares two expert placements as well as two KV placements)
 bool stage_own() { static const bool v = std::getenv("STRATA_KV_STAGE_OWN") != nullptr; return v; }
+// Prefill reads a pinned expert straight from the arena's REBAR device alias in the gather/dequant, with no
+// host->device staging DMA and no copy stream.  Measured on Swift (gfx1201): the staged path's `wait copy`
+// alone was ~30% of the prompt and the gather another ~21%; the direct read halves the prefill (2341 -> 1222 ms
+// for 39 tokens) with bit-identical output.  Default ON; `STRATA_PREFILL_DIRECT=0` restores the DMA staging
+// (the A/B arm).  Only the short chunk path: an expert with no device alias still stages, and `--prefill >= 2048`
+// keeps the streamed walk.
+bool pf_direct() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_PREFILL_DIRECT");
+        return v == nullptr || std::string(v) != "0";
+    }();
+    return on;
+}
 void take_stage(Alloc& o_borrowed, const core::SessionState& ss, const strata::kernels::QsaShapes& s,
                 strata::kernels::KvHostPools& st, bool& ok) {
     const core::QsaState& q0 = ss.qsa_states[0];
@@ -1185,6 +1198,8 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         const int32_t e = order[j];
                         const bool resident = m.host_res && m.cache && m.host_res[(size_t) l * NE + e] >= 0;
                         if (resident) return true;
+                        // direct: the compute reads the arena alias over PCIe, so nothing is staged here
+                        if (pf_direct() && m.src->device_alias(l, e) != nullptr) return true;
                         const int sl = stage_next;
                         stage_next = (stage_next + 1) % STAGE;
                         const auto th = Clock::now();
@@ -1281,8 +1296,15 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             }
                             const int32_t e = order[j];
                             if (stage_of[j] < 0) {
-                                ++stats_.experts_resident;
-                                if (!compute(j, m.cache->device_slot(m.host_res[(size_t) l * NE + e]), -1)) return false;
+                                // not staged: a VRAM-resident expert (its slot) or a direct read of the arena alias
+                                const uint8_t* alias = pf_direct() ? m.src->device_alias(l, e) : nullptr;
+                                if (alias != nullptr) {
+                                    ++stats_.experts_resident;
+                                    if (!compute(j, alias, -1)) return false;
+                                } else {
+                                    ++stats_.experts_resident;
+                                    if (!compute(j, m.cache->device_slot(m.host_res[(size_t) l * NE + e]), -1)) return false;
+                                }
                             } else {
                                 pt.mark(kPfWaitCopy, cs);
                                 hipStreamWaitEvent(m.cs, m.copied[stage_of[j]], 0);
