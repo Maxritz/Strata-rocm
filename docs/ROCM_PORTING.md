@@ -621,6 +621,26 @@ needs retraining, nothing on expert offload; Complete-muE (2605.23893) — train
 2604.07035 — an accuracy-efficiency benchmark with no systems technique; QStore (2505.04081) — lossless
 joint high/low-precision storage, not a speed lever.
 
+## 12. Optimization backlog (TODO)
+
+Measured baseline on the 39-token and large-chunk Swift prompts (gfx1201, RDNA4): short-chunk prefill
+80 tok/s, **large-chunk prefill 944 tok/s (2047 tokens, generate) / 871 e2e**, decode **12.6 tok/s**.
+Targets: prefill 800 tok/s (**met on large chunks**), decode 40+ (**open**).
+
+| # | item | why | status |
+|---|------|-----|--------|
+| 1 | **Adaptive chunk sizing** so short prompts stop being PCIe-dominated | a 39-tok chunk reads ~8 GiB for 39 tok; a >=512-tok chunk amortizes | in progress |
+| 2 | **Decode to 40+ tok/s**: spec-decode (MTP / `--spec`), resident hot experts for the verify pass, CPU-pool-vs-GPU split | decode is now the only category below target | open |
+| 3 | **[LIT-1] Q2_0 Swift quant, A/B vs IQ2_XS** | GSQ-RCO card: 367 vs 108 prompt tok/s on the same model — lookup-table decode dominates | open |
+| 4 | **Fix `--expert-cache-per-layer` `verify_slot` abort** | unblocks per-layer residency | open |
+| 5 | **[LIT-4] Tiered residency + routing-predicted prefetch** (hot VRAM / warm arena / cold disk) | only lever that beats the PCIe link | open |
+| 6 | **[LIT-3] Co-activation-ordered expert packing** (ZipMoE) | clean PCIe bursts for co-routed top-10 | open |
+| 7 | **[LIT-5] Per-expert mixed precision + routing-preserving quant** | keep the Top-10 *set* stable under re-quant | open |
+| 8 | **[LIT-6] Fuse gate/up/down into one expert kernel** (Mega-MoE) | fewer launches, less traffic | open |
+| 9 | **[LIT-7] FP4/FP8 expert weights** | cuts PCIe bytes only above ~4 bpw; subordinate to #3 | open |
+| 10 | **KV cache in VRAM** (block layout) | keep KV from displacing the expert hot set | open |
+
+
 
 
 
