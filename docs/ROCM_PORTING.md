@@ -496,3 +496,55 @@ Use type punning: (const char4&)a casts the int to char4 without changing the bi
 - Run, decode the generated IDs via the inverted vocab.
 - Compare per-token top-1 logits against a llama.cpp/gguf run on the SAME GGUF (`llama-cli --model <GGUF> --temp 0`). The single decisive metric separating "coherent but slow" from "broken logits": **top-1 token agreement** — the target engine's greedy next token must equal llama.cpp's at each step. Mismatches = a correctness bug; all-pass = coherent.
 
+### 11.8 Prompt-path perf: rocBLAS warm-up + cache-preferring reads (commit a6949a0)
+
+`STRATA_PREFILL_TIMING=1` now reports, per phase, GPU-elapsed **and host-elapsed** (`gpu/host ms`),
+per-call host stopwatches (`need`, `proj.bf16`, `proj.native`, `grp.*`) and the expert PCIe volume.
+That instrumentation pinned the following on the 39-token Swift prompt (`--prefill 128`,
+`--expert-cache 2600 --expert-profile data/expert-profile.bin`):
+
+- **A one-time rocBLAS BF16/FP16 init was landing on the first token.** Of 432 `proj.bf16` calls exactly
+  one exceeded 5 ms and it was **346 ms** (likewise one 281 ms `proj.native`); every other call was
+  ~0.04 ms. `Gemm::warmup` now runs a throwaway BF16 and FP16 GEMM in `Prefill::init`, so the init is
+  paid at load: **prefill 1153 -> 566 ms**.
+- **Resident experts were read over PCIe even when already in the VRAM cache.** The direct path checked
+  the arena's REBAR `device_alias` first; it now prefers the cache slot when `host_res >= 0`:
+  **566 -> 485 ms**.
+- Net: **1153 -> 485 ms, 33 -> 80 tok/s (~2.4x)** on the short prompt.
+
+**The bottleneck is the PCIe link, and it is saturated.** The profile shows the expert gather (`dequant`
+phase) at ~280 ms carrying 8.0 GiB — i.e. **30.4 GB/s**. This box is **X570 + Ryzen 9 5900XT = PCIe 4.0
+x16** (~32 GB/s theoretical, ~28-30 usable), and ReBAR is active (`local heap 15.922 GB, invisible heap
+0 B`). A micro confirmed a single in-kernel BAR read runs at 26 GB/s, and that `hipMemcpy` from the
+mapped arena is **elided (no-op)** — there is no copy-engine path; the kernel BAR read is the only
+mechanism. So:
+
+- **Concurrent/parallel reads cannot help** — the link is the limit.
+- **Overlapping the gather with the MMQ does not help either**: a double-buffered version (gathers on
+  the copy stream, `gather_ev`/`mmq_ev` handoff, 2x group slots) measured **524 ms vs 485 ms — a
+  regression** (the two streams contend for the same saturated link and SMs) and was reverted.
+- Only **reading fewer bytes** helps — the tiered cache (`--expert-cache`/`host_res` in VRAM, the pinned
+  arena in RAM, the pack on disk) — and only on **reuse** (multi-chunk / multi-turn / decode). A cold
+  single chunk genuinely needs its ~8 GiB, so ~458 ms is near its floor.
+
+**External GPU profilers are unavailable on this Windows + RDNA4 stack** (recorded so it is not
+re-litigated):
+
+- **AMDuProf GPU profiling is Windows-unsupported** — AMD's own feature matrix lists GPU
+  Profiling/Tracing as Linux-only; `collect --config gpu_sol` errors *"GPU Profiling is not supported on
+  this System"*. (µProf CPU profiling does work; its help ships as text files under
+  `AMDuProf\bin\Help\text\`, so never call `-h`, which pages the console.)
+- `rocprofiler-sdk` / `rocprofv3` and `rocgdb` are Linux-only; TheRock (`G:\rocm-10\CMakeLists.txt:215`)
+  forces `THEROCK_FLAG_INCLUDE_PROFILER` **OFF on WIN32**; AMD's component table lists the Windows
+  profiler as **RGP**. `rocgdb` (`C:\ROCm72\bin\rocgdb.exe`) is `GNU gdb (ROCm)` — a debugger, no
+  profile commands.
+- **RGP** does support HIP on RX 9000 / Windows 11, but its Radeon Developer Panel would not connect to
+  this ROCm-HIP binary (tried hosted and elevated, and a trivial HIP micro; the RDP service/router comes
+  up but no app connects). Live per-kernel GPU timing therefore comes from the engine's own
+  `STRATA_PREFILL_TIMING`.
+
+**Known issue**: `--expert-cache-per-layer` aborts with
+`ExpertCache::verify_slot: slot 0 differs from the arena at byte 0` (the profile has 24576 ranked pairs
+vs 5243 per-layer slots), so per-layer admission is currently unusable.
+
+
