@@ -681,11 +681,13 @@ namespace {
 // the time between two consecutive marks is charged to the phase of the first, so a gap where the GPU waits (for the
 // host's expert grouping, or for an expert's copy) lands on the phase that was waiting.  Events are reused: the marks
 // are folded at every MoE layer's host sync, after which all of them have completed.
-enum PfPhase { kPfStart, kPfHc, kPfGdn, kPfQsa, kPfQsaIdx, kPfQsaSel, kPfQsaAttn, kPfRouter, kPfHostGroup, kPfGather,
-               kPfWaitCopy, kPfDequant, kPfGemmGU, kPfGemmD, kPfCombine, kPfPle, kPfCount };
-const char* const kPfNames[kPfCount] = {"embed+steps", "hc read", "gdn", "qsa proj", "qsa indexer", "qsa select",
-                                        "qsa attn", "router+shared", "host grouping", "gather", "wait copy", "dequant",
-                                        "gemm gate/up", "gemm down", "combine", "ple"};
+enum PfPhase { kPfStart, kPfHc, kPfGdn, kPfGdnGates, kPfGdnConv, kPfGdnRec, kPfQsa, kPfQsaIdx, kPfQsaSel, kPfQsaAttn,
+               kPfRouter, kPfHostGroup, kPfGather, kPfWaitCopy, kPfDequant, kPfMmqGu, kPfSwiglu, kPfQuant, kPfMmqD,
+               kPfCombine, kPfPle, kPfCount };
+const char* const kPfNames[kPfCount] = {"embed+steps", "hc read", "gdn proj", "gdn gates", "gdn conv", "gdn rec",
+                                        "qsa proj", "qsa indexer", "qsa select", "qsa attn", "router+shared",
+                                        "host grouping", "gather", "wait copy", "dequant", "mmq gu", "swiglu",
+                                        "quant h", "mmq down", "combine", "ple"};
 struct PfTimer {
     bool on = std::getenv("STRATA_PREFILL_TIMING") != nullptr;
     std::vector<hipEvent_t> ev;
@@ -957,9 +959,13 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     if (!native_proj(m.gemm, wg, m.mixed_h, m.z, T, v.name("attn_gate.weight"), err)) return false;
                     if (!bf16_proj(m.gemm, wa, m.mixed_bf, m.ab, T, v.name("ssm_alpha.weight"), err, 2 * HV)) return false;
                     if (!bf16_proj(m.gemm, wb, m.mixed_bf, m.ab + HV, T, v.name("ssm_beta.weight"), err, 2 * HV)) return false;
+                    pt.mark(kPfGdnGates, cs);
                     gdn_gates(m.ab, (const float*) wdt->data, (const float*) wsa->data, m.gate, m.beta, T, m.cs);
+                    pt.mark(kPfGdnConv, cs);
                     gdn_conv(conv, m.qkv, (const float*) wc->data, m.hbuf, T, EPS, m.cs);
+                    pt.mark(kPfGdnRec, cs);
                     gdn_recurrence(state, m.hbuf, m.gate, m.beta, m.z, (const float*) wnm->data, EPS, m.y, m.y_h, T, m.cs);
+                    pt.mark(kPfGdn, cs);
                     if (!native_proj(m.gemm, wo, m.y_h, m.bo, T, v.name("ssm_out.weight"), err)) return false;
                     ++gdn_index;
                 } else if (half == 0) {
@@ -1247,7 +1253,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             const int64_t r0 = m.bounds_host[j0], nr = m.bounds_host[j + 1] - r0;
                             int64_t maxr = 0;
                             for (size_t i = j0; i <= j; ++i) maxr = std::max<int64_t>(maxr, m.cnt[(size_t) order[i]]);
-                            pt.mark(kPfGemmGU, cs);
+                            pt.mark(kPfMmqGu, cs);
                             // the zeroed tail after the group's last expert (see MMQ_TAIL)
                             hipMemsetAsync(m.grp_gu + (size_t) ngx * mmq_gub, 0, MMQ_TAIL, m.cs);
                             hipMemsetAsync(m.grp_d + (size_t) ngx * mmq_db, 0, MMQ_TAIL, m.cs);
@@ -1256,14 +1262,16 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             gu.n = ngx; gu.xq = m.Xq; gu.bounds = m.bounds_dev + j0; gu.ids = m.ids_identity;
                             gu.total_rows = T * K; gu.max_rows = maxr; gu.dst = m.GU; gu.ld_dst = 1280;
                             m.mmq_ctx->run(gu, m.cs);
+                            pt.mark(kPfSwiglu, cs);
                             mmq::swiglu(m.GU + r0 * 1280, m.H + r0 * 640, nr, 640, !lay.native, m.cs);
-                            pt.mark(kPfGemmD, cs);
+                            pt.mark(kPfQuant, cs);
                             mmq::quantize(m.H + r0 * 640, nullptr, m.Hq, mmq_dt, 640, 640, nr, m.cs);
                             mmq::Product dn;
                             dn.w = m.grp_d; dn.type = mmq_dt; dn.w_rows = N; dn.w_cols = 640; dn.expert_bytes = mmq_db;
                             dn.n = ngx; dn.xq = m.Hq; dn.bounds = m.bounds_dev + n + 1 + g * (MMQ_GROUP + 1);
                             dn.ids = m.ids_identity; dn.total_rows = nr; dn.max_rows = maxr; dn.dst = m.Dm + r0 * N;
                             dn.ld_dst = N;
+                            pt.mark(kPfMmqD, cs);
                             m.mmq_ctx->run(dn, m.cs);
                             return true;
                         }
@@ -1279,10 +1287,11 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         }
                         if (slot >= 0) hipEventRecord(m.used[slot], m.cs);
                         const int64_t o0 = m.off[(size_t) e], ne = m.cnt[(size_t) e];
-                        pt.mark(kPfGemmGU, cs);
+                        pt.mark(kPfMmqGu, cs);
                         m.gemm.f16(m.Xs + o0 * N, m.dq_gu[q], m.GU + o0 * 1280, ne, 1280, N);
+                        pt.mark(kPfSwiglu, cs);
                         swiglu_interleaved(m.GU + o0 * 1280, m.Hh + o0 * 640, ne, m.cs);
-                        pt.mark(kPfGemmD, cs);
+                        pt.mark(kPfMmqD, cs);
                         m.gemm.f16(m.Hh + o0 * 640, m.dq_d[q], m.Dm + o0 * N, ne, N, 640);
                         return true;
                     };
