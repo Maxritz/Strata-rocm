@@ -553,12 +553,13 @@ Grounded in the §11.8 measurements: PCIe 4.0 x16 (~30 GB/s) is the hard link, 1
 experts, ~1.5 GiB dense, 2-4 GB KV. This section is the converged result of a delegated 3-agent debate
 (Poolside), corrected against the measured facts.
 
-**Prefill 800 tok/s is a LARGE-CHUNK target and is nearly met already.** The per-chunk expert read is
+**Prefill 800 tok/s is a LARGE-CHUNK target and is already met.** The per-chunk expert read is
 paid once per layer and then reused across the chunk, so throughput scales with chunk length:
-a 39-token chunk reads ~8 GiB for 39 tokens (PCIe-bound, 80 tok/s), while a 2119-token chunk amortizes
-those same classes of reads over 54x the tokens (measured **628 tok/s pre-warm-up**, ~770 with the §11.8
-warm-up). The 80 tok/s figure is a short-chunk artifact, not the model's ceiling. Amortization:
-unique-experts/token falls from ~5.4 (39 tok) to ~0.14 (2048 tok, all 288 experts/layer).
+a 39-token chunk reads ~8 GiB for 39 tokens (PCIe-bound, 80 tok/s), while a 2047-token chunk amortizes
+those same classes of reads over ~52x the tokens — **measured 943.4 tok/s generate (871 tok/s
+end-to-end) for 2047 tokens after the §11.8 warm-up**. The 80 tok/s figure is a short-chunk artifact,
+not the model's ceiling. Amortization: unique-experts/token falls from ~5.4 (39 tok) to ~0.14 (2048 tok,
+all 288 experts/layer). The open target is now **decode, measured 12.6 tok/s** (see action 4).
 
 **Ranked actions (highest ceiling first):**
 
