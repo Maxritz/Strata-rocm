@@ -584,5 +584,42 @@ contend for the same saturated link and SMs; overlap only helps if the overlappe
 of the read (e.g. the next layer's dense/attention), which is unproven here. Their VRAM budgets
 (>12 GB for experts) are also infeasible on 16 GB.
 
+### 11.10 Literature scan: borrowable techniques
+
+Evaluated: ISTA-DASLab GSQ-RCO model card (the Swift GGUF family), the Qwen3.8-Flash-Next architecture
+deep-dive, and arXiv 2609.19969 (DeepSeek-V4.1-Flash KV compression), 2609.26368 (HySparse2),
+2607.20981 (edge MoE efficiency survey), 2605.23893 (Complete-muE), 2604.07035 (dense/MoE
+accuracy-efficiency benchmark), 2505.04081 (QStore).
+
+**Directly applicable, ranked:**
+
+1. **Quant format is a first-order prefill lever — `Q2_0` over `IQ2_XS`.** The GSQ-RCO card measures, on
+   the same 512-expert / 48-layer model, **367.49 vs 108.19 prompt tok/s** and 93.79 vs 70.30 decode tok/s
+   (`Q2_0` vs `IQ2_XS`): "decoding them costs real time, and on this model that cost dominates
+   inference." `Q2_0` is block-64 with no per-format lookup tables. Strata's Swift run uses `IQ2_XS`
+   while the reap-288 pack uses `Q2_0`, so a `Q2_0` Swift build is the cheapest big prefill win.
+2. **Speculative decoding for TG 40+.** Qwen ships a 4B MTP head (1 layer + LM head, QSA attention) for
+   spec decode; DSpark (2609.19969) adds confidence-scheduled verification length. Strata already has
+   `--spec`; for a MoE, verifying k tokens per expert-weight fetch also amortizes the PCIe transfer.
+3. **Co-activation-ordered expert layout** (ZipMoE, via 2607.20981): pack frequently co-routed top-10
+   experts contiguously so PCIe reads are clean bursts (the survey cites up to 72.77% latency reduction).
+4. **Routing-predicted prefetch + hot-cold hierarchy** (2607.20981; DeepSeek-V4.1 Engram, 2609.19969):
+   prefetch the next layer's predicted experts while computing; pin non-expert weights + the hottest
+   experts in VRAM. `--expert-profile` already predicts; it needs to drive a prefetch, not just admission.
+5. **Per-expert mixed precision + routing-preserving quantization** (2607.20981): more bits on
+   rare-critical experts, fewer on routine ones; keep the router logits precise so the Top-10 *set* is
+   stable when experts are re-quantized.
+6. **Fuse gate/up/down into one expert kernel** (Mega-MoE, 2609.19969) — Strata runs MMQ gu, swiglu and
+   MMQ down as separate launches today.
+7. **FP4/FP8 expert weights** (2609.19969) cut PCIe bytes 2-4x *only above ~4 bpw*; at Strata's 2.5 bpw
+   the expert bytes are already near-minimal, so this matters only through item 1 (a cheaper-to-decode
+   format may be slightly larger yet faster).
+
+**Not applicable** (recorded so it is not re-checked): HySparse2 (2609.26368) — attention/KV architecture,
+needs retraining, nothing on expert offload; Complete-muE (2605.23893) — training hyperparameters;
+2604.07035 — an accuracy-efficiency benchmark with no systems technique; QStore (2505.04081) — lossless
+joint high/low-precision storage, not a speed lever.
+
+
 
 
