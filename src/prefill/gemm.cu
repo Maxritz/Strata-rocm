@@ -51,6 +51,27 @@ void Gemm::rebind(uint16_t* scratch, int64_t scratch_elems, void* workspace, siz
     hipblasSetWorkspace((hipblasHandle_t) handle_, workspace_, ws_bytes);
 }
 
+bool Gemm::warmup(std::string& err) {
+    // The first hipblasGemmEx of each type (BF16 and FP16) pays a one-time rocBLAS cost (kernel selection / lazy
+    // init) of a few hundred ms; paying it here, at load, keeps it off the first token.  Self-contained: a small
+    // throwaway GEMM of each type on the handle's own stream.
+    if (!handle_) { err = "prefill gemm: warmup before init"; return false; }
+    const int64_t T = 8, N = 64, K = 64;
+    const size_t bytes = (size_t) (T * K + N * K) * 2 + (size_t) N * T * 4;
+    void* buf = nullptr;
+    if (hipMalloc(&buf, bytes) != hipSuccess) { err = "prefill gemm: warmup alloc"; return false; }
+    hipStream_t s = (hipStream_t) stream_;
+    uint16_t* X = (uint16_t*) buf;
+    uint16_t* W = X + T * K;
+    float* Y = (float*) (W + N * K);
+    hipMemsetAsync(buf, 0, bytes, s);
+    bf16(X, W, Y, T, N, K);
+    f16(X, W, Y, T, N, K);
+    if (hipStreamSynchronize(s) != hipSuccess) { err = "prefill gemm: warmup sync"; hipFree(buf); return false; }
+    hipFree(buf);
+    return true;
+}
+
 bool Gemm::init(void* stream, int64_t scratch_elems, std::string& err) {
     hipblasHandle_t h = nullptr;
     if (hipblasCreate(&h) != HIPBLAS_STATUS_SUCCESS) { err = "prefill gemm: hipblasCreate failed"; return false; }
@@ -73,6 +94,7 @@ bool Gemm::init(void* stream, int64_t scratch_elems, std::string& err) {
 void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
                 float beta) {
     if (T <= 0 || N <= 0) return;
+    if (std::getenv("STRATA_GEMM_DEBUG")) std::fprintf(stderr, "GEMM bf16 T=%lld N=%lld K=%lld\n", (long long) T, (long long) N, (long long) K);
     if (ldy <= 0) ldy = N;
     const float alpha = 1.0f;
     // Column-major view: Y^T[N, T] = W[N, K] (stored K x N col-major, transposed) . X^T[K, T].
@@ -85,6 +107,7 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
 void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
                float beta) {
     if (T <= 0 || N <= 0) return;
+    if (std::getenv("STRATA_GEMM_DEBUG")) std::fprintf(stderr, "GEMM f16  T=%lld N=%lld K=%lld\n", (long long) T, (long long) N, (long long) K);
     if (ldy <= 0) ldy = N;
     const float alpha = 1.0f;
     ck(hipblasGemmEx((hipblasHandle_t) handle_, HIPBLAS_OP_T, HIPBLAS_OP_N, (int) N, (int) T, (int) K, &alpha, W,

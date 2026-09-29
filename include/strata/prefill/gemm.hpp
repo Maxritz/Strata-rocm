@@ -39,6 +39,11 @@ public:
     /// Caller-owned buffers only: the scratch and workspace moved (the prompt path laid its buffers out again).
     void rebind(uint16_t* scratch, int64_t scratch_elems, void* workspace, size_t ws_bytes);
 
+    /// Force rocBLAS to initialize its BF16 and FP16 GEMM kernels now.  The first call of each type is a one-time
+    /// ~300 ms cost (kernel selection / lazy init) that otherwise lands on the first token; warming it at load time
+    /// hides it under the model I/O.  Needs the scratch/workspace to be bound (init_external/rebind).
+    bool warmup(std::string& err);
+
     uint16_t* scratch() const { return scratch_; }
     int64_t scratch_elems() const { return scratch_elems_; }
     void* stream() const { return stream_; }

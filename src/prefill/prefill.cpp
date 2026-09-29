@@ -33,8 +33,10 @@
 #include <condition_variable>
 #include <cstring>
 #include <future>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -507,6 +509,8 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         err = "prefill: device buffers for a chunk of " + std::to_string(chunk) + " tokens do not fit";
         return false;
     }
+    // Pay the one-time rocBLAS BF16/FP16 init here, at load, instead of on the first token (see Gemm::warmup).
+    if (!m.gemm.warmup(err)) return false;
     return true;
 }
 
@@ -656,19 +660,69 @@ uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::Session
 
 namespace {
 
+// STRATA_PREFILL_TIMING: host-side stopwatches for the prompt path's blocking calls.  The phase timer above
+// shows *where* the wall time goes; these name the exact call (weight fetch, projection launch, grouping D2H
+// sync) so a 100+ ms stall identifies itself instead of being inferred.
+struct HostStat { double sum = 0; long long n = 0; double mx = 0; long long big = 0; };
+double& pf_pcie_bytes() { static double b = 0; return b; }
+std::map<std::string, HostStat>& host_stat_tab() {
+    static std::map<std::string, HostStat> t;
+    return t;
+}
+bool host_timing() {
+    static const bool v = std::getenv("STRATA_PREFILL_TIMING") != nullptr;
+    return v;
+}
+void host_add(const std::string& n, double ms) {
+    auto& e = host_stat_tab()[n];
+    e.sum += ms;
+    ++e.n;
+    if (ms > e.mx) e.mx = ms;
+    if (ms > 5.0) ++e.big;   // a stall worth naming
+}
+struct HostTimer {
+    const std::string n;
+    std::chrono::steady_clock::time_point t0;
+    bool on;
+    explicit HostTimer(const char* name) : n(name), on(host_timing()) {
+        if (on) t0 = std::chrono::steady_clock::now();
+    }
+    ~HostTimer() {
+        if (on) host_add(n, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    }
+};
+void host_report() {
+    if (host_stat_tab().empty()) return;
+    std::vector<std::pair<std::string, HostStat>> v(host_stat_tab().begin(), host_stat_tab().end());
+    std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.second.sum > b.second.sum; });
+    std::string line;
+    char b[200];
+    for (const auto& e : v) {
+        if (e.second.sum < 5.0) continue;   // only the calls that matter
+        std::snprintf(b, sizeof b, " %s sum=%.0f n=%lld max=%.1f big=%lld", e.first.c_str(), e.second.sum, e.second.n,
+                      e.second.mx, e.second.big);
+        line += b;
+    }
+    std::fprintf(stderr, "strata prefill host calls:%s\n", line.c_str());
+    host_stat_tab().clear();
+}
+
 const core::WeightRef* need(const core::LayerView& v, const char* suffix, std::string& err) {
+    HostTimer ht("need");
     const core::WeightRef* r = v.get(suffix);
     if (!r) err = v.name(suffix) + " is missing";
     return r;
 }
 bool native_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y, int64_t T, const std::string& name,
                  std::string& err, int64_t ldy = 0) {
+    HostTimer ht("proj.native");
     if (!w->native_data) { err = "prefill: " + name + " has no native GGUF blocks (run with --native)"; return false; }
     gm.native(X, w->native_type, w->native_data, Y, T, w->ne1, w->ne0, ldy);
     return true;
 }
 bool bf16_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y, int64_t T, const std::string& name,
                std::string& err, int64_t ldy = 0) {
+    HostTimer ht("proj.bf16");
     if (w->kind != core::WeightKind::Bf16InF32 || !w->data) { err = "prefill: " + name + " is not a resident BF16 tensor"; return false; }
     gm.bf16(X, (const uint16_t*) w->data, Y, T, w->ne1 > 0 ? w->ne1 : 1, w->ne0, ldy);
     return true;
@@ -681,10 +735,12 @@ namespace {
 // the time between two consecutive marks is charged to the phase of the first, so a gap where the GPU waits (for the
 // host's expert grouping, or for an expert's copy) lands on the phase that was waiting.  Events are reused: the marks
 // are folded at every MoE layer's host sync, after which all of them have completed.
-enum PfPhase { kPfStart, kPfHc, kPfGdn, kPfGdnGates, kPfGdnConv, kPfGdnRec, kPfQsa, kPfQsaIdx, kPfQsaSel, kPfQsaAttn,
+enum PfPhase { kPfStart, kPfHcNorm, kPfHcGemm, kPfHcSilu, kPfHcMix, kPfGdn, kPfGdnGates, kPfGdnConv, kPfGdnRec,
+               kPfQsa, kPfQsaIdx, kPfQsaSel, kPfQsaAttn,
                kPfRouter, kPfHostGroup, kPfGather, kPfWaitCopy, kPfDequant, kPfMmqGu, kPfSwiglu, kPfQuant, kPfMmqD,
                kPfCombine, kPfPle, kPfCount };
-const char* const kPfNames[kPfCount] = {"embed+steps", "hc read", "gdn proj", "gdn gates", "gdn conv", "gdn rec",
+const char* const kPfNames[kPfCount] = {"embed+steps", "hc norm", "hc gemm", "hc silu", "hc mix", "gdn proj",
+                                        "gdn gates", "gdn conv", "gdn rec",
                                         "qsa proj", "qsa indexer", "qsa select", "qsa attn", "router+shared",
                                         "host grouping", "gather", "wait copy", "dequant", "mmq gu", "swiglu",
                                         "quant h", "mmq down", "combine", "ple"};
@@ -692,8 +748,11 @@ struct PfTimer {
     bool on = std::getenv("STRATA_PREFILL_TIMING") != nullptr;
     std::vector<hipEvent_t> ev;
     std::vector<int> ph;
+    std::vector<std::chrono::steady_clock::time_point> htp;
     size_t used = 0;
     double ms[kPfCount] = {};
+    double hms[kPfCount] = {};   // host wall time charged the same way: if gpu >> host the phase is GPU-bound,
+                                 // if gpu ~= host the phase is the host stalling (I/O / grouping), not the kernels
     void mark(int phase, hipStream_t s) {
         if (!on) return;
         if (used == ev.size()) {
@@ -701,8 +760,10 @@ struct PfTimer {
             hipEventCreate(&e);
             ev.push_back(e);
             ph.push_back(0);
+            htp.push_back(std::chrono::steady_clock::now());
         }
         ph[used] = phase;
+        htp[used] = std::chrono::steady_clock::now();
         hipEventRecord(ev[used], s);
         ++used;
     }
@@ -712,9 +773,11 @@ struct PfTimer {
         for (size_t i = 0; i + 1 < used; ++i) {
             float t = 0.0f;
             if (hipEventElapsedTime(&t, ev[i], ev[i + 1]) == hipSuccess) ms[ph[i]] += t;
+            hms[ph[i]] += std::chrono::duration<double, std::milli>(htp[i + 1] - htp[i]).count();
         }
         std::swap(ev[0], ev[used - 1]);
         std::swap(ph[0], ph[used - 1]);
+        std::swap(htp[0], htp[used - 1]);
         used = 1;
     }
     ~PfTimer() {
@@ -936,12 +999,17 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 const core::WeightRef *wn = need(v, sn.c_str(), err), *wd = need(v, sd.c_str(), err),
                                       *wu = need(v, su.c_str(), err), *wi = need(v, si.c_str(), err);
                 if (!wn || !wd || !wu || !wi) return false;
-                pt.mark(kPfHc, cs);
+                pt.mark(kPfHcNorm, cs);
                 gr_norm(m.R, (const float*) wn->data, EPS, m.xn, m.xn16, T, m.cs);
+                pt.mark(kPfHcGemm, cs);
                 if (!bf16_proj(m.gemm, wd, m.xn16, m.lo, T, sd, err)) return false;
+                pt.mark(kPfHcSilu, cs);
                 gr_silu(m.lo, m.lo16, T, m.cs);
+                pt.mark(kPfHcGemm, cs);
                 if (!bf16_proj(m.gemm, wu, m.lo16, m.gated, T, su, err)) return false;
+                pt.mark(kPfHcGemm, cs);
                 if (!bf16_proj(m.gemm, wi, m.xn16, m.inj, T, si, err)) return false;
+                pt.mark(kPfHcMix, cs);
                 gr_mix(m.xn, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h);
 
                 if (half == 0 && !core::is_qsa_layer(g, l)) {
@@ -1133,30 +1201,40 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     m.gemm.bf16(m.mixed_bf, (const uint16_t*) wgi->data, m.sg, T, 1, N);
                     // group the (token, k) pairs by expert on the host
                     pt.mark(kPfHostGroup, cs);
-                    hipMemcpyAsync(m.ids_host.data(), m.ids, (size_t) T * K * 4, hipMemcpyDeviceToHost, m.cs);
-                    hipStreamSynchronize(m.cs);
+                    {
+                        HostTimer ht("grp.ids_d2h_sync");
+                        hipMemcpyAsync(m.ids_host.data(), m.ids, (size_t) T * K * 4, hipMemcpyDeviceToHost, m.cs);
+                        hipStreamSynchronize(m.cs);
+                    }
                     pt.fold();
-                    std::fill(m.cnt.begin(), m.cnt.end(), 0);
-                    for (int64_t i = 0; i < T * K; ++i) {
-                        const int32_t e = m.ids_host[(size_t) i];
-                        if (e < 0 || e >= NE) { err = "prefill: routed id out of range"; return false; }
-                        ++m.cnt[(size_t) e];
+                    {
+                        HostTimer ht("grp.count_off");
+                        std::fill(m.cnt.begin(), m.cnt.end(), 0);
+                        for (int64_t i = 0; i < T * K; ++i) {
+                            const int32_t e = m.ids_host[(size_t) i];
+                            if (e < 0 || e >= NE) { err = "prefill: routed id out of range"; return false; }
+                            ++m.cnt[(size_t) e];
+                        }
+                        m.off[0] = 0;
+                        for (int64_t e = 0; e < NE; ++e) m.off[(size_t) e + 1] = m.off[(size_t) e] + m.cnt[(size_t) e];
                     }
-                    m.off[0] = 0;
-                    for (int64_t e = 0; e < NE; ++e) m.off[(size_t) e + 1] = m.off[(size_t) e] + m.cnt[(size_t) e];
-                    std::vector<int32_t> fill(m.off.begin(), m.off.end() - 1);
-                    for (int64_t i = 0; i < T * K; ++i) {
-                        const int32_t e = m.ids_host[(size_t) i];
-                        const int32_t p = fill[(size_t) e]++;
-                        m.slot_host[(size_t) i] = p;
-                        m.src_host[(size_t) p] = (int32_t) (i / K);
+                    {
+                        HostTimer ht("grp.slot_src");
+                        std::vector<int32_t> fill(m.off.begin(), m.off.end() - 1);
+                        for (int64_t i = 0; i < T * K; ++i) {
+                            const int32_t e = m.ids_host[(size_t) i];
+                            const int32_t p = fill[(size_t) e]++;
+                            m.slot_host[(size_t) i] = p;
+                            m.src_host[(size_t) p] = (int32_t) (i / K);
+                        }
+                        hipMemcpyAsync(m.slot_dev, m.slot_host.data(), (size_t) T * K * 4, hipMemcpyHostToDevice, m.cs);
+                        hipMemcpyAsync(m.src_dev, m.src_host.data(), (size_t) T * K * 4, hipMemcpyHostToDevice, m.cs);
                     }
-                    hipMemcpyAsync(m.slot_dev, m.slot_host.data(), (size_t) T * K * 4, hipMemcpyHostToDevice, m.cs);
-                    hipMemcpyAsync(m.src_dev, m.src_host.data(), (size_t) T * K * 4, hipMemcpyHostToDevice, m.cs);
                     // the experts, in id order: resident ones from VRAM, the others through the staging ring
                     std::vector<int32_t> order;
                     for (int32_t e = 0; e < NE; ++e) if (m.cnt[(size_t) e] > 0) order.push_back(e);
                     const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+                    pf_pcie_bytes() += (double) order.size() * (double) lay.blob_bytes(l);
                     const bool use_mmq = mmq_plan().any && mmq_plan().layer[(size_t) l];
                     const int mmq_gt = lay.native ? lay.fmt[(size_t) l].gu_type : 42;
                     const int mmq_dt = lay.native ? lay.fmt[(size_t) l].d_type : 42;
@@ -1305,8 +1383,12 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             }
                             const int32_t e = order[j];
                             if (stage_of[j] < 0) {
-                                // not staged: a VRAM-resident expert (its slot) or a direct read of the arena alias
-                                const uint8_t* alias = pf_direct() ? m.src->device_alias(l, e) : nullptr;
+                                // not staged: a VRAM-resident expert (its slot) or a direct read of the arena alias.
+                                // Prefer the VRAM cache slot when it holds the expert: a VRAM read beats the arena's
+                                // REBAR alias (a PCIe read). Only fall back to the alias (no staging DMA) otherwise.
+                                const bool cached = m.host_res != nullptr && m.cache != nullptr &&
+                                                    m.host_res[(size_t) l * NE + e] >= 0;
+                                const uint8_t* alias = (!cached && pf_direct()) ? m.src->device_alias(l, e) : nullptr;
                                 if (alias != nullptr) {
                                     ++stats_.experts_resident;
                                     if (!compute(j, alias, -1)) return false;
@@ -1434,12 +1516,21 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         std::string line;
         char b[96];
         for (int i = 0; i < kPfCount; ++i) {
-            if (pt.ms[i] <= 0.0) continue;
-            std::snprintf(b, sizeof b, " %s %.0f (%.1f%%)", kPfNames[i], pt.ms[i], total > 0 ? 100.0 * pt.ms[i] / total : 0.0);
+            if (pt.ms[i] <= 0.0 && pt.hms[i] <= 0.0) continue;
+            std::snprintf(b, sizeof b, " %s %.0f/%.0f (%.1f%%)", kPfNames[i], pt.ms[i], pt.hms[i],
+                          total > 0 ? 100.0 * pt.ms[i] / total : 0.0);
             line += b;
         }
-        std::fprintf(stderr, "strata prefill timing: %lld tokens, GPU timeline %.0f ms, wall %.0f ms, host staging %.0f ms:%s\n",
+        std::fprintf(stderr, "strata prefill timing: %lld tokens, GPU timeline %.0f ms, wall %.0f ms, host staging %.0f ms "
+                             "(each phase gpu/host ms):%s\n",
                      (long long) n, total, ms_since(t_start), stats_.ms_experts_host, line.c_str());
+        host_report();
+        if (pf_pcie_bytes() > 0.0) {
+            const double dq = pt.ms[kPfDequant] > 0.0 ? pt.ms[kPfDequant] : 1.0;
+            std::fprintf(stderr, "strata prefill pcie: %.0f MiB of experts over the dequant phase (%.1f GB/s over %.0f ms)\n",
+                         pf_pcie_bytes() / 1048576.0, pf_pcie_bytes() / 1e9 / (dq / 1e3), dq);
+            pf_pcie_bytes() = 0.0;
+        }
     }
     if (std::getenv("STRATA_STATE_HASH_GDN") != nullptr) {   // debug: the GDN states as the prompt path leaves them
         hipStreamSynchronize(m.cs);
