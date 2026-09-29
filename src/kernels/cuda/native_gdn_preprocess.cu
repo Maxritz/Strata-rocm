@@ -39,7 +39,7 @@ constexpr int S = 128;
 __device__ __forceinline__ float warp_sum(float value) {
 #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1)
-        value += __shfl_xor_sync(0xffffffffffffffffull, value, offset, 32);
+        value += __shfl_xor_sync(0xffffffffffffffffull, value, offset);
     return value;
 }
 __device__ __forceinline__ float norm_sum(float value, float* sums) {

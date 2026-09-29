@@ -494,6 +494,25 @@ void drive_pool_multi(void* user, const float* x_f, const int32_t* ids, int64_t 
     strata::core::expert_pool_dispatch_multi(t->d, x_f, ids, n_tok, k, out);
     t->cpu_ms += std::chrono::duration<double, std::milli>(Clock::now() - a).count();
     ++t->calls;
+    // THE ROUTING TRACE (P0.S8). The single-token `drive_pool` writes this too; the verify-window path used
+    // `--spec` (which is mandatory for a native pack) did NOT, so `--dump-routing` produced a 0-byte file while
+    // still logging a record count. Mirror drive_pool's record shape exactly: int32 layer, int32 k, k int32 ids,
+    // k float weights. The multi dispatch has no weights by contract, so emit zeroes - tools/make_profile.py
+    // counts only the ids and skips the weights, so zeroes are harmless and keep the format compatible.
+    if (t->routing != nullptr) {
+        const int32_t layer_idx = (int32_t) layer;
+        if (layer_idx < 0 || layer_idx >= 48) {
+            std::fprintf(stderr, "strata generate: the routing trace saw layer %d, outside 0..47\n", layer_idx);
+        } else {
+            const int32_t rec[2] = {layer_idx, (int32_t) k};
+            float zbuf[16] = {};   // k <= 10 in this engine
+            for (int64_t tt = 0; tt < n_tok; ++tt) {
+                std::fwrite(rec, sizeof rec, 1, t->routing);
+                std::fwrite(ids + (size_t) tt * (size_t) k, sizeof(int32_t), (size_t) k, t->routing);
+                std::fwrite(zbuf, sizeof(float), (size_t) k, t->routing);
+            }
+        }
+    }
 }
 
 // ---- issue #31: what the watchdog prints before it stops a stalled engine
@@ -1355,7 +1374,8 @@ int main(int argc, char** argv) {
 
     float* d_parts = nullptr;
     if (hipMalloc(&d_parts, (size_t) K * g.n_embd * 4) != hipSuccess ||
-        hipMemset(d_parts, 0, (size_t) K * g.n_embd * 4) != hipSuccess) {
+        hipMemset(d_parts, 0, (size_t) K * g.n_embd * 4) != hipSuccess ||
+        hipDeviceSynchronize() != hipSuccess) {   // ordered before any non-blocking graph reads it (see verify arena)
         std::fprintf(stderr, "strata generate: the parts buffer failed\n");
         return 1;
     }
@@ -3040,6 +3060,7 @@ int main(int argc, char** argv) {
                             consumed[(size_t) ((int64_t) consumed.size() - (take - 1) + j)];
                     hist_stage[(size_t) (hist_n - 1)] = (int32_t) x;
                     hipMemcpy(d_hist, hist_stage.data(), (size_t) hist_n * sizeof(int32_t), hipMemcpyHostToDevice);
+                    hipDeviceSynchronize();   // the window's sampler reads it on the non-blocking verify stream
                 }
                 tr("window", p, T);
                 if (!ver.run(T, window.data(), p, &drive_pool_multi, &drive, outv.data(), err) || drive.d.failed) {

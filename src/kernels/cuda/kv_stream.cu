@@ -60,7 +60,7 @@ __device__ int block_scan(int v, int* warp_sums, int& total) {
     const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
     int x = v;
     for (int o = 1; o < 32; o <<= 1) {
-        const int y = __shfl_up_sync(0xffffffffffffffffull, x, o, 32);
+        const int y = __shfl_up_sync(0xffffffffffffffffull, x, o);
         if (lane >= o) x += y;
     }
     if (lane == 31) warp_sums[w] = x;
@@ -68,7 +68,7 @@ __device__ int block_scan(int v, int* warp_sums, int& total) {
     if (w == 0) {
         int t = warp_sums[lane];
         for (int o = 1; o < 32; o <<= 1) {
-            const int y = __shfl_up_sync(0xffffffffffffffffull, t, o, 32);
+            const int y = __shfl_up_sync(0xffffffffffffffffull, t, o);
             if (lane >= o) t += y;
         }
         warp_sums[lane] = t;

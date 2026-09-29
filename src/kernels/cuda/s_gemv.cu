@@ -289,7 +289,7 @@ __global__ void s_gemv_q8_split_kernel(const uint8_t* __restrict__ x, const uint
     }
     float acc = (((acc0 + acc1) + (acc2 + acc3)) + ((acc4 + acc5) + (acc6 + acc7))) +
                 (((acc8 + acc9) + (acc10 + acc11)) + ((acc12 + acc13) + (acc14 + acc15)));
-    for (int step = 16; step > 0; step >>= 1) acc += __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, acc, step, 32);
+    for (int step = 16; step > 0; step >>= 1) acc += __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, acc, step);
     if (lane == 0) y[o] = acc;
 }
 

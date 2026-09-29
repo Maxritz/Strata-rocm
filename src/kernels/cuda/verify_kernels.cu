@@ -42,7 +42,7 @@ __global__ void __launch_bounds__(S) gdn_conv_l2_multi_kernel(const float* __res
     float y = sum / (1.0f + __expf(-sum));
     if ((int) blockIdx.x < qk_heads) {
         float sq = y * y;
-        for (int o = 16; o > 0; o >>= 1) sq += __shfl_xor_sync(0xffffffffffffffffull, sq, o, 32);
+        for (int o = 16; o > 0; o >>= 1) sq += __shfl_xor_sync(0xffffffffffffffffull, sq, o);
         if ((threadIdx.x & 31) == 0) part[threadIdx.x >> 5] = sq;
         __syncthreads();
         const float ss = part[0] + part[1] + part[2] + part[3];
@@ -101,7 +101,7 @@ __global__ void __launch_bounds__(256) gdn_ab_multi_kernel(const float* __restri
     for (int t = 0; t < kVerifyMaxT; ++t) {
         if (t >= T) break;
         float a = acc[t];
-        for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffffffffffull, a, o, 32);
+        for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffffffffffull, a, o);
         if (lane != 0) continue;
         if (is_beta) {
             beta[(size_t) t * h_v + r] = 1.0f / (1.0f + __expf(-a));
@@ -165,7 +165,7 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __re
             sq_part = oc * oc;
         }
         if (t < t_out_begin) continue;   // a replayed token: its state update is needed, its output is not
-        for (int o2 = 16; o2 > 0; o2 >>= 1) sq_part += __shfl_xor_sync(0xffffffffffffffffull, sq_part, o2, 32);
+        for (int o2 = 16; o2 > 0; o2 >>= 1) sq_part += __shfl_xor_sync(0xffffffffffffffffull, sq_part, o2);
         if ((tid & 31) == 0) wsum[tid >> 5] = sq_part;
         __syncthreads();
         if (rg == 0) {
@@ -270,7 +270,7 @@ __global__ void row_top_prob_kernel(const float* __restrict__ logits, int n_voca
     const float m = l[ids[t]];
     float s = 0.0f;
     for (int i = threadIdx.x; i < n_vocab; i += blockDim.x) s += __expf(l[i] - m);
-    for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffffffffffffull, s, o, 32);
+    for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffffffffffffull, s, o);
     if ((threadIdx.x & 31) == 0) part[threadIdx.x >> 5] = s;
     __syncthreads();
     if (threadIdx.x == 0) {

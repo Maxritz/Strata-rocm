@@ -336,17 +336,20 @@ __device__ __forceinline__ float vec_dot_iq4_xs_q8_1(const void* __restrict__ vb
 }
 
 // Q8_0 (ggml type 8) against one q8_1 activation: one call covers the whole 32-element block (ipb == 1), so
-// this is the full block dot and `iqs` is always 0.  Both pointers are cast to int and fed to dp4a, as ggml's
-// own vec_dot_q8_0_q8_1 does; the compiler splits the (offset-2) weight loads if the target needs it.
+// `iqs` is always 0.  The weight block advances by `kbx`, as every other dot here does.  `bq8_1` arrives
+// already advanced by `row_dot`'s `kbx * (qk / 32)`, so the activation is indexed by `iqs` and never by
+// `kbx` -- indexing both by kbx double-counts the offset and reads past the row on the last block.  Both
+// pointers are cast to int and fed to dp4a, as ggml's own vec_dot_q8_0_q8_1 does; the compiler splits the
+// (offset-2) weight loads if the target needs it.
 __device__ __forceinline__ float vec_dot_q8_0_q8_1(const void* v, const block_q8_1* y, int kbx, int iqs) {
-    (void) iqs;
-    const auto* bq8 = (const block_q8_0*) v;
+    const auto* bq8 = (const block_q8_0*) v + kbx;
+    const block_q8_1* yb = y + iqs;
     const int* a = (const int*) bq8->qs;
-    const int* b = (const int*) y[kbx].qs;
+    const int* b = (const int*) yb->qs;
     int acc = 0;
 #pragma unroll
     for (int i = 0; i < 8; ++i) acc = ggml_cuda_dp4a(a[i], b[i], acc);
-    return __half2float(bq8->d) * __low2float(y[kbx].ds) * (float) acc;
+    return __half2float(bq8->d) * __low2float(yb->ds) * (float) acc;
 }
 
 // Q5_0 (ggml type 6) against one q8_1 activation: the whole 32-element block is one dot call (ipb == 1), so
@@ -402,7 +405,7 @@ template<> struct Fmt<6> { static constexpr int qk = 32, ipb = 1, step = 1;
 
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffffffffffull, v, o, 32);
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffffffffffull, v, o);
     return v;
 }
 
@@ -498,8 +501,8 @@ __global__ void quantize_q8_1_kernel(const float* __restrict__ x, block_q8_1* __
     float amax = fabsf(xi), sum = xi;
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) {
-        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffffffffffull, amax, o, 32));
-        sum += __shfl_xor_sync(0xffffffffffffffffull, sum, o, 32);
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffffffffffull, amax, o));
+        sum += __shfl_xor_sync(0xffffffffffffffffull, sum, o);
     }
     const float d = amax / 127.0f;
     const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);

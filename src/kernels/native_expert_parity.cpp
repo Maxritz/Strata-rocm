@@ -42,8 +42,8 @@ int main(int argc, char** argv) {
     std::vector<int> layers;
     for (int i = 2; i < argc; ++i) layers.push_back(std::atoi(argv[i]));
     if (layers.empty()) layers = {0, 1, 2, 3, 20, 47};
-    const int NT = 3, E = 7;
-    const int64_t H = 2560, FF = 640;
+    const int NT = 3;   // activations tested per expert (multi-token batch)
+    const int E = 7;    // arbitrary expert index (< n_expert on every MoE shard we touch)
     int failures = 0;
     hipStream_t s;
     hipStreamCreate(&s);
@@ -54,6 +54,9 @@ int main(int argc, char** argv) {
             for (int r = 0; r < 3; ++r)
                 if (ti.name == "blk." + std::to_string(l) + ".ffn_" + roles[r] + "_exps.weight") t[r] = &ti;
         if (!t[0] || !t[1] || !t[2]) { std::printf("layer %d: no expert tensors\n", l); ++failures; continue; }
+        // GGUF logical [n_expert, n_ff, n_embd] is stored dim-0-fastest, so shape is [n_embd, n_ff, n_expert].
+        const int64_t H = (int64_t) t[0]->shape[0];   // n_embd
+        const int64_t FF = (int64_t) t[0]->shape[1];  // n_ff
         cpu::NativeFmt f;
         std::string err;
         if (!cpu::native_fmt((int) t[0]->type, (int) t[2]->type, H, FF, f, err)) {

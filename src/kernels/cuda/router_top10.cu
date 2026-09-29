@@ -89,13 +89,13 @@ __global__ void router_top10_kernel(const float* __restrict__ logits, int n_toke
     // so this is bit-identical to the serial scan.
     float mx = -INFINITY;
     for (int e = tid; e < n_expert; e += nt) mx = fmaxf(mx, l[e]);
-    for (int off = 16; off > 0; off >>= 1) mx = fmaxf(mx, __shfl_down_sync(0xffffffffffffffffull, mx, off, 32));
+    for (int off = 16; off > 0; off >>= 1) mx = fmaxf(mx, __shfl_down_sync(0xffffffffffffffffull, mx, off));
     if ((tid & 31) == 0) s_red[tid >> 5] = mx;
     __syncthreads();
     if (tid < 32) {
         const int nw = (nt + 31) >> 5;
         float v = (tid < nw) ? s_red[tid] : -INFINITY;
-        for (int off = 16; off > 0; off >>= 1) v = fmaxf(v, __shfl_down_sync(0xffffffffffffffffull, v, off, 32));
+        for (int off = 16; off > 0; off >>= 1) v = fmaxf(v, __shfl_down_sync(0xffffffffffffffffull, v, off));
         if (tid == 0) s_red[0] = v;
     }
     __syncthreads();
@@ -152,8 +152,8 @@ __global__ void router_top10_kernel(const float* __restrict__ logits, int n_toke
             if (pe > bv) { bv = pe; bi = e; }
         }
         for (int off = 16; off > 0; off >>= 1) {
-            const float ov = __shfl_down_sync(0xffffffffffffffffull, bv, off, 32);
-            const int oi = __shfl_down_sync(0xffffffffffffffffull, bi, off, 32);
+            const float ov = __shfl_down_sync(0xffffffffffffffffull, bv, off);
+            const int oi = __shfl_down_sync(0xffffffffffffffffull, bi, off);
             if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
         }
         if ((tid & 31) == 0) { s_red[tid >> 5] = bv; s_rid[tid >> 5] = bi; }
@@ -163,8 +163,8 @@ __global__ void router_top10_kernel(const float* __restrict__ logits, int n_toke
             float v = (tid < nw) ? s_red[tid] : -INFINITY;
             int ix = (tid < nw) ? s_rid[tid] : n_expert;
             for (int off = 16; off > 0; off >>= 1) {
-                const float ov = __shfl_down_sync(0xffffffffffffffffull, v, off, 32);
-                const int oi = __shfl_down_sync(0xffffffffffffffffull, ix, off, 32);
+                const float ov = __shfl_down_sync(0xffffffffffffffffull, v, off);
+                const int oi = __shfl_down_sync(0xffffffffffffffffull, ix, off);
                 if (ov > v || (ov == v && oi < ix)) { v = ov; ix = oi; }
             }
             if (tid == 0 && ix < n_expert) {

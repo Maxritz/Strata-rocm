@@ -75,13 +75,13 @@ __device__ __forceinline__ float silu_f(float x) { return x / (1.0f + expf(-x));
 __device__ double block_sum(double v, double* scratch) {
     __syncthreads();
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, v, off, 32);
+    for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, v, off);
     if (lane == 0) scratch[warp] = v;
     __syncthreads();
     const int nw = ((int) blockDim.x + 31) >> 5;
     v = (threadIdx.x < nw) ? scratch[threadIdx.x] : 0.0;
     if (warp == 0)
-        for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, v, off, 32);
+        for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, v, off);
     if (threadIdx.x == 0) scratch[0] = v;
     __syncthreads();
     return scratch[0];

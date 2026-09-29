@@ -39,7 +39,7 @@ std::atomic<bool> enabled{false};
 __device__ __forceinline__ float warp_sum(float value) {
 #pragma unroll
     for (int offset = 16; offset; offset >>= 1)
-        value += __shfl_xor_sync(0xffffffffffffffffull, value, offset, 32);
+        value += __shfl_xor_sync(0xffffffffffffffffull, value, offset);
     return value;
 }
 template<int BlockSize>

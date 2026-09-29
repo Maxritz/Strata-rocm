@@ -122,7 +122,7 @@ __global__ void gdn_l2_kernel(float* __restrict__ x, int cols, float eps) {
     double acc = 0.0;
     for (int i = threadIdx.x; i < cols; i += blockDim.x) acc += (double) p[i] * (double) p[i];
     // warp reduction
-    for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, acc, off, 32);
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, acc, off);
     __shared__ double ssum;
     if (threadIdx.x == 0) ssum = acc;
     __syncthreads();
@@ -140,7 +140,7 @@ __global__ void gdn_out_norm_kernel(const float* __restrict__ o, const float* __
     float* py = y + (size_t) h * S;
     double acc = 0.0;
     for (int i = threadIdx.x; i < S; i += blockDim.x) acc += (double) po[i] * (double) po[i];
-    for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, acc, off, 32);
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, acc, off);
     __shared__ double ssum;
     if (threadIdx.x == 0) ssum = acc;
     __syncthreads();

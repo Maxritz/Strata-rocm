@@ -22,12 +22,12 @@ constexpr int WARPS = THREADS / 32;
 
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffffffffffull, v, o, 32);
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffffffffffull, v, o);
     return v;
 }
 __device__ __forceinline__ float warp_max(float v) {
 #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffffffffffull, v, o, 32));
+    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffffffffffull, v, o));
     return v;
 }
 

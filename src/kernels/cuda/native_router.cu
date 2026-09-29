@@ -34,12 +34,12 @@ namespace {
 std::atomic<bool> enabled{false};
 __device__ __forceinline__ float warp_sum(float value) {
 #pragma unroll
-    for (int mask = 16; mask; mask >>= 1) value += __shfl_xor_sync(0xffffffffffffffffull, value, mask, 32);
+    for (int mask = 16; mask; mask >>= 1) value += __shfl_xor_sync(0xffffffffffffffffull, value, mask);
     return value;
 }
 __device__ __forceinline__ float warp_max(float value) {
 #pragma unroll
-    for (int mask = 16; mask; mask >>= 1) value = fmaxf(value, __shfl_xor_sync(0xffffffffffffffffull, value, mask, 32));
+    for (int mask = 16; mask; mask >>= 1) value = fmaxf(value, __shfl_xor_sync(0xffffffffffffffffull, value, mask));
     return value;
 }
 __launch_bounds__(256, 1)
@@ -78,8 +78,8 @@ __global__ void route(const float* __restrict__ logits, int32_t* __restrict__ id
         }
 #pragma unroll
         for (int mask = 16; mask; mask >>= 1) {
-            const float other = __shfl_xor_sync(0xffffffffffffffffull, best, mask, 32);
-            const int other_id = __shfl_xor_sync(0xffffffffffffffffull, expert, mask, 32);
+            const float other = __shfl_xor_sync(0xffffffffffffffffull, best, mask);
+            const int other_id = __shfl_xor_sync(0xffffffffffffffffull, expert, mask);
             if (other > best || (other == best && other_id < expert)) { best = other; expert = other_id; }
         }
         if ((expert & 31) == lane) {

@@ -99,6 +99,15 @@ public:
     /// the CPU is RAM-bound, Q2_0).  Set before the first `run`.
     void set_pcie_mode(int mode) { sink_.pcie_mode = mode; }
 
+    /// The staging-capacity override (Track 3): how many PCIe expert blobs may be staged per GPU layer in this
+    /// window.  16 is the built-in default; more slots overlap more PCIe fetches with the CPU's share, at the cost
+    /// of more device arena.  Call before the first `run`.  Clamped to [kStagingBlobs, 64] and rounded even.
+    void set_staging_cap(int64_t cap) {
+        if (cap < kStagingBlobs) cap = kStagingBlobs;
+        if (cap > 64) cap = 64;
+        sink_.staging_cap = staging_cap_ = cap & ~1ll;
+    }
+
     double ms_wait = 0, ms_pool = 0, ms_host = 0, ms_commit = 0;
     int64_t windows = 0;
 
@@ -175,6 +184,7 @@ private:
     int32_t* plan_ = nullptr;                                     // device copy of the plan block
     uint8_t* staging_ = nullptr;                                  // VRAM slots for the PCIe share of the misses
     static constexpr int64_t kStagingBlobs = 16;
+    int64_t staging_cap_ = kStagingBlobs;                         // default; override via set_staging_cap / STRATA_STAGING_CAP
     uint8_t* hit_xq_ = nullptr;
     uint8_t* nat_xq_ = nullptr;   // plan v0.3 P6: q8_1 activations for a native pack's grouped experts
     float* hit_xs_ = nullptr;

@@ -136,6 +136,27 @@ class Tokenizer:
                    list(md.get("tokenizer.ggml.token_type") or []) or None,
                    md.get("tokenizer.ggml.pre", "qwen35"), special)
 
+    @classmethod
+    def from_pack(cls, path) -> "Tokenizer":
+        """Load the tokenizer/ directory a pack already carries, WITHOUT the weight shards.
+
+        This is the decode side (id -> text): it needs only the id -> token table and the token types, so the
+        recorded merges are not read.  `vocab.json` maps token -> id, so it is inverted to id -> token; a pack
+        written by `extract` is dense (ids 0..N-1), so the table has no holes.  Meant for turning the engine's
+        `output : <ids>` line into readable text; encoding still uses `from_gguf`.
+        """
+        path = pathlib.Path(path)
+        vocab = json.loads((path / "vocab.json").read_text(encoding="utf-8"))
+        n = (max(vocab.values()) + 1) if vocab else 0
+        tokens = [""] * n
+        for tok, i in vocab.items():
+            tokens[i] = tok
+        tt = path / "token_type.json"
+        types = json.loads(tt.read_text(encoding="utf-8")) if tt.exists() else None
+        cfg = path / "tokenizer.json"
+        pre = json.loads(cfg.read_text(encoding="utf-8")).get("pre", "qwen35") if cfg.exists() else "qwen35"
+        return cls(tokens, [], types, pre)
+
     # -------------------------------------------------------------- the algorithm
     def _bpe(self, word: str) -> list[str]:
         """Merge `word` (already byte-mapped) by LOWEST RANK first, repeatedly - not left to right.
@@ -242,10 +263,25 @@ def extract(gguf_path, out_dir) -> dict:
 def main() -> int:
     import argparse
     ap = argparse.ArgumentParser()
-    ap.add_argument("--gguf", required=True)
-    ap.add_argument("--out", required=True)
+    ap.add_argument("--gguf", help="source model shard: extract its tokenizer/ (or decode with it)")
+    ap.add_argument("--out", help="pack directory to write tokenizer/ into")
     ap.add_argument("--check", action="store_true", help="round-trip a corpus and report")
+    ap.add_argument("--pack", help="a pack directory: load its tokenizer/ and decode (no GGUF needed)")
+    ap.add_argument("--ids", help="comma/space separated token ids: decode them to text and print")
     args = ap.parse_args()
+    if args.ids is not None:
+        # the human-readable side of an engine run: STRATA's `output : <ids>` line goes in here.
+        if args.pack:
+            tk = Tokenizer.from_pack(pathlib.Path(args.pack) / "tokenizer")
+        elif args.gguf:
+            tk = Tokenizer.from_gguf(args.gguf)
+        else:
+            ap.error("--ids needs --pack <dir> (or --gguf <shard>)")
+        ids = [int(x) for x in args.ids.replace(",", " ").split()]
+        print(tk.decode(ids))
+        return 0
+    if not args.gguf or not args.out:
+        ap.error("--gguf and --out are required unless --ids is given")
     cfg = extract(args.gguf, args.out)
     print("tokenizer/: vocab %d, merges %d, pre %s, specials %s"
           % (cfg["vocab_size"], cfg["n_merges"], cfg["pre"], cfg["special_ids"]))

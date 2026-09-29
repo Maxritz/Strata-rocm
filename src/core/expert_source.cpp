@@ -355,6 +355,27 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         P.counts[0] = groups;
         P.counts[1] = entries;
         P.counts[2] = fetches;
+        if (ptrace) {
+            const uint8_t* h0 = (const uint8_t*) d.src->blob(d.layers, 0);
+            unsigned long long d0 = (unsigned long long) d.src->device_alias(d.layers, 0);
+            for (int q = 0; q < fetches; ++q) {
+                const int32_t e = ids[pcie_i0[q]];
+                unsigned long long dp = P.ptr2[q];
+                unsigned long long off = (unsigned long long) (dma_src[q] - h0);
+                unsigned long long doff = dp > 0 ? (dp - d0) : 0;
+                std::fprintf(stderr, "pool L=%lld q=%d e=%d host_off=%llu dev_off=%llu delta=%lld\n",
+                             (long long) d.layers, q, e, off, doff, (long long) (off - doff));
+            }
+            {
+                std::string s = "pool start2 L=" + std::to_string(d.layers) + " fetches=" + std::to_string(fetches) +
+                    " entries=" + std::to_string(entries) + " groups=" + std::to_string(groups) + " ->";
+                for (int q = 0; q <= fetches; ++q) s += " " + std::to_string(P.start2[q]);
+                s += " | start[0..groups]:"; for (int q = 0; q <= groups; ++q) s += " " + std::to_string(P.start[q]);
+                s += " | dst[0..entries):"; for (int q = 0; q < entries; ++q) s += " " + std::to_string(P.dst[q]);
+                s += " | tok[0..entries):"; for (int q = 0; q < entries; ++q) s += " " + std::to_string(P.tok[q]);
+                std::fprintf(stderr, "%s\n", s.c_str());
+            }
+        }
         std::atomic_thread_fence(std::memory_order_seq_cst);
         pt("publish", fetches);
         if (P.publish) P.publish(P.ctx);

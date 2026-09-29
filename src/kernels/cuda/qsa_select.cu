@@ -42,7 +42,7 @@ __global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_kernel(const fl
         const float4 q4 = *reinterpret_cast<const float4*>(q + h * IDX_DIM);
         float d = k4.x * q4.x + k4.y * q4.y + k4.z * q4.z + k4.w * q4.w;
 #pragma unroll
-        for (int o = 16; o > 0; o >>= 1) d += __shfl_xor_sync(0xffffffffffffffffull, d, o, 32);
+        for (int o = 16; o > 0; o >>= 1) d += __shfl_xor_sync(0xffffffffffffffffull, d, o);
         score += d > 0.0f ? d : 0.0f;
     }
     if (lane == 0) {

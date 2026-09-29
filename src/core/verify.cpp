@@ -51,6 +51,38 @@ double ms_since(Clock::time_point t) { return std::chrono::duration<double, std:
 const bool g_dbg = std::getenv("STRATA_VERIFY_DEBUG") != nullptr;
 #define VDBG(...) do { if (g_dbg) { std::fprintf(stderr, "verify dbg: " __VA_ARGS__); std::fflush(stderr); } } while (0)
 
+// STRATA_STAGING_STAT=1 — per-layer-group expert plan counts vs. the staging cap.
+// Plan layout (see the comment above the plan mapping): counts[0]=VRAM, [1]=CPU, [2]=PCIe.
+const bool g_stg = std::getenv("STRATA_STAGING_STAT") != nullptr;
+// Track 1 (default ON; STRATA_TRACK1=0 opts out, keeping the pre-v3 layout): ring each layer's CPU experts as soon
+// as the router has published their ids, i.e. before the GPU's shared-expert block, so the host's plan+pool overlaps
+// that GPU work.  Measured +1.4% decode on REAP-288 with identical token output; previously the ring fired at the
+// end of `pre` (after the shared expert).
+const bool g_track1 = [] {
+    const char* t = std::getenv("STRATA_TRACK1");
+    return !(t != nullptr && t[0] == '0');
+}();
+struct StgStat {
+    int64_t n = 0, sum_vram = 0, sum_cpu = 0, sum_pcie = 0, max_pcie = 0, sat = 0, noplan = 0;
+    void add(int vram, int cpu, int pcie, int cap, bool pub) {
+        n++; sum_vram += vram; sum_cpu += cpu; sum_pcie += pcie;
+        if (pcie > max_pcie) max_pcie = pcie;
+        if (pcie >= cap) sat++;
+        if (!pub) noplan++;
+    }
+    void dump(int cap) {
+        if (!n) return;
+        const double d = (double) n;
+        std::fprintf(stderr,
+                     "staging stat: %lld layer-groups  vram %.2f  cpu %.2f  pcie %.2f  pcie_max %lld"
+                     "  at_or_over_cap %lld  no_plan %lld  (cap %d)\n",
+                     (long long) n, (double) sum_vram / d, (double) sum_cpu / d, (double) sum_pcie / d,
+                     (long long) max_pcie, (long long) sat, (long long) noplan, cap);
+        std::fflush(stderr);
+    }
+};
+StgStat g_stg_stat;
+
 struct Bump {
     uint8_t* base = nullptr;
     uint64_t used = 0;
@@ -212,6 +244,12 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     }
 
     // ---- the device arena: the same sequence counted, then carved
+    if (const char* e = std::getenv("STRATA_STAGING_CAP"); e != nullptr && *e != '\0') {
+        char* end = nullptr;
+        const long v = std::strtol(e, &end, 10);
+        if (end != e && end != nullptr && *end == '\0' && v >= kStagingBlobs && v <= 64)
+            set_staging_cap(v);
+    }
     auto carve = [&](Bump& b) {
         tok_ = b.take<int32_t>(T); step_ = b.take<int32_t>(T * strata::kernels::kStepCount);
         pos_ = b.take<int32_t>(T * NH); commit_ = b.take<int32_t>(2 + T);
@@ -234,7 +272,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         shared_ = b.take<float>(T * N); parts_ = b.take<float>(T * K * N); hit_out_ = b.take<float>(T * K * N);
         hit_slot_ = b.take<int32_t>(T * K); hit_dst_ = b.take<int32_t>(T * K); hit_count_ = b.take<int32_t>(4);
         plan_ = b.take<int32_t>(2 * ((uint64_t) plan_i32_ + 16));
-        staging_ = b.take<uint8_t>((uint64_t) kStagingBlobs * strata::kernels::cpu::expert_layout().max_blob);
+        staging_ = b.take<uint8_t>((uint64_t) staging_cap_ * strata::kernels::cpu::expert_layout().max_blob);
         hit_xq_ = b.take<uint8_t>(T * (N / 32) * 34); hit_xs_ = b.take<float>(T * (N / 32));
         nat_xq_ = b.take<uint8_t>(T * (N / 32) * 36);
         hit_scratch_ = b.take<uint8_t>(std::max<uint64_t>(
@@ -252,12 +290,15 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         err = "verify: the device arena (" + std::to_string(count.used >> 20) + " MiB) does not fit";
         return false;
     }
-    hipMemset(arena_, 0, count.used);
+    // THE ARENA CLEAR IS ORDERED WITH `cs_`, ON `cs_`.  A `hipMemset` on the legacy default stream is not
+    // ordered against these non-blocking streams: measured on ROCm 10.1 it executed *after the first verify
+    // window*, wiping the window's residual and the GDN/QSA snapshots the first commit then read - the first
+    // committed recurrent state was built from zeros.  It must run to completion before any window launches.
     Bump real;
     real.base = (uint8_t*) arena_;
     carve(real);
     sink_.staging = (unsigned long long) staging_;
-    sink_.staging_cap = kStagingBlobs;
+    sink_.staging_cap = staging_cap_;
     (void) TS;
     if (hipStreamCreateWithFlags(&copy_, hipStreamNonBlocking) != hipSuccess) {
         err = "verify: copy stream create failed";
@@ -265,6 +306,10 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     }
     if (hipStreamCreateWithFlags(&cs_, hipStreamNonBlocking) != hipSuccess) {
         err = "verify: stream create failed";
+        return false;
+    }
+    if (hipMemsetAsync(arena_, 0, count.used, cs_) != hipSuccess || hipStreamSynchronize(cs_) != hipSuccess) {
+        err = "verify: the arena clear failed";
         return false;
     }
     std::fprintf(stderr, "strata verify: window up to %d tokens, %.1f MiB of device buffers\n", max_t,
@@ -515,8 +560,9 @@ bool Verifier::record_window(int T, hipStream_t cs, std::string& err) {
             mb.logits = logits_ + t * NE; mb.ids = ids_ + t * K; mb.weights = w_ + t * K;
             if (!moe_route(wt, g, l, K, mb, mixed_ + t * N, cs, err, nullptr)) return false;
         }
-        doorbell_publish(xm, ids_ + tb * K, w_ + tb * K, (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N,
-                         m_ids_ + tb * K, m_w_ + tb * K, m_seq_, cs);
+        if (g_track1)
+            doorbell_publish(xm, ids_ + tb * K, w_ + tb * K, (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N,
+                             m_ids_ + tb * K, m_w_ + tb * K, m_seq_, cs);
         {
             const WeightRef *wgi = need(v, "ffn_gate_inp_shexp.weight", err), *wsg = need(v, "ffn_gate_shexp.weight", err),
                             *wsu = need(v, "ffn_up_shexp.weight", err), *wsd = need(v, "ffn_down_shexp.weight", err);
@@ -538,6 +584,9 @@ bool Verifier::record_window(int T, hipStream_t cs, std::string& err) {
                 return false;
             }
         }
+        if (!g_track1)
+            doorbell_publish(xm, ids_ + tb * K, w_ + tb * K, (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N,
+                             m_ids_ + tb * K, m_w_ + tb * K, m_seq_, cs);
         if (strata::kernels::cpu::expert_layout().native)
             quantize_q8_1_rows(xm, n, N, nat_xq_ + (size_t) tb * (N / 32) * 36, cs);
         else
@@ -579,7 +628,7 @@ bool Verifier::record_window(int T, hipStream_t cs, std::string& err) {
         grouped(p_ptr, p_start, p_counts);
         wait_flag_ge(m_flagB_, ring, cs);                      // the PCIe share is in staging (DMA) or mapped
         if (sink_.pcie_mode == 2) {                            // stage it with a copy kernel, then point at staging
-            const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
+            const int64_t per = G == 2 ? staging_cap_ / 2 : staging_cap_;
             uint8_t* stage = staging_ + (size_t) (grp * per) * lay.max_blob;
             fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, cs);
             rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), cs);
@@ -770,6 +819,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     }
     *(volatile uint32_t*) h_seq_ = 0;
     *(volatile uint32_t*) h_flag_ = 0;
+    if (g_stg) g_stg_stat = StgStat{};
     *(volatile uint32_t*) h_flagA_ = 0;
     *(volatile uint32_t*) h_flagB_ = 0;
     std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -822,6 +872,14 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         progress_tick();
         std::atomic_thread_fence(std::memory_order_seq_cst);
         _mm_sfence();
+        if (g_stg) {
+            const int cap_b = G == 2 ? (int) (staging_cap_ / 2) : (int) staging_cap_;
+            const int32_t* cb = h_plan_ + (size_t) grp * (size_t) plan_i32_;
+            const bool pub = (*(volatile uint32_t*) h_flagA_ == want);
+            g_stg_stat.add(cb[0], cb[1], cb[2], cap_b, pub);
+            std::fprintf(stderr, "stg l=%lld g=%d vram=%d cpu=%d pcie=%d cap=%d pub=%d\n", (long long) l, grp,
+                         cb[0], cb[1], cb[2], cap_b, (int) pub);
+        }
         if (*(volatile uint32_t*) h_flagA_ != want) {        // the pool did not publish a plan: an empty one
             sink_.counts[0] = 0;
             sink_.counts[1] = 0;
@@ -836,6 +894,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
         ms_pool += ms_since(b);
     }
+    if (g_stg) g_stg_stat.dump(G == 2 ? (int) (staging_cap_ / 2) : (int) staging_cap_);
     progress_at("verify window: waiting for the GPU to finish the window (flags A/B/M raised)", (int64_t) T);
     const hipError_t se = hipStreamSynchronize(cs_);
     if (se != hipSuccess) { err = std::string("verify: ") + hipGetErrorString(se); return false; }
@@ -856,6 +915,23 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         }
     }
     for (int t = 0; t < T; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
+    if (static const bool dbgw = std::getenv("STRATA_DBG_WINDOW") != nullptr; dbgw) {   // the window's columns
+        static int printed = 0;
+        if (printed < 2) {   // the T=1 window and the first multi-token window
+            ++printed;
+            hipDeviceSynchronize();
+            std::vector<float> h((size_t) T * (size_t) n_vocab_);
+            hipMemcpy(h.data(), head_logits_, h.size() * 4, hipMemcpyDeviceToHost);
+            for (int t = 0; t < T; ++t) {
+                const float* row = h.data() + (size_t) t * n_vocab_;
+                int64_t am = 0;
+                for (int64_t v = 1; v < n_vocab_; ++v)
+                    if (row[v] > row[am]) am = v;
+                std::fprintf(stderr, "strata dbg: window at %lld, T=%d, col %d: out %d  argmax %lld  max %.6f\n",
+                             (long long) pos0, T, t, out[t], (long long) am, (double) row[am]);
+            }
+        }
+    }
     if (static const bool dbg = std::getenv("STRATA_DBG_NAN") != nullptr; dbg) {   // debug: the first non-finite head
         static bool reported = false;
         if (!reported) {
@@ -892,7 +968,7 @@ void Verifier::set_plan_slot(int grp) {
     sink_.ptr2 = sink_.ptr + cap;
     sink_.start2 = base + ptr_off + 4 * cap;
     const int G = groups_[last_t_] > 0 ? groups_[last_t_] : 1;
-    const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
+const int64_t per = G == 2 ? staging_cap_ / 2 : staging_cap_;
     sink_.staging = (unsigned long long) (staging_ + (size_t) (grp * per) * strata::kernels::cpu::expert_layout().max_blob);
     sink_.staging_cap = per;
 }

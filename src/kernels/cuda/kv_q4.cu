@@ -77,15 +77,15 @@ __device__ __forceinline__ uint16_t q4_group(float x, int lane, uint8_t& byte) {
     float amax = fabsf(x), mval = x;
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) {
-        const float a = __shfl_xor_sync(0xffffffffffffffffull, amax, o, 32);
-        const float v = __shfl_xor_sync(0xffffffffffffffffull, mval, o, 32);
+        const float a = __shfl_xor_sync(0xffffffffffffffffull, amax, o);
+        const float v = __shfl_xor_sync(0xffffffffffffffffull, mval, o);
         if (a > amax || (a == amax && v > mval)) { amax = a; mval = v; }
     }
     const float d = mval / -8.0f;
     const float id = d != 0.0f ? 1.0f / d : 0.0f;
     int q = __float2int_rz(x * id + 8.5f);
     const uint8_t qc = (uint8_t) (q < 0 ? 0 : (q > 15 ? 15 : q));
-    const uint8_t qhi = __shfl_down_sync(0xffffffffffffffffull, qc, 16, 32);
+    const uint8_t qhi = __shfl_down_sync(0xffffffffffffffffull, qc, 16);
     byte = (uint8_t) (qc | (qhi << 4));
     (void) lane;
     return f16_from_f32(d);

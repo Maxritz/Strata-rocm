@@ -60,7 +60,7 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_kernel(float* __restrict
         sq_part = oc * oc;
     }
     // RMS over the head's 128 outputs: warps of row group 0 are threads 0..127.
-    for (int o2 = 16; o2 > 0; o2 >>= 1) sq_part += __shfl_xor_sync(0xffffffffffffffffull, sq_part, o2, 32);
+    for (int o2 = 16; o2 > 0; o2 >>= 1) sq_part += __shfl_xor_sync(0xffffffffffffffffull, sq_part, o2);
     if ((tid & 31) == 0) wsum[tid >> 5] = sq_part;
     __syncthreads();
     if (rg == 0) {
@@ -84,7 +84,7 @@ __global__ void __launch_bounds__(S) gdn_conv_l2_kernel(float* __restrict__ hist
     float y = sum / (1.0f + __expf(-sum));
     if ((int) blockIdx.x < qk_heads) {
         float sq = y * y;
-        for (int o = 16; o > 0; o >>= 1) sq += __shfl_xor_sync(0xffffffffffffffffull, sq, o, 32);
+        for (int o = 16; o > 0; o >>= 1) sq += __shfl_xor_sync(0xffffffffffffffffull, sq, o);
         if ((threadIdx.x & 31) == 0) part[threadIdx.x >> 5] = sq;
         __syncthreads();
         const float ss = part[0] + part[1] + part[2] + part[3];
@@ -112,7 +112,7 @@ __global__ void __launch_bounds__(256) gdn_ab_kernel(const float* __restrict__ x
         acc = fmaf(__uint_as_float(wv.z << 16), xb.x, acc); acc = fmaf(__uint_as_float(wv.z & 0xffff0000u), xb.y, acc);
         acc = fmaf(__uint_as_float(wv.w << 16), xb.z, acc); acc = fmaf(__uint_as_float(wv.w & 0xffff0000u), xb.w, acc);
     }
-    for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffffffffffull, acc, o, 32);
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffffffffffull, acc, o);
     if (lane != 0) return;
     if (is_beta) {
         beta[r] = 1.0f / (1.0f + __expf(-acc));

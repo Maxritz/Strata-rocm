@@ -40,7 +40,7 @@ __global__ void bf16_gemv_warp_kernel(const uint16_t* __restrict__ x, const uint
     float acc = 0.0f;
     for (long long i = lane; i < n_in; i += 32)
         acc += f32_from_bf16(x[i]) * f32_from_bf16(row[i]);
-    for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, acc, off, 32);
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, acc, off);
     if (lane == 0) y[o] = acc;
 }
 

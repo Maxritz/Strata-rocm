@@ -48,13 +48,13 @@ __global__ void cvec_kernel(float* __restrict__ R, const float* __restrict__ dir
     if (steer && mode == 0) {
         __shared__ float part[THREADS / 32];
 #pragma unroll
-        for (int o = 16; o > 0; o >>= 1) dot += __shfl_xor_sync(0xffffffffffffffffull, dot, o, 32);
+        for (int o = 16; o > 0; o >>= 1) dot += __shfl_xor_sync(0xffffffffffffffffull, dot, o);
         if ((threadIdx.x & 31) == 0) part[threadIdx.x >> 5] = dot;
         __syncthreads();
         if (threadIdx.x < 32) {
             float p = threadIdx.x < THREADS / 32 ? part[threadIdx.x] : 0.0f;
 #pragma unroll
-            for (int o = 16; o > 0; o >>= 1) p += __shfl_xor_sync(0xffffffffffffffffull, p, o, 32);
+            for (int o = 16; o > 0; o >>= 1) p += __shfl_xor_sync(0xffffffffffffffffull, p, o);
             if (threadIdx.x == 0) part[0] = p;
         }
         __syncthreads();

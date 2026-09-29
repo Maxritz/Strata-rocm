@@ -103,7 +103,7 @@ __global__ void to_f16_kernel(const float* __restrict__ in, uint16_t* __restrict
 // A wrong scalar here is the quiet failure mode: sigmoid bounds the damage to [0,1], so a gate that should be
 // 0.5 and reads 1.0 scales the shared expert by 2x and produces perfectly finite, perfectly plausible logits.
 __device__ __forceinline__ double warp_sum_d(double v) {
-    for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, v, off, 32);
+    for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, v, off);
     return __shfl_sync(0xFFFFFFFFFFFFFFFFull, v, 0);
 }
 

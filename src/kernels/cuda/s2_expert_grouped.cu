@@ -102,7 +102,7 @@ __device__ __forceinline__ float row_dot_s2_q8(const uint8_t* __restrict__ codes
 
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, v, off, 32);
+    for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, v, off);
     return v;
 }
 

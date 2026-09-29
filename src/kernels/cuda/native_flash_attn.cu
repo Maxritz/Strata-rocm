@@ -41,7 +41,7 @@ template<int Width> __device__ __forceinline__ float warp_sum(float x) {
 __device__ __forceinline__ float warp_max(float x) {
 #pragma unroll
     for (int offset = 16; offset; offset >>= 1)
-        x = fmaxf(x, __shfl_xor_sync(0xffffffffffffffffull, x, offset, 32));
+        x = fmaxf(x, __shfl_xor_sync(0xffffffffffffffffull, x, offset));
     return x;
 }
 
@@ -105,7 +105,7 @@ __global__ void attend(const float* __restrict__ q, const half* __restrict__ k,
         }
 #pragma unroll
         for (int offset = 8; offset < 32; offset <<= 1)
-            next_max = fmaxf(next_max, __shfl_xor_sync(0xffffffffffffffffull, next_max, offset, 32));
+            next_max = fmaxf(next_max, __shfl_xor_sync(0xffffffffffffffffull, next_max, offset));
         const float rescale = expf(maximum - next_max);
         maximum = next_max;
         score = expf(score - maximum);

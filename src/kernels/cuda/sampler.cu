@@ -131,8 +131,8 @@ __global__ void sampler_greedy_kernel(const float* __restrict__ logits, int n_vo
         if (s > bv) { bv = s; best = v; }
     }
     for (int off = 16; off > 0; off >>= 1) {
-        const float ov = __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, bv, off, 32);
-        const int oi = __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, best, off, 32);
+        const float ov = __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, bv, off);
+        const int oi = __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, best, off);
         if (ov > bv || (ov == bv && oi < best)) { bv = ov; best = oi; }
     }
     __shared__ float sv[32];
@@ -145,8 +145,8 @@ __global__ void sampler_greedy_kernel(const float* __restrict__ logits, int n_vo
         float wv = lane < nw ? sv[lane] : __int_as_float(0xff800000);
         int wi = lane < nw ? si[lane] : n_vocab;
         for (int off = 16; off > 0; off >>= 1) {
-            const float ov = __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, wv, off, 32);
-            const int oi = __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, wi, off, 32);
+            const float ov = __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, wv, off);
+            const int oi = __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, wi, off);
             if (ov > wv || (ov == wv && oi < wi)) { wv = ov; wi = oi; }
         }
         // A tie between two `-inf` candidates leaves `wi == n_vocab`, and the serial version answered 0.
@@ -233,8 +233,8 @@ __global__ void sampler_kernel(const float* __restrict__ logits, int n_vocab, in
             if (s > bv) { bv = s; best = v; }
         }
         for (int off = 16; off > 0; off >>= 1) {
-            const float ov = __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, bv, off, 32);
-            const int oi = __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, best, off, 32);
+            const float ov = __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, bv, off);
+            const int oi = __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, best, off);
             if (ov > bv || (ov == bv && oi < best)) { bv = ov; best = oi; }
         }
         const int warp = (int) (threadIdx.x >> 5), lane = (int) (threadIdx.x & 31);
@@ -245,8 +245,8 @@ __global__ void sampler_kernel(const float* __restrict__ logits, int n_vocab, in
             float wv = lane < nw ? sv[lane] : __int_as_float(0xff800000);
             int wi = lane < nw ? si[lane] : n_vocab;
             for (int off = 16; off > 0; off >>= 1) {
-                const float ov = __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, wv, off, 32);
-                const int oi = __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, wi, off, 32);
+                const float ov = __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, wv, off);
+                const int oi = __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, wi, off);
                 if (ov > wv || (ov == wv && oi < wi)) { wv = ov; wi = oi; }
             }
             if (lane == 0) { sel_ids[i] = (wi < n_vocab) ? wi : 0; sel_logit[i] = wv; }

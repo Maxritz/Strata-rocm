@@ -460,13 +460,15 @@ Use type punning: (const char4&)a casts the int to char4 without changing the bi
 - `fused_gr_read_multi` `hipErrorInvalidValue`: `kFusedGrMaxT=8` asked for 80 KB LDS, but RDNA4 opt-in LDS ceiling is 64 KB, so the `hipFuncSetAttribute` silently failed and the 60 KB launch hit the default limit. Fixed by clamping `hipFuncAttributeMaxDynamicSharedMemorySize` to `hipDeviceAttributeMaxSharedMemoryPerBlock` and guarding the launch size.
 - `layer.cpp` router: the 512-only `native_router_top10` was hard-erroring on 288 experts. Fixed to fall back to the generic `router_top10` when `g.n_expert != 512 || k != 10` (same pattern as `prefill.cpp` and `mtp.cpp`).
 - `native_expert_layout` / `iq_row_bytes` now accept type 6 and type 8.
+- `verify.cpp` **arena-ordering fix (this was the speculation defeat)**: `hipMemset(arena_, 0, count.used)` ran on the legacy default stream, which is NOT ordered against the verifier's `hipStreamNonBlocking` streams; on ROCm 10.1 it executed *after the first verify window*, wiping that window's residual (`R_`) and the GDN/QSA snapshots (`qkv_L_`, `h_L_`, `z_`, `gate_L_`, `beta_L_`) that the first `commit` graph then reads, so the first committed recurrent state was built from zeros. Every later window inherited the corrupted state. The clear now runs on `cs_` with an explicit `hipStreamSynchronize`; the same ordering was applied to `d_parts` and the penalty history `d_hist` in `generate.cpp`.
+- `iq_kernels.cu` `vec_dot_q8_0_q8_1`: the activation was indexed by both `kbx` and `iqs`, double-counting the offset and reading past the row on the last block. The weight block now advances by `kbx`, the activation by `iqs`.
 
 ### 11.4 Measured end-to-end (gfx1201, spec 4, 280-slot VRAM cache, bootstrap profile)
 - decode 8.20 tok/s (16 tokens / 1950 ms)
 - prefill 4.22 tok/s (6 tokens / 1420 ms; TTFT 1614 ms)
 - CPU expert pool dominates: ~48.8 ms/round
 - expert arena is currently hiphostregister-pinned fully (42.19 GiB, 0.74 GiB/s at startup)
-- speculation: 0 / 45 drafts accepted (pure overhead; `--spec 4` recommended to be disabled until fixed)
+- speculation: 0 / 45 drafts accepted at this snapshot (engine 0.1.15). The cause was the verify-window arena wipe above; post-fix numbers are in 11.5.
 - output decodes to chat structure (`<|im_start|>assistant ...`), but prompt must be tokenized from `tokenizer.json` to judge coherence (see 11.7).
 
 ### 11.5 Open work / hot items (TODO)
@@ -474,7 +476,7 @@ Use type punning: (const char4&)a casts the int to char4 without changing the bi
 - **RAM/VR low**: replace the full 42 GiB arena with file-backed mmap + a bounded pinned staging ring (demand-load only hot experts).
 - **GPU utilization**: misses still go to the CPU pool (48.8 ms/round). Need the miss path to also run on the GPU via a tiled `native_expert_grouped` (HipKittens-style shared-memory tiling) so the GPU is the bottleneck, not idle.
 - **Real hot-expert profile**: build from `route_reap288.bin` (768 records), not the round-robin bootstrap profile (hit rate ~13/1579).
-- **Speculation**: 0/45 — debug the verify/draft agreement or turn it off.
+- **Speculation**: FIXED. The verify-window arena wipe in 11.3 caused the 0/N acceptance. Post-fix validation: `--spec 2`, `--spec 4` and `--spec 6` produce the *identical* greedy stream (they diverged before); feeding the engine's own continuation back as `--spec-oracle` accepts 12/12 at `--spec 4` and 8/8 at `--spec 2`; repeated runs are bit-identical. Decode 23.5 tok/s at `--spec 4` with accepted drafts (14.2 tok/s at `--spec 2` with all drafts rejected), measured on a 64-token run with `--expert-cache 2600`.
 - **`hipModuleUnload ... while stream is capturing`**: NOT called by Strata; comes from the ROCm runtime tearing down a module (likely the lazily-loaded Q5_K head module / graph-captured module) mid-capture. Fix: defer that module's teardown past `hipStreamEndCapture`, or load the head module eagerly before capture begins. TODO in `src/core/native_head.cpp`.
 
 ### 11.6 Verification commands

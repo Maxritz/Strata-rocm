@@ -40,7 +40,7 @@ __global__ void kv_append_q8_kernel(int8_t* __restrict__ k_q, int8_t* __restrict
     const float x = (is_v ? vcur : kcur)[h * head_dim + g * KV_Q8_GROUP + t];
     // max |x| over the 64 values: two warps, then combine through shared memory in a fixed order
     float a = fabsf(x);
-    for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffffffffffull, a, o, 32));
+    for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffffffffffull, a, o));
     __shared__ float warp_max[2];
     if ((t & 31) == 0) warp_max[t >> 5] = a;
     __syncthreads();

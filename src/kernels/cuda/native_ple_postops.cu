@@ -36,7 +36,7 @@ namespace strata::kernels {
 namespace {
 constexpr int N = 2560, H = 4, D = N * H, HISTORY = 9;
 __device__ float warp_sum(float x) {
-    for (int offset = 16; offset; offset >>= 1) x += __shfl_xor_sync(0xffffffffffffffffull, x, offset, 32);
+    for (int offset = 16; offset; offset >>= 1) x += __shfl_xor_sync(0xffffffffffffffffull, x, offset);
     return x;
 }
 __global__ void gate_kernel(const float* key, const float* query, float* gate, float scale) {
@@ -92,7 +92,7 @@ __global__ void conv_residual_kernel(const float* history, const float* normaliz
 // weighted_rms_norm (native_gr_norm.cu) with the gamma row repeating every H rows (one token's H groups)
 __device__ float norm_warp_sum(float value) {
 #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) value += __shfl_xor_sync(0xffffffffffffffffull, value, offset, 32);
+    for (int offset = 16; offset > 0; offset >>= 1) value += __shfl_xor_sync(0xffffffffffffffffull, value, offset);
     return value;
 }
 __global__ void rms_rep_kernel(const float* __restrict__ input, const float* __restrict__ gamma,

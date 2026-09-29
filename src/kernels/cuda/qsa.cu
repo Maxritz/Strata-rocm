@@ -261,7 +261,7 @@ __global__ void qsa_index_kernel(const float* __restrict__ pooled,
     for (int d = lane; d < idx_dim; d += 32)
         acc = __dadd_rn(acc, __dmul_rn((double) pooled[(size_t) b * idx_dim + d],
                                        (double) q_idx[(size_t) wid * idx_dim + d]));
-    for (int o = 16; o > 0; o >>= 1) acc = __dadd_rn(acc, __shfl_xor_sync(0xffffffffffffffffull, acc, o, 32));
+    for (int o = 16; o > 0; o >>= 1) acc = __dadd_rn(acc, __shfl_xor_sync(0xffffffffffffffffull, acc, o));
     if (lane == 0) s_dot[wid] = acc;
     __syncthreads();
 
@@ -419,12 +419,12 @@ __global__ void kv_gather_kernel(const uint16_t* __restrict__ k_pool, const uint
 // ================= 6. qsa_attend =================
 
 __device__ __forceinline__ float warp_max(float v) {
-    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffffffffffull, v, o, 32));
+    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffffffffffull, v, o));
     return v;
 }
 
 __device__ __forceinline__ float warp_sum(float v) {
-    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffffffffffull, v, o, 32);
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffffffffffull, v, o);
     return v;
 }
 

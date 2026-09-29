@@ -19,12 +19,12 @@ constexpr int S = 128, HK = 16, HV = 48, C = 10240;
 
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffffffffffull, v, o, 32);
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffffffffffull, v, o);
     return v;
 }
 __device__ __forceinline__ float warp_max(float v) {
 #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffffffffffull, v, o, 32));
+    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffffffffffull, v, o));
     return v;
 }
 __device__ __forceinline__ uint16_t bf(float f) {
@@ -229,8 +229,8 @@ __global__ void route_kernel(const float* __restrict__ logits, int32_t* __restri
         for (int i = 1; i < 16; ++i) if (v[i] > best) { best = v[i]; ex = lane + i * 32; }
 #pragma unroll
         for (int m = 16; m; m >>= 1) {
-            const float ob = __shfl_xor_sync(0xffffffffffffffffull, best, m, 32);
-            const int oi = __shfl_xor_sync(0xffffffffffffffffull, ex, m, 32);
+            const float ob = __shfl_xor_sync(0xffffffffffffffffull, best, m);
+            const int oi = __shfl_xor_sync(0xffffffffffffffffull, ex, m);
             if (ob > best || (ob == best && oi < ex)) { best = ob; ex = oi; }
         }
         if ((ex & 31) == lane) { v[ex / 32] = -INFINITY; selected_sum += best; }
@@ -359,7 +359,7 @@ __global__ void kv_append_kernel(const float* __restrict__ K, const float* __res
         return;
     }
     float a = fabsf(x);
-    for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffffffffffull, a, o, 32));
+    for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffffffffffull, a, o));
     __shared__ float wm[2];
     if ((threadIdx.x & 31) == 0) wm[threadIdx.x >> 5] = a;
     __syncthreads();

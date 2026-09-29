@@ -38,7 +38,7 @@ constexpr int D = 128, R = 4, ROT = 64, THREADS = 256;
 __device__ float warp_sum(float x) {
 #pragma unroll
     for (int offset = 16; offset; offset >>= 1)
-        x += __shfl_xor_sync(0xffffffffffffffffull, x, offset, 32);
+        x += __shfl_xor_sync(0xffffffffffffffffull, x, offset);
     return x;
 }
 __global__ void append(const float* __restrict__ raw, const int32_t* __restrict__ pos_dev,

@@ -68,12 +68,12 @@ __device__ __forceinline__ float silu_f(float x) { return x / (1.0f + expf(-x));
 __device__ __forceinline__ float sigmoid_f(float x) { return 1.0f / (1.0f + expf(-x)); }
 
 __device__ __forceinline__ double warp_sum(double v) {
-    for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, v, off, 32);
+    for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, v, off);
     return __shfl_sync(0xFFFFFFFFFFFFFFFFull, v, 0);
 }
 
 __device__ __forceinline__ float warp_sumf(float v) {
-    for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, v, off, 32);
+    for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, v, off);
     return __shfl_sync(0xFFFFFFFFFFFFFFFFull, v, 0);
 }
 
