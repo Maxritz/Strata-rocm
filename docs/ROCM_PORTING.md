@@ -547,4 +547,42 @@ re-litigated):
 `ExpertCache::verify_slot: slot 0 differs from the arena at byte 0` (the profile has 24576 ranked pairs
 vs 5243 per-layer slots), so per-layer admission is currently unusable.
 
+### 11.9 Toward the RDNA4 target: prefill 800 tok/s, TG 40+ (converged plan)
+
+Grounded in the §11.8 measurements: PCIe 4.0 x16 (~30 GB/s) is the hard link, 16 GB VRAM, ~33 GiB of
+experts, ~1.5 GiB dense, 2-4 GB KV. This section is the converged result of a delegated 3-agent debate
+(Poolside), corrected against the measured facts.
+
+**Prefill 800 tok/s is a LARGE-CHUNK target and is nearly met already.** The per-chunk expert read is
+paid once per layer and then reused across the chunk, so throughput scales with chunk length:
+a 39-token chunk reads ~8 GiB for 39 tokens (PCIe-bound, 80 tok/s), while a 2119-token chunk amortizes
+those same classes of reads over 54x the tokens (measured **628 tok/s pre-warm-up**, ~770 with the §11.8
+warm-up). The 80 tok/s figure is a short-chunk artifact, not the model's ceiling. Amortization:
+unique-experts/token falls from ~5.4 (39 tok) to ~0.14 (2048 tok, all 288 experts/layer).
+
+**Ranked actions (highest ceiling first):**
+
+1. **(DONE, §11.8)** rocBLAS warm-up at load — removes the ~630 ms one-time init from the first token.
+2. **Prefill with large chunks** (>=1024, ideally 2048). The dominant control; most of the 80 -> 800.
+3. **Tiered expert residency** — the only lever that beats the link (a hit reads 0 B over PCIe):
+   VRAM hot set from the routing-frequency profile (`--expert-profile`), per-layer quota sized to ~6-8 GB
+   (16 - 1.5 dense - 2-4 KV - scratch); pinned arena = RAM warm tier; pack = cold. **Fix the
+   `--expert-cache-per-layer` `verify_slot` abort first** — per-layer admission is currently unusable.
+4. **Decode/TG 40+.** Speculative decoding is already wired (§11.5: 23.5 tok/s at `--spec 4`, identical
+   greedy stream). Push it with warm experts for the verify pass, a larger draft depth, and a tuned
+   CPU-pool-vs-GPU split. Target 40+.
+5. **KV cache in VRAM** (block layout) so the 2-4 GB KV does not displace the hot expert set.
+6. **Later micro-opts (low ceiling):** resident-set quantization; expert weight layout for rocBLAS.
+
+**Physically impossible on this link (do not chase):** zero PCIe transfers (cold experts must cross it);
+>30 GB/s (saturated); a fast 39-token chunk (it needs a fixed ~8 GiB); any all-experts-resident scheme
+(33 GiB >> 16 GB VRAM).
+
+**Corrections to the delegated plans.** Both agents proposed "compute/transfer overlap" as a win, but
+§11.8 measured a naive per-group overlap as a **regression** (524 vs 485 ms) — the read and the compute
+contend for the same saturated link and SMs; overlap only helps if the overlapped work is *independent*
+of the read (e.g. the next layer's dense/attention), which is unproven here. Their VRAM budgets
+(>12 GB for experts) are also infeasible on 16 GB.
+
+
 
