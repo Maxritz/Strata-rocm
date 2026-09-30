@@ -22,20 +22,26 @@ what is easy; do not mark anything green that was not measured.
 
 ## Current position (update this line as clauses close)
 
+**The authoritative task ledgers are `docs/TODO.md` (all outstanding items, with priorities and what "done"
+means) and `docs/RESEARCH_NOTES.md` (a verified 45-paper corpus screened against this exact hardware).  Read
+those two before picking work; `docs/PAPER_FINDINGS.md` maps the Strata paper's findings to the clauses.**
+
 - DONE: D1–D7 (FP4 GEMV 1.140 TOPS · MTP 37 tok/s · prefill-fit · spec-6 LDS · ring hang · WMMA peak 196 ·
   K1a layout parity · **K1b int4 WMMA GEMM 55.8-64.7 T-MAC/s, parity PASS, acceptance (b) met**).  Plus: CPU
-  probe SIGILL fix (probe out of the -mavx512 TU) with the AVX2 oracle validated; upstream 8acd17c/53f9e7a/#257.
-- **STRATEGIC FINDING (drives the order):** prefill is **bandwidth-bound on host-arena expert streaming** (upstream
-  #269), not compute.  So a faster GEMM does not by itself raise prefill, and for the RUNNING model the int4 MMA
-  would repack 2-bit Q2_0 to 4-bit, DOUBLING the streamed bytes.  K1c therefore targets **already-4-bit** models
-  (Q4_K / IQ4_XS), which need their architecture first.  Levers for prefill speed, in order: larger chunks,
-  hot-set residency, and getting the non-resident experts off the CPU (MMQ, done for the ring).
-- **OPEN NOW: M1 = `olmoe`** (16 L, hidden 2048, 64 experts top-8, 16/16 MHA, Q4_K).  It is the simplest NEW
-  architecture AND 4-bit, so it is the first model on which the K1 WMMA path is both correct and a win.
-  Then **K1c** (wire the WMMA GEMM into prefill/grouped-expert) on that model, then qwen35moe, deepseek2(MLA),
-  gemma4, k2-horizon, laguna, gpt-oss(MXFP4 = K2).
-- Then: K2 (MXFP4/NVFP4 tensor core), K3 (16B repack), K4 (fusion); E1 transient release (code done, GPU gain
-  unmeasured), E2 hot-expert profile, E3 decode 60, E4 adaptive chunk, E5-E7.
+  probe SIGILL fixed (the P0 #0 crash) with the AVX2 oracle validated; upstream 8acd17c/53f9e7a/#257.
+- **STRATEGIC FINDING:** prefill is **bandwidth-bound on host-arena expert streaming** (upstream #269), not
+  compute, so a faster GEMM does not raise it by itself; for the RUNNING model the int4 MMA would repack 2-bit
+  Q2_0 to 4-bit, DOUBLING the stream.  K1c therefore targets **already-4-bit** models.
+- **OPEN NOW (per TODO "immediate next action" + P1 #3):** the next model is **`deepseek2`/GLM-4.7-Flash**
+  (TODO calls it the best-value shelf item: MLA, 64 experts/4, **all quants already supported** -> pure decoder
+  work) or **`qwen35moe`** (GDN+MoE reuse directly; new code is GQA + interleaved partial-RoPE; gated behind the
+  MXFP4 primitive for its UD/NVFP4 files).  `olmoe` is the simplest but is TODO #11, not first.
+- Then: K2 (MXFP4/NVFP4 tensor core, TODO #6 - gates the biggest models), K3 (16B repack), K4 (fusion);
+  E1 transient release (code done, GPU gain unmeasured), E2 hot-expert profile, E3 decode 60 (TODO #23), E4-E7.
+- **K5 (new, from the paper - docs/PAPER_FINDINGS.md):** a **T-MAC-style LUT** CPU expert kernel.  The paper's
+  finding 7 says the i-quants are limited by CPU *arithmetic* (not RAM), and this host has **no AVX-512**, so
+  the IQ2_S/Q2_0 CPU rows gate every model's decode here.  T-MAC (arXiv:2407.00088) reports ~4x over llama.cpp
+  with bit-wise table lookups (no dequant, no multiplies).  This is the highest-value kernel for this machine.
 
 ## Model set this must serve
 
