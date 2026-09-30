@@ -54,9 +54,16 @@ ck_tile's `amdgcn_mma` layout (`G:\ROCM10RT-gfx1201\include\ck_tile\core\arch\mm
   with G-COH re-run green.
 - **K1a DONE (2026-10-01, `eeba8e7`):** 16×16×16 fragment layout (RDNA4 ISA §7.12.2) + signed-int4 MMA —
   parity PASS 0/256.  The fragment-layout risk is retired.
-- **K1b OPEN:** tiled GEMM parity PASS (0 wrong) but **7.5–11 T-MAC/s** unstaged (`f76d5a2`) / 5.9–7.0 LDS-staged.
-  Both are latency/sync-bound (2 MMAs per `__syncthreads`), not compute-bound; bank-padding regressed.  Needs the
-  standard GEMM engineering: double-buffered LDS, ≥8 MMAs per barrier, vectorized 128-bit loads, higher tile.
+- **K1b DONE (2026-10-01, `bench/micro/wmma_iu4_gemm_lds.cu`):** tiled int4 WMMA GEMM, parity **PASS 0 wrong**.
+  Key fix (found by disassembly, not guessed): store tiles **packed** and read each fragment as **one `ds_read_b32`**
+  (A row-major packed; B **N-major packed — the K3 layout**).  Staging becomes a pure 128-bit copy; no
+  unpack/repack.  15.8 → **52.8 T-MAC/s @2048³, 64.7 @4096³, 55.8 @2048×1280×2560 (expert gate/up, 2048-tok chunk)**
+  → **acceptance (b) MET**.  4 accumulators/wave (16×64), BK=64 → 16 MMAs/barrier.
+  - Measured: `wmma_iu4_gemm_lds.exe 2048 1280 2560` → 55.8; `… 4096 4096 4096` → 64.7.
+  - Small-M still lower (512×2560×2560 = 34.2, 1024×640×2560 = 24.8) — launch/memory-bound; the grouped/persistent
+    form (K1c) is the fix, not a dense-tile tweak.
+- **K1c OPEN:** wire this into prefill's MMQ slot (acceptance (c), G-COH re-run).  Requires the grouped form:
+  pack each expert's weight N-major (K3) and dispatch [concatenated tokens × N × K] per expert.
 - **Owner-clause:** do not enable until (a) and (b) pass.
 
 ### K2 — MXFP4 / NVFP4 tensor-core path  *(TODO §6: the RDNA4 FP4 path and WMMA are the SAME project)*
