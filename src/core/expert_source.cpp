@@ -41,7 +41,18 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
     if (n_layers <= 0 || n_expert <= 0) { err = "FileExpertSource: the geometry is empty"; return false; }
     n_expert_ = n_expert;
     blobs_ = n_layers * n_expert;
-    const uint64_t want = (uint64_t) blobs_ * (uint64_t) strata::kernels::cpu::BLOB;
+    // The pack's blob sizes are PER LAYER (a native pack's gate/up/down differ by layer), so the file size is the
+    // layout's total, not `blobs * BLOB`.  Using the uniform BLOB rejected every native pack
+    // ("FileExpertSource: ... is not the pack this geometry came from").
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    if (lay.n_layers != n_layers || lay.n_expert != n_expert) {
+        err = "FileExpertSource: geometry " + std::to_string(n_layers) + "x" + std::to_string(n_expert) +
+              " differs from the pack's " + std::to_string(lay.n_layers) + "x" + std::to_string(lay.n_expert);
+        return false;
+    }
+    uint64_t want = 0;
+    for (int64_t l = 0; l < n_layers; ++l) want += lay.blob_bytes(l) * (uint64_t) n_expert;
+    mapped_ = want;
     const std::string path = pack_dir + "/experts.bin";
 
 #if defined(_WIN32)
@@ -132,12 +143,13 @@ void FileExpertSource::close() {
     mapping_ = nullptr;
     file_ = nullptr;
 #else
-    if (base_ != nullptr) munmap((void*) base_, (size_t) blobs_ * (size_t) strata::kernels::cpu::BLOB);
+    if (base_ != nullptr) munmap((void*) base_, (size_t) mapped_);
     if (fd_ >= 0) ::close(fd_);
     fd_ = -1;
 #endif
     base_ = nullptr;
     blobs_ = 0;
+    mapped_ = 0;
     reads_ = 0;
 }
 
@@ -152,7 +164,7 @@ const uint8_t* FileExpertSource::blob(int64_t layer, int64_t expert) {
     const int64_t i = layer * n_expert_ + expert;
     if (i >= blobs_) return nullptr;
     ++reads_;
-    return base_ + (size_t) i * strata::kernels::cpu::BLOB;
+    return base_ + strata::kernels::cpu::expert_layout().blob_offset(layer, expert);
 }
 
 // ================================ THE ADAPTER ================================

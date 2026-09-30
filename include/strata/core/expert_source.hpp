@@ -287,6 +287,7 @@ private:
     int64_t blobs_ = 0;
     int64_t n_expert_ = 0;
     int64_t reads_ = 0;
+    uint64_t mapped_ = 0;   ///< bytes mapped (the layout total; munmap needs it on POSIX)
 #if defined(_WIN32)
     void* file_ = nullptr;
     void* mapping_ = nullptr;
