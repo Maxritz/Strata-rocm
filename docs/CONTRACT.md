@@ -108,6 +108,15 @@ Each is DONE only when it passes G-COH and reports decode/prefill on gfx1201.
   `native_expert_parity`/`mla_parity`/`ds2_moe_parity` all green after the change.  **The gate is still OPEN**:
   G-COH (L1 <= 1e-3 vs a CPU/llama.cpp reference) has not been measured, prefill is one-token-at-a-time, and
   decode/prefill are far below G-PERF.
+  - **M2 perf step 9 (2026-10-01): BATCHED PREFILL (blocker A) — prefill 12.94 -> 82.59 tok/s (6.4x) on a
+    2050-token chunk, 18.78 -> 141.22 (7.5x) on 130 tokens, byte-identical output.**  `ds2_prefill` runs the
+    chunk through each layer at once: MLA projections as one MMQ GEMM, one causal attention kernel, and the
+    routed experts grouped so each distinct expert is computed once per chunk on the GPU (`native_expert_grouped`
+    reading the arena device alias).  The Q5_K/Q6_K grouped-expert dispatch (GLM's 10 Q5_K + 9 Q6_K layers) is
+    the blocker-B prerequisite.  New gates: `ds2_prefill_parity` (attention 0.0, rope 0.0, rms 4.0e-08),
+    `native_expert_parity` layers 1/5/10 0 failures.  Full record in `docs/DEEPSEEK.md` §7 (M2 step 9).  **The
+    gate is still OPEN** (G-COH unscored; decode-60 unchanged, experts are still on the CPU for decode and over
+    PCIe for prefill) — this closes blocker A's *mechanism*, not G-PERF.
   - **M2 perf step 8 (2026-10-01, `cb87340` + `4269a8b`): decode 12.46 -> 19.05, prefill 11.90 -> 17.35 tok/s,
     byte-identical output.**  `STRATA_DS2_TIMING=1` (`ds2_token`) + a `--no-pool` control showed the path is
     **host-enqueue-bound** (device event span == host enqueue), not GPU-bound.  Fixes: `native_mmvq_heads` —

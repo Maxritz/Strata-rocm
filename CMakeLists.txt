@@ -222,6 +222,7 @@ if(STRATA_ENABLE_HIP)
                           src/kernels/cuda/native_qsa.cu
                           src/kernels/cuda/native_rope.cu
                           src/kernels/cuda/mla.cu
+                          src/kernels/cuda/ds2_prefill.cu
                           src/kernels/cuda/ds2_moe.cu
                           src/kernels/cuda/native_ple_postops.cu
                           src/kernels/cuda/native_flash_attn.cu
@@ -315,7 +316,8 @@ if(STRATA_ENABLE_HIP)
   # what composes them into a token.  No tokenizer - the prompt arrives as ids - because Gate C1 compares logits
   # against llama.cpp on the SAME ids and a tokenizer on one side of that comparison is a second variable.
   # plan v0.3 P5: batched prompt processing (tensor-core GEMMs through cuBLAS).
-   add_library(strata_prefill STATIC src/prefill/gemm.cu src/prefill/kernels.cu src/prefill/prefill.cpp)
+   add_library(strata_prefill STATIC src/prefill/gemm.cu src/prefill/kernels.cu src/prefill/prefill.cpp
+     src/core/ds2_prefill.cpp)
    target_include_directories(strata_prefill PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${ROCM_INCLUDE})
    target_link_libraries(strata_prefill PUBLIC strata_engine ${ROCM_LIBRARY}/hipblas.lib ${ROCM_LIBRARY}/amdhip64.lib)
    strata_apply_hip_flags(strata_prefill)
@@ -422,6 +424,11 @@ if(STRATA_ENABLE_HIP)
   target_include_directories(native_mmvq_heads_parity PRIVATE ${ROCM_INCLUDE})
   target_link_libraries(native_mmvq_heads_parity PRIVATE strata_kernels ${ROCM_LIBRARY}/amdhip64.lib)
   add_test(NAME native_mmvq_heads_parity COMMAND native_mmvq_heads_parity --selftest)
+
+  # The batched MLA companions (`src/kernels/cuda/ds2_prefill.cu`) vs their single-token namesakes.
+  add_executable(ds2_prefill_parity src/kernels/ds2_prefill_parity.cpp)
+  target_include_directories(ds2_prefill_parity PRIVATE ${ROCM_INCLUDE})
+  target_link_libraries(ds2_prefill_parity PRIVATE strata_kernels ${ROCM_LIBRARY}/amdhip64.lib)
 
   add_executable(ds2_moe_parity src/kernels/ds2_moe_parity.cpp)
   target_include_directories(ds2_moe_parity PRIVATE ${ROCM_INCLUDE})

@@ -44,6 +44,8 @@
 #include "strata/core/mtp.hpp"
 #include "strata/prefill/prefill.hpp"
 #include "strata/core/native_dense.hpp"
+#include "strata/core/ds2_prefill.hpp"
+#include "strata/prefill/moe_mmq.hpp"
 #include "strata/program/logits_selection.hpp"
 #include "strata/spec/draft_policy.hpp"
 #include "strata/spec/suffix_drafter.hpp"
@@ -635,7 +637,8 @@ int run_deepseek2(Options& o) {
                  (long long) (g.head_dim - g.n_rot), (long long) g.n_rot, (long long) g.n_lora_q,
                  (long long) g.n_lora_kv, (long long) K, (long long) g.n_expert, (long long) g.n_ff,
                  (long long) dense_lead, (long long) dense_ff);
-    std::fprintf(stderr, "strata generate: deepseek2 prefill is TOKEN-AT-A-TIME (no batched prefill path yet)\n");
+    std::fprintf(stderr, "strata generate: deepseek2 prefill is BATCHED (MMQ + grouped GPU experts); "
+                         "STRATA_DS2_NO_BATCH_PREFILL=1 restores the token-at-a-time arm\n");
 
     // The embedding and the head come from the GGUF directly, as for a qwen4exp native pack.
     strata::core::NativeEmbed native_embed;
@@ -784,76 +787,144 @@ int run_deepseek2(Options& o) {
     int64_t next = -1;
     double prefill_ms = 0, decode_ms = 0;
     int64_t decoded = 0;
-    const int64_t total = n_prompt + o.max_new;
-    for (int64_t pos = 0; pos < total; ++pos) {
-        const int64_t tok = pos < n_prompt ? o.tokens[(size_t) pos] : next;
-        if (tok < 0 || tok >= n_vocab) {
-            std::fprintf(stderr, "strata generate: token %lld at position %lld is outside the vocabulary\n",
-                         (long long) tok, (long long) pos);
-            return 1;
+
+    // The current `ss.ds2_x` residual -> the next token (output norm, head, sample).  Shared by the batched
+    // prefill's tail and the token loop so the two cannot disagree.
+    auto head_sample = [&](std::string& herr) -> int {
+        strata::kernels::native_gr_rms_norm_weighted(ss.ds2_x, (const float*) won->data, ss.ds2_xn,
+                                                     (int) g.n_embd, 1, (float) eps, (void*) stream);
+        if (!native_head.run(ss.ds2_xn, d_logits, (void*) stream, herr)) return -1;
+        if (hipMemcpyAsync(logits.data(), d_logits, (size_t) n_vocab * 4, hipMemcpyDeviceToHost, stream) != hipSuccess ||
+            hipStreamSynchronize(stream) != hipSuccess) {
+            herr = "the logits readback failed";
+            return -1;
         }
-        const Clock::time_point t0 = Clock::now();
+        int bad = 0;
+        for (float val : logits) if (!std::isfinite(val)) ++bad;
+        if (bad != 0) {
+            herr = std::to_string(bad) + " of " + std::to_string(n_vocab) + " logits are not finite";
+            return -1;
+        }
+        sp.counter = (uint64_t) produced.size();
+        strata::kernels::sample_tokens(d_logits, 1, (int) n_vocab, nullptr, 0, sp, d_next, (void*) stream);
+        int next32 = 0;
+        if (hipMemcpyAsync(&next32, d_next, sizeof(int), hipMemcpyDeviceToHost, stream) != hipSuccess ||
+            hipStreamSynchronize(stream) != hipSuccess) {
+            herr = "reading the sampled token failed";
+            return -1;
+        }
+        return next32;
+    };
+
+    auto forward_one = [&](int64_t tok, int64_t pos, std::string& ferr) -> bool {
+        if (tok < 0 || tok >= n_vocab) {
+            ferr = "token " + std::to_string(tok) + " at position " + std::to_string(pos) + " is outside the vocabulary";
+            return false;
+        }
         native_embed.gather_one(tok, d_emb, (void*) stream);
         if (hipMemcpyAsync(ss.ds2_x, d_emb, (size_t) g.n_embd * 4, hipMemcpyDeviceToDevice, stream) != hipSuccess) {
-            std::fprintf(stderr, "strata generate: the embedding copy failed\n");
-            return 1;
+            ferr = "the embedding copy failed";
+            return false;
         }
-        if (pos == 0) strata::core::session_zero(ss, g, nullptr, (void*) stream);
-        err.clear();
-        if (!strata::core::ds2_token(wt, g, pos, ss, pool_fn, &drive, (void*) stream, err)) {
-            std::fprintf(stderr, "strata generate: ds2_token at position %lld: %s\n", (long long) pos, err.c_str());
-            return 1;
-        }
+        if (!strata::core::ds2_token(wt, g, pos, ss, pool_fn, &drive, (void*) stream, ferr)) return false;
         if (drive.d.failed) {
-            std::fprintf(stderr, "strata generate: the expert pool failed at layer %lld expert %lld: %s\n",
-                         (long long) drive.d.fail_layer, (long long) drive.d.fail_expert,
-                         drive.d.fail ? drive.d.fail : "(no message)");
+            ferr = "the expert pool failed at layer " + std::to_string(drive.d.fail_layer) + " expert " +
+                   std::to_string(drive.d.fail_expert) + ": " + (drive.d.fail ? drive.d.fail : "(no message)");
+            return false;
+        }
+        return true;
+    };
+
+    // ---- prompt: one batched pass over the chunk when the GPU expert path is available and the source is the
+    //      arena (a mapped device alias); otherwise the token-at-a-time loop, exactly as before.
+    const bool batch_prefill = n_prompt > 1 && strata::prefill::mmq::built() && o.expert_ram_gb <= 0 &&
+                               !o.mmap_experts && std::getenv("STRATA_DS2_NO_BATCH_PREFILL") == nullptr;
+    std::string perr;
+    if (batch_prefill) {
+        int64_t cap = 4096;   // a chunk larger than the attention kernel's shared score row is safer as sub-chunks
+        if (const char* e = std::getenv("STRATA_DS2_PREFILL_CAP")) {
+            const long long v = std::atoll(e);
+            if (v >= 1) cap = (int64_t) v;
+        }
+        const int64_t nff = std::max<int64_t>(dense_ff, g.n_ff);
+        const uint64_t pf_bytes = strata::core::ds2_prefill_scratch_bytes(g, cap, K, nff);
+        void* pf_arena = nullptr;
+        strata::core::Ds2PrefillScratch pf;
+        if (pf_bytes == 0 || hipMalloc(&pf_arena, pf_bytes) != hipSuccess ||
+            !strata::core::ds2_prefill_scratch_init(g, cap, K, nff, pf_arena, pf)) {
+            std::fprintf(stderr, "strata generate: the batched prefill scratch (%llu B) failed\n",
+                         (unsigned long long) pf_bytes);
             return 1;
         }
-        if (pos >= n_prompt - 1) {
-            strata::kernels::native_gr_rms_norm_weighted(ss.ds2_x, (const float*) won->data, ss.ds2_xn,
-                                                         (int) g.n_embd, 1, (float) eps, (void*) stream);
-            if (!native_head.run(ss.ds2_xn, d_logits, (void*) stream, err)) {
-                std::fprintf(stderr, "strata generate: lm_head: %s\n", err.c_str());
+        strata::core::session_zero(ss, g, nullptr, (void*) stream);
+        const Clock::time_point tp0 = Clock::now();
+        int64_t done = 0, last_base = 0;
+        while (done < n_prompt) {
+            const int64_t Tp = std::min<int64_t>(cap, n_prompt - done);
+            for (int64_t t = 0; t < Tp; ++t) {
+                native_embed.gather_one(o.tokens[(size_t) (done + t)], d_emb, (void*) stream);
+                if (hipMemcpyAsync(pf.X + t * g.n_embd, d_emb, (size_t) g.n_embd * 4, hipMemcpyDeviceToDevice,
+                                   stream) != hipSuccess) {
+                    std::fprintf(stderr, "strata generate: the prefill embedding copy failed\n");
+                    return 1;
+                }
+            }
+            if (!strata::core::ds2_prefill(wt, g, done, Tp, ss, pf, *srcp, (void*) stream, perr)) {
+                std::fprintf(stderr, "strata generate: ds2_prefill at %lld + %lld: %s\n", (long long) done,
+                             (long long) Tp, perr.c_str());
                 return 1;
             }
-            if (hipMemcpyAsync(logits.data(), d_logits, (size_t) n_vocab * 4, hipMemcpyDeviceToHost, stream) != hipSuccess ||
-                hipStreamSynchronize(stream) != hipSuccess) {
-                std::fprintf(stderr, "strata generate: the logits readback failed\n");
-                return 1;
-            }
-            int bad = 0;
-            for (float v : logits) if (!std::isfinite(v)) ++bad;
-            if (bad != 0) {
-                std::fprintf(stderr, "strata generate: %d of %lld logits are not finite at position %lld\n", bad,
-                             (long long) n_vocab, (long long) pos);
-                return 1;
-            }
-            sp.counter = (uint64_t) produced.size();
-            strata::kernels::sample_tokens(d_logits, 1, (int) n_vocab, nullptr, 0, sp, d_next, (void*) stream);
-            int next32 = 0;
-            if (hipMemcpyAsync(&next32, d_next, sizeof(int), hipMemcpyDeviceToHost, stream) != hipSuccess ||
-                hipStreamSynchronize(stream) != hipSuccess) {
-                std::fprintf(stderr, "strata generate: reading the sampled token failed\n");
-                return 1;
-            }
-            next = next32;
-            if (next < 0 || next >= n_vocab) {
-                std::fprintf(stderr, "strata generate: the sampler returned %lld, outside 0..%lld\n",
-                             (long long) next, (long long) (n_vocab - 1));
-                return 1;
-            }
-            produced.push_back(next);
-            ++decoded;
-            decode_ms += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
-            if ((int64_t) produced.size() >= o.max_new) break;
-            if (o.stop_eos && std::find(o.eos_ids.begin(), o.eos_ids.end(), next) != o.eos_ids.end()) break;
-        } else {
-            prefill_ms += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+            last_base = done;
+            done += Tp;
         }
-        if ((pos & 255) == 0)
-            std::fprintf(stderr, "strata generate: position %lld, token %lld%s\n", (long long) pos, (long long) tok,
-                         pos < n_prompt ? " (prompt)" : "");
+        const int64_t last_row = n_prompt - 1 - last_base;
+        if (hipMemcpyAsync(ss.ds2_x, pf.X + last_row * g.n_embd, (size_t) g.n_embd * 4, hipMemcpyDeviceToDevice,
+                           stream) != hipSuccess) {
+            std::fprintf(stderr, "strata generate: the prefill residual copy failed\n");
+            return 1;
+        }
+        prefill_ms = std::chrono::duration<double, std::milli>(Clock::now() - tp0).count();
+        hipFree(pf_arena);
+    } else {
+        strata::core::session_zero(ss, g, nullptr, (void*) stream);
+        const Clock::time_point tp0 = Clock::now();
+        for (int64_t pos = 0; pos < n_prompt; ++pos) {
+            if (!forward_one(o.tokens[(size_t) pos], pos, perr)) {
+                std::fprintf(stderr, "strata generate: %s\n", perr.c_str());
+                return 1;
+            }
+        }
+        prefill_ms = std::chrono::duration<double, std::milli>(Clock::now() - tp0).count();
+    }
+    {
+        std::string herr;
+        next = head_sample(herr);
+        if (next < 0) {
+            std::fprintf(stderr, "strata generate: lm_head/sample: %s\n", herr.c_str());
+            return 1;
+        }
+        produced.push_back(next);
+        ++decoded;
+    }
+    // ---- decode: the sampled token is fed back one at a time through the untouched token path ----
+    for (int64_t d = 1; (int64_t) produced.size() < o.max_new; ++d) {
+        const int64_t pos = n_prompt + d - 1;
+        const Clock::time_point t0 = Clock::now();
+        if (!forward_one(next, pos, perr)) {
+            std::fprintf(stderr, "strata generate: ds2_token at position %lld: %s\n", (long long) pos, perr.c_str());
+            return 1;
+        }
+        std::string herr;
+        next = head_sample(herr);
+        if (next < 0) {
+            std::fprintf(stderr, "strata generate: lm_head/sample at position %lld: %s\n", (long long) pos,
+                         herr.c_str());
+            return 1;
+        }
+        produced.push_back(next);
+        ++decoded;
+        decode_ms += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+        if (o.stop_eos && std::find(o.eos_ids.begin(), o.eos_ids.end(), next) != o.eos_ids.end()) break;
     }
     if (drive.routing != nullptr) {
         std::fclose(drive.routing);
@@ -864,12 +935,12 @@ int run_deepseek2(Options& o) {
     std::printf("\noutput  :");
     for (int64_t t : produced) std::printf(" %lld", (long long) t);
     std::printf("\n");
-    std::printf("%-24s %lld tokens in %.1f ms  ->  %.2f tok/s\n", "decode", (long long) decoded, decode_ms,
-                decode_ms > 0 ? 1000.0 * (double) decoded / decode_ms : 0.0);
+    std::printf("%-24s %lld tokens in %.1f ms  ->  %.2f tok/s\n", "decode", (long long) (decoded - 1), decode_ms,
+                decode_ms > 0 ? 1000.0 * (double) (decoded - 1) / decode_ms : 0.0);
     if (n_prompt > 1)
-        std::printf("%-24s %lld tokens in %.1f ms  ->  %.2f tok/s\n", "prefill (token-at-a-time)",
-                    (long long) (n_prompt - 1), prefill_ms,
-                    prefill_ms > 0 ? 1000.0 * (double) (n_prompt - 1) / prefill_ms : 0.0);
+        std::printf("%-24s %lld tokens in %.1f ms  ->  %.2f tok/s\n",
+                    batch_prefill ? "prefill (batched)" : "prefill (token-at-a-time)", (long long) n_prompt,
+                    prefill_ms, prefill_ms > 0 ? 1000.0 * (double) n_prompt / prefill_ms : 0.0);
     return 0;
 }
 

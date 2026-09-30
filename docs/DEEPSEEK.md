@@ -184,11 +184,34 @@ IQ4_XS): no canonicalization pass is required.
     **11.90 → 17.35 tok/s**, output byte-identical (`12089 13 576 6722 315 9621`).  Breakdown per token:
     `sync` 28.3 → 9.5 ms, `rest` 23.0 → 13.0 ms, `pool` 30 ms (unchanged — the CPU pool is DRAM-bandwidth
     bound, so it is the floor: ~33 tok/s even with a free GPU).  Commits `cb87340`, `4269a8b`.
-- **Still OPEN for M2:** a BATCHED prefill for deepseek2 (the prompt currently runs one token at a time through
-  `ds2_token`; grouping the chunk's distinct experts once per chunk, rather than re-reading 4 experts per token,
-  is the large prefill lever), the formal G-COH gate vs a CPU/llama.cpp reference (the greedy continuations
-  above are coherent but were not yet scored L1 <= 1e-3 against a reference), a captured deepseek2 token graph
-  (to remove the remaining 9.5 ms `sync` + 13 ms `rest`), and decode-60 / prefill-5000 tuning.
+- **M2 step 9 — BATCHED PREFILL (blocker A), the dense GEMM + grouped GPU experts (2026-10-01).**
+  `ds2_prefill` (`include/strata/core/ds2_prefill.hpp`, `src/core/ds2_prefill.cpp`) runs a prompt chunk of T rows
+  through each layer at once: the MLA projections are ONE MMQ GEMM over the chunk (llama.cpp's `mul_mat_q`, not
+  T per-token GEMVs), the attention is one causal kernel over the chunk (`ds2pf::attention`,
+  `src/kernels/cuda/ds2_prefill.cu`), and the routed experts are grouped so each DISTINCT expert is read and
+  computed ONCE per chunk by `native_expert_grouped` reading the arena's device alias over PCIe.  The
+  single-token `ds2_token` path is byte-for-byte unchanged and remains the decode path; sub-chunks of
+  `STRATA_DS2_PREFILL_CAP` (default 4096) bound the scratch.
+  - **BLOCKER B kernel prerequisite:** GLM's 10 Q5_K and 9 Q6_K expert layers were rejected by
+    `native_expert_grouped`; the Q5_K scalar dot was added (`Fmt<13>`, 176 B/block) and cases 13/14 wired into
+    both the gate/up and down dispatches.  `native_expert_parity` on layers 1/5/10 (Q6_K/Q5_K/IQ4_XS): **0
+    failures**, gpu rel 1.18e-02 / 1.21e-02 / 1.18e-02.
+  - **New parity gate:** `ds2_prefill_parity` — batch attention vs kernel-per-token `mla_attention` **0.0**,
+    batch `rope_slice` vs `mla_rope` **0.0**, `rms_strided` vs a per-row double reference **4.0e-08**.
+  - **Evidence (gfx1201):**
+    `build_gfx1201\strata.exe --pack H:\OLLAMA-Models\strata-pack-glm --native H:\OLLAMA-Models\GGUF\GLM-4.7-Flash-APEX-I-Quality.gguf --tokens <prompt> --max-new 2 --max-context 4096`
+    - **2050-token prompt: prefill 12.94 -> 82.59 tok/s (6.4x)**; the token-at-a-time arm is
+      `STRATA_DS2_NO_BATCH_PREFILL=1` (158470.3 ms vs 24820.2 ms on the same prompt).
+    - **130-token prompt: prefill 18.78 -> 141.22 tok/s (7.5x)**, output byte-identical (`785 6722 315 9621`
+      both arms); the 5-token prompt stays byte-identical (`12089 13 576 6722 315 9621`).  Forcing
+      `STRATA_DS2_PREFILL_CAP=32` (5 sub-chunks) keeps the 130-token output byte-identical, so the chunk-boundary
+      path is exercised.
+    - **decode unchanged** (~18-20 tok/s; the decode loop still calls `ds2_token`), so G-PERF decode-60 is still
+      OPEN.  The GPU grouped expert reads are over PCIe (~0.65 GB/s effective at 2050 tokens), which is the next
+      prefill lever, and decode-60 still needs the expert bytes resident (blocker B's second half, E3).
+  - **Still OPEN for M2:** the formal G-COH gate vs a CPU/llama.cpp reference (the greedy continuations above are
+    coherent but were not yet scored L1 <= 1e-3 against a reference), decode resident experts, a captured
+    deepseek2 token graph, and decode-60 / prefill-5000 tuning.
 
 
 
