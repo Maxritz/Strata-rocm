@@ -107,20 +107,18 @@ SILU, weights_norm, scale, gating_func)` — the router carries the **`exp_probs
 
 ---
 
-## 6. The gate for step S4 (the MLA projections) — the weight format
+## 6. The MLA projections' weight format — RESOLVED
 
-`mla_layer` composes projections from `s_gemv`/`s_gemv_q8k`, but those take the **canonical SForm**
-(`s_gemv.hpp`: `code_bits` ∈ {2,4,8}, `Codebook` ∈ {Affine, Iq4Nl}, `has_offset`, `act_kind`).  GLM's MLA
-projections are **Q6_K** (6-bit — no SForm), **IQ4_XS** (S4 + Iq4Nl, representable), **Q5_K** (S8 + offset) and
-**Q8_0** (S8).  So one of:
+`mla_layer`'s projections can use **`native_mmvq`** (`include/strata/kernels/native_mmvq.hpp`), which already
+decodes the raw GGUF blocks this fork needs: **Q3_K=110, Q4_K=144, Q5_K=176, Q6_K=210, IQ4_XS=136 bytes per 256
+elements** (pinned to llama.cpp `3cf0325`), plus Q2_0/Q4_0/Q5_0/Q8_0/IQ4_NL.  So the MLA projections are a
+composition, not a new kernel: `native_mmvq` for `wq_a`/`wq_b`/`wkv_a_mqa`/`wk_b`/`wv_b`/`wo`,
+`native_rope_apply` (head_dim 256, n_rot 64) for the partial RoPE, `rmsnorm` for `attn_q_a_norm`/
+`attn_kv_a_norm`, and a standard attention for the (naive, non-absorbed) core.  GGUF order is n_in contiguous /
+n_out rows, which matches the projection shapes in §5.
 
-- **(a) canonicalize** the K-quant projections at pack time (Q6_K → the S-form the pack already emits for the
-  experts; `tools/pack_index.py` already writes an `act_kind` column, so the machinery exists), or
-- **(b) add a GPU GEMV** for the raw ggml K-quant blocks (Q6_K 210-byte blocks) — a new kernel.
+The same holds for every new family's K-quant projections (M1 qwen35moe Q4_K, M3 k2-horizon Q4_K, laguna
+IQ4_XS): no canonicalization pass is required.
 
-Until one lands, a GLM projection on the GPU is blocked, and this host (no AVX-512) would run it on the CPU via
-ggml — which the contract's G-GPU forbids.  **This is the first real task of the S4 session**, and it is why S4 is
-a kernel-suite session and not just wiring: the same gate applies to every K-quant projection in every new family
-(M1 qwen35moe Q4_K, M3 k2-horizon Q4_K, laguna IQ4_XS).
 
 
