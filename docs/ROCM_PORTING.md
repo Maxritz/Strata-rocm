@@ -689,6 +689,19 @@ Ranked by impact/effort, on a PCIe-4.0-bound box (wins = fewer bytes over the li
 
 **Autoresearch harness contract for this repo** (when we build it): immutable `bench/` driver (fixed model + prompt + `--max-tokens`/warmup/repeats + JSON), editable `config.yaml` (chunk size, `STREAM_ALL_MIN`, expert cache, spec depth, KV quant), untracked `results.tsv` (`commit	throughput_tps	vram_gb	status	description`), keep a candidate only if median tok/s beats the best by more than run-to-run σ with the output hash unchanged.
 
+### 12.3 FreeToken — the closest reference engine (local at `AMDS\FreeToken`)
+
+[`FlashML-org/FreeToken`](https://github.com/FlashML-org/FreeToken) is an *edge-native MoE serving engine* — the mature, generalized form of what this repo is doing — and it lists **Qwen3.8-Flash-Next** (our exact model) as supported, alongside DeepSeek-V4, GLM-5.x/4.7, Qwen3.6/3.5 MoE, Qwen3-VL, gpt-oss, Gemma-4, MiniMax, Muse-Glimmer. Its **Vulkan C++ port** (`ports/FreeToken-Vulkan-CXX.md`) is the AMD-relevant path. Worth mining for:
+
+- **Lazy loading, systematized**: `--moe-strategy {fused,offload,cpu,hybrid,auto}`. `offload` = experts in host RAM + an **LRU GPU slot cache**, misses stream over PCIe; `hybrid` = **per step fetch some misses over PCIe and compute the rest on CPU, overlapped**, with the split **calibrated by `ft bench bw`** (a CPU-vs-PCIe bandwidth profile) — this is the disciplined version of our `probe_pcie_h2d_gbps` + CPU pool, and it is the model for our "fetch vs CPU-pool" decision. `--moe-cpu-layers {3,7,11|count|fraction|auto}` gives per-layer granularity (`auto` is Windows/WSL-only, where CUDA pinned memory is capped — relevant here).
+- **Quants + the CPU executor**: NVFP4 / MXFP4 / FP8 / BF16 and the **FTW** fast-load format; the CPU executor serves **bf16 / nvfp4 / mxfp4** experts (not fp8). Confirms our split: GPU keeps a compressed hot set, CPU handles misses in a format it can decode.
+- **Elastic memory management**: runtime **re-allocation of VRAM between the expert cache and KV** without restart — the dynamic form of our "KV in VRAM" item.
+- **Full-layer double-buffered prefill streaming** — the generalized form of our `stream_all` path.
+- **Pinned host PLE table**: their Qwen3.8-Flash-Next keeps a **47.7 GiB PLE n-gram table pinned in host RAM** — exactly our PLE handling.
+
+Takeaway for us: steal the **`ft bench bw` → calibrated hybrid split** first (it directly tunes the PCIe-vs-CPU-pool choice we already have knobs for, and fixes our bogus PCIe probe); then the **LRU slot cache** and **elastic cache/KV** are the next tier.
+
+
 
 
 ## 13. Measured scores (gfx1201, RX 9070 XT, PCIe 4.0 x16)
