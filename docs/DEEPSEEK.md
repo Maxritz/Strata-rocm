@@ -166,9 +166,29 @@ IQ4_XS): no canonicalization pass is required.
   - `The capital of Germany is` (785,6722,315,9851,374) -> `19808 13 ...` = **" Berlin."**
   - `2+2=` (17,10,17,28) -> `19 ...` = **"4"**
   - decode **12.9-13.0 tok/s**, prefill (token-at-a-time) **~12.1-12.4 tok/s**; expert arena 16.09 GiB.
+- **M2 step 8 — PER-TOKEN PROFILE, and two launch-path fixes (2026-10-01).**  `STRATA_DS2_TIMING=1` in
+  `ds2_token` reports, per token, the three walls that can be attacked independently: `sync` (the router
+  handoff's `hipStreamSynchronize`), `pool` (the CPU expert pool), and `rest` (enqueue-only).  A `--no-pool`
+  run measured the device event span **equal to the host enqueue time** (~26 ms of ~940 launches), i.e. the
+  token-at-a-time path is **host-enqueue-bound, not GPU-bound**.
+  - **Head-batched MLA MMVQ.**  The absorption (`q_abs[h] = wk_b[h] @ q_nope[h]`) and up-projection were two
+    per-head loops of `n_head` (quantize + MMVQ) pairs — 80 launches a layer.  The concatenated per-head
+    activations are now quantized once (`MlaBuffers::act_q8`), and `native_mmvq_heads` does the `n_head`
+    independent products in ONE launch (a `blockIdx.z` head offset over the unchanged single-matrix kernels).
+    Bitwise parity: `native_mmvq_heads_parity` → Q8_0/Q6_K, both kernel selections, 0 float bits differ.
+    (A Q6_K per-head activation stride of `blocks_per_row` instead of `n_in/32` was caught only by the
+    end-to-end token diverging; that is why the direct test exists.)
+  - **Pool handoff on the compute queue.**  The three D2H staging memcpys and the H2D upload (four copy-engine
+    ops a layer) are replaced by `doorbell_publish` and `copy_from_mapped` kernels on the compute queue.
+  - **Measured (gfx1201, the command in the bullet above):** decode **12.46 → 19.05 tok/s**, prefill
+    **11.90 → 17.35 tok/s**, output byte-identical (`12089 13 576 6722 315 9621`).  Breakdown per token:
+    `sync` 28.3 → 9.5 ms, `rest` 23.0 → 13.0 ms, `pool` 30 ms (unchanged — the CPU pool is DRAM-bandwidth
+    bound, so it is the floor: ~33 tok/s even with a free GPU).  Commits `cb87340`, `4269a8b`.
 - **Still OPEN for M2:** a BATCHED prefill for deepseek2 (the prompt currently runs one token at a time through
-  `ds2_token`), and the formal G-COH gate vs a CPU/llama.cpp reference (the greedy continuations above are
-  coherent but were not yet scored L1 <= 1e-3 against a reference), plus decode-60 / prefill-5000 tuning.
+  `ds2_token`; grouping the chunk's distinct experts once per chunk, rather than re-reading 4 experts per token,
+  is the large prefill lever), the formal G-COH gate vs a CPU/llama.cpp reference (the greedy continuations
+  above are coherent but were not yet scored L1 <= 1e-3 against a reference), a captured deepseek2 token graph
+  (to remove the remaining 9.5 ms `sync` + 13 ms `rest`), and decode-60 / prefill-5000 tuning.
 
 
 

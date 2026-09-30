@@ -107,7 +107,15 @@ Each is DONE only when it passes G-COH and reports decode/prefill on gfx1201.
   "The capital of Germany is" -> " Berlin.", "2+2=" -> "4").  `qsa_parity`/`gdn_parity`/`gr_parity`/
   `native_expert_parity`/`mla_parity`/`ds2_moe_parity` all green after the change.  **The gate is still OPEN**:
   G-COH (L1 <= 1e-3 vs a CPU/llama.cpp reference) has not been measured, prefill is one-token-at-a-time, and
-  decode/prefill are far below G-PERF.  Details in `docs/DEEPSEEK.md` §7 (M2 step 7).
+  decode/prefill are far below G-PERF.
+  - **M2 perf step 8 (2026-10-01, `cb87340` + `4269a8b`): decode 12.46 -> 19.05, prefill 11.90 -> 17.35 tok/s,
+    byte-identical output.**  `STRATA_DS2_TIMING=1` (`ds2_token`) + a `--no-pool` control showed the path is
+    **host-enqueue-bound** (device event span == host enqueue), not GPU-bound.  Fixes: `native_mmvq_heads` —
+    the MLA absorption/up-projection's `n_head` per-head MMVQs in one launch (bitwise; parity
+    `native_mmvq_heads_parity`), and the CPU-pool handoff moved from four copy-engine memcpys a layer to
+    compute-queue `doorbell_publish`/`copy_from_mapped` kernels.  Remaining per token: sync 9.5, rest 13,
+    **pool 30 ms (the DRAM-bound floor)**, so a token graph alone tops out near ~30 tok/s; decode-60 needs the
+    expert bytes out of the CPU path (K-series/E3).  Details in `docs/DEEPSEEK.md` §7 (M2 step 8).
 
 ---
 
