@@ -205,7 +205,11 @@ void silu_inplace(float* x, int64_t n, void* stream) {
 /// very expensive substitute for one fence instruction.
 __global__ void doorbell_ring_kernel(uint32_t* seq) {
     __threadfence_system();
-    *seq = *seq + 1u;
+    // **VOLATILE, OR gfx1201 NEVER TELLS THE HOST.**  On RDNA4 a plain store to mapped pinned memory stays in the
+    // GPU's L2 until the stream is synchronised, so the host spinning on `seq` never sees the ring (upstream
+    // 53f9e7a, the "hip_handoff needed the volatile ring store" note in docs/AMD_HIP.md).  `doorbell_publish_kernel`
+    // already stores it volatile for the same reason.
+    *(volatile uint32_t*) seq = *(volatile uint32_t*) seq + 1u;
 }
 
 __global__ void doorbell_wait_kernel(const volatile uint32_t* flag, const volatile uint32_t* seq) {

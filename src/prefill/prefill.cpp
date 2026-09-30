@@ -81,22 +81,23 @@ constexpr int STAGE = 8;           // host->device expert staging ring (chunks b
 // attention halves instead of waiting for each layer's routing.
 constexpr int RING_MAX = 512;           // the arrays; the ring itself is ring_slots()
 // The chunk size at/above which every non-resident expert streams through the ring instead of the resident path.
-// The measured optimum is format-dependent (Q2_0 streams well; IQ2_S was faster resident), so it is tunable:
-// STRATA_STREAM_ALL_MIN overrides (a huge value keeps large chunks on the resident/direct path).
+// 1024 since upstream 0.1.30 (was 2048): on fixed cache, 1-4K-token prompts gained +17-28% for the same output
+// (1,500-token 621->785, 2,000 727->934, 4,000 779->912 tok/s).  Below ~1,000 tokens the OUTPUT changed on Q2_0
+// (a smaller chunk takes other kernels), so 1024 is the floor.  STRATA_PREFILL_STREAM_MIN overrides; the fork's
+// older STRATA_STREAM_ALL_MIN is still honoured.
 inline int64_t stream_all_min() {
     static const int64_t v = [] {
-        const char* e = std::getenv("STRATA_STREAM_ALL_MIN");
-        return e ? (int64_t) std::atoll(e) : (int64_t) 2048;
+        const char* e = std::getenv("STRATA_PREFILL_STREAM_MIN");
+        if (e == nullptr) e = std::getenv("STRATA_STREAM_ALL_MIN");
+        return e ? (int64_t) std::atoll(e) : (int64_t) 1024;
     }();
     return v;
 }
 double g_pinned_share = 1.0;
-// Set when the active ExpertSource is TRANSIENT (the RingExpertSource): its blob/device_alias pointers are valid
-// only until a slot is reused, and the ring's release is per-layer synchronous (docs section 10c), not gated on
-// the async consumers.  The MMQ prefill gather reads a blob's device alias asynchronously, so against a transient
-// source it reads a slot the ring already reused -> "gather_native: unspecified launch failure" (a GPU hang).
-// Until the event-gated release (docs section 15.5 step 2) lands, MMQ stays off for a transient source.
-bool g_src_transient = false;
+// MMQ is allowed against a TRANSIENT source (the RingExpertSource): `RingExpertSource::release_layer` synchronizes
+// on the layer's consumer event before it frees a slot, and the async MMQ gather runs on that same stream, so a
+// ring slot cannot be reused while the gather still reads it.  Measured on Swift, 2047-token prefill: MMQ on
+// 376 tok/s vs the old "MMQ off for a transient source" 130 tok/s (2.9x), no hang.
 // The streamed ring: 384 slots when (nearly) every streamed expert is DMA'd from pinned RAM - measured on Q2_0,
 // 8192-token chunks: 96 slots 1153 tok/s, 384 1294 (the next layer's experts arrive during its attention half) -
 // and 96 when a large share goes through host copies (IQ3_S on 64 GB, a third unpinned: 96 slots 1216, 256 1070 -
@@ -436,7 +437,7 @@ const MmqPlan& mmq_plan() {
         MmqPlan p;
         const auto& lay = strata::kernels::cpu::expert_layout();
         const char* env = std::getenv("STRATA_PREFILL_MMQ");
-        const bool on = mmq::built() && !g_src_transient && (env == nullptr || std::atoi(env) != 0);
+        const bool on = mmq::built() && (env == nullptr || std::atoi(env) != 0);
         const int64_t layers = lay.native ? (int64_t) lay.fmt.size() : lay.n_layers;
         p.layer.assign((size_t) std::max<int64_t>(layers, 0), 0);
         p.fallback = !on || layers <= 0;
@@ -654,7 +655,6 @@ bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::
 
 int64_t Prefill::chunk() const { return impl_->T; }
 void Prefill::set_pinned_share(double share) { g_pinned_share = share; }
-void Prefill::set_source_transient(bool transient) { g_src_transient = transient; }
 double Prefill::pinned_share() { return g_pinned_share; }
 
 uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk) {
