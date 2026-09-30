@@ -233,10 +233,11 @@ if(STRATA_ENABLE_HIP)
                           src/kernels/cuda/cvec.cu
                           src/kernels/cuda/qsa_decode_attn.cu
                           src/kernels/cuda/fused_gdn.cu
-                          src/kernels/cuda/dequant_bf16.cu
-                          src/kernels/cuda/qsa_select.cu
-                          src/kernels/cuda/verify_kernels.cu
-                          src/kernels/cuda/iq_kernels.cu
+                         src/kernels/cuda/dequant_bf16.cu
+                         src/kernels/cuda/qsa_select.cu
+                         src/kernels/cuda/verify_kernels.cu
+                         src/kernels/cuda/iq_kernels.cu
+                         src/kernels/cuda/fp4_gemv.cu
                           src/kernels/ngram.cpp
                           src/ngram/ple_reader.cpp
                           src/platform/direct_file.cpp)
@@ -324,6 +325,13 @@ if(STRATA_ENABLE_HIP)
   target_include_directories(dequant_s2_parity PRIVATE ${ROCM_INCLUDE})
   target_link_libraries(dequant_s2_parity PRIVATE strata_kernels ${ROCM_LIBRARY}/amdhip64.lib)
   add_test(NAME dequant_s2_parity COMMAND dequant_s2_parity --selftest)
+
+  # MXFP4/NVFP4 GEMV: software FP4 decode (no FP4 tensor core on gfx1201/gfx1031), parity against the same
+  # scalar dequantizers `dequant_fp4_test` checks bit-for-bit against ggml.
+  add_executable(fp4_gemv_parity src/kernels/fp4_gemv_parity.cpp)
+  target_include_directories(fp4_gemv_parity PRIVATE ${ROCM_INCLUDE})
+  target_link_libraries(fp4_gemv_parity PRIVATE strata_kernels ${ROCM_LIBRARY}/amdhip64.lib)
+  add_test(NAME fp4_gemv_parity COMMAND fp4_gemv_parity --selftest)
 
   add_executable(s2_gemv_parity src/kernels/s2_gemv_parity.cpp)
   target_include_directories(s2_gemv_parity PRIVATE ${ROCM_INCLUDE})
