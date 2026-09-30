@@ -109,4 +109,14 @@ std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out);
 void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* y,
                  int n_in, int n_out, int ncols, void* stream);
 
+// `n_head` INDEPENDENT matrix-vector products in ONE launch: head `h` reads its own weight block at
+// `weights + h * native_mmvq_weight_bytes(type, n_in, n_out)` and its own activation at
+// `x_q8_1 + h * (n_in / block_elems) * 36`, writing `y + h * n_out`.  This is the MLA absorption/up-projection,
+// where ncols cannot apply (the weight differs per head).  Every head is BITWISE equal to the same call made
+// one head at a time through `native_mmvq`; the only change is where the kernel reads and writes.  Q8_0 (8) and
+// Q6_K (14) are supported; any other type throws.
+bool native_mmvq_heads_supported(int ggml_type) noexcept;
+void native_mmvq_heads(int ggml_type, const void* weights, const void* x_q8_1, float* y,
+                       int n_in, int n_out, int n_head, void* stream);
+
 } // namespace strata::kernels

@@ -834,6 +834,7 @@ uint64_t mla_buffers_bytes(const ModelGeometry& g, int64_t max_cells) {
     n += (uint64_t) g.n_head * (uint64_t) g.head_dim * 4;
     n += (uint64_t) max_cells * 4;
     n += (uint64_t) q8k_bytes(g.n_head * g.head_dim);
+    n += (uint64_t) strata::kernels::native_q8_1_bytes((int) (g.n_head * (nope > g.n_lora_kv ? nope : g.n_lora_kv)));
     n += 4;
     return align_up16(n) + 256;
 }
@@ -851,6 +852,8 @@ uint64_t mla_buffers_init(const ModelGeometry& g, int64_t max_cells, void* base,
     b.attn = c.take<float>((uint64_t) g.n_head * (uint64_t) g.head_dim);
     b.scores = c.take<float>((uint64_t) max_cells);
     b.attn_q8k = c.take_bytes(q8k_bytes(g.n_head * g.head_dim));
+    b.act_q8 = c.take_bytes(strata::kernels::native_q8_1_bytes(
+        (int) (g.n_head * (nope > g.n_lora_kv ? nope : g.n_lora_kv))));
     b.pos = c.take<int32_t>(1);
     return c.used;
 }
@@ -873,7 +876,7 @@ bool mla_layer(const ModelGeometry& g, const MlaWeights& w, const MlaState& st, 
     }
     if (!w.wq_a || !w.wq_b || !w.wkv_a_mqa || !w.wk_b || !w.wv_b || !w.wo || !w.q_a_norm || !w.kv_a_norm ||
         !w.q8_1 || !b.q_a || !b.q || !b.q_nope || !b.q_pe || !b.q_abs || !b.kv_a || !b.attn_latent || !b.attn ||
-        !b.scores || !b.pos || !st.kv || !st.v || !x || !out || !stream) {
+        !b.scores || !b.act_q8 || !b.pos || !st.kv || !st.v || !x || !out || !stream) {
         err = "mla_layer: a required weight, buffer or stream is null";
         return false;
     }
@@ -901,20 +904,35 @@ bool mla_layer(const ModelGeometry& g, const MlaWeights& w, const MlaState& st, 
         mla_rope(b.q_pe, b.q_pe, g.n_head, g.n_rot, w.rope_freq_base, b.pos, stream);
         mla_rope(b.kv_a + g.n_lora_kv, b.kv_a + g.n_lora_kv, 1, g.n_rot, w.rope_freq_base, b.pos, stream);
         mla_write_kv(st.kv, st.v, b.kv_a, b.kv_a + g.n_lora_kv, pos, g.n_lora_kv, g.n_rot, stream);
-        const size_t wk_stride = native_mmvq_weight_bytes(w.wk_b_type, (int) nope, (int) g.n_lora_kv);
-        for (int64_t h = 0; h < g.n_head; ++h) {
-            native_quantize_q8_1(b.q_nope + h * nope, w.q8_1, (int) nope, 1, stream);
-            native_mmvq(w.wk_b_type, (const uint8_t*) w.wk_b + h * wk_stride, w.q8_1,
-                        b.q_abs + h * g.n_lora_kv, (int) nope, (int) g.n_lora_kv, 1, stream);
+        // The `n_head` per-head matrix-vector products share ONE activation layout: quantize the whole run once
+        // (bitwise identical - Q8_1 is per-32-block independent) and step the q8_1 pointer per head.  `act_q8`
+        // is sized for `n_head * max(nope, n_lora_kv)`; the per-head block strides are exact multiples of 36.
+        native_quantize_q8_1(b.q_nope, b.act_q8, (int) (g.n_head * nope), 1, stream);
+        if (native_mmvq_heads_supported(w.wk_b_type)) {
+            native_mmvq_heads(w.wk_b_type, w.wk_b, b.act_q8, b.q_abs, (int) nope, (int) g.n_lora_kv,
+                              (int) g.n_head, stream);
+        } else {
+            const size_t wk_stride = native_mmvq_weight_bytes(w.wk_b_type, (int) nope, (int) g.n_lora_kv);
+            const size_t qnope_q8 = (size_t) (nope / 32) * 36;
+            for (int64_t h = 0; h < g.n_head; ++h) {
+                native_mmvq(w.wk_b_type, (const uint8_t*) w.wk_b + h * wk_stride, b.act_q8 + h * qnope_q8,
+                            b.q_abs + h * g.n_lora_kv, (int) nope, (int) g.n_lora_kv, 1, stream);
+            }
         }
         const float scale = 1.0f / std::sqrt((float) g.head_dim);
         mla_attention(b.q_abs, b.q_pe, st.kv, st.v, pos + 1, g.n_head, g.n_lora_kv, g.n_rot, scale, b.scores,
                       b.attn_latent, stream);
-        const size_t wv_stride = native_mmvq_weight_bytes(w.wv_b_type, (int) g.n_lora_kv, (int) g.head_dim);
-        for (int64_t h = 0; h < g.n_head; ++h) {
-            native_quantize_q8_1(b.attn_latent + h * g.n_lora_kv, w.q8_1, (int) g.n_lora_kv, 1, stream);
-            native_mmvq(w.wv_b_type, (const uint8_t*) w.wv_b + h * wv_stride, w.q8_1, b.attn + h * g.head_dim,
-                        (int) g.n_lora_kv, (int) g.head_dim, 1, stream);
+        native_quantize_q8_1(b.attn_latent, b.act_q8, (int) (g.n_head * g.n_lora_kv), 1, stream);
+        if (native_mmvq_heads_supported(w.wv_b_type)) {
+            native_mmvq_heads(w.wv_b_type, w.wv_b, b.act_q8, b.attn, (int) g.n_lora_kv, (int) g.head_dim,
+                              (int) g.n_head, stream);
+        } else {
+            const size_t wv_stride = native_mmvq_weight_bytes(w.wv_b_type, (int) g.n_lora_kv, (int) g.head_dim);
+            const size_t latent_q8 = (size_t) (g.n_lora_kv / 32) * 36;
+            for (int64_t h = 0; h < g.n_head; ++h) {
+                native_mmvq(w.wv_b_type, (const uint8_t*) w.wv_b + h * wv_stride, b.act_q8 + h * latent_q8,
+                            b.attn + h * g.head_dim, (int) g.n_lora_kv, (int) g.head_dim, 1, stream);
+            }
         }
         const int64_t attn_in = g.n_head * g.head_dim;
         native_quantize_q8_1(b.attn, w.q8_1, (int) attn_in, 1, stream);

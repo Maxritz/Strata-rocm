@@ -417,6 +417,12 @@ if(STRATA_ENABLE_HIP)
   target_link_libraries(mla_parity PRIVATE strata_engine ${ROCM_LIBRARY}/amdhip64.lib)
   add_test(NAME mla_parity COMMAND mla_parity --selftest)
 
+  # The head-batched MMVQ (`native_mmvq_heads`, the MLA absorption/up-projection) vs the per-head loop, bitwise.
+  add_executable(native_mmvq_heads_parity src/kernels/native_mmvq_heads_parity.cpp)
+  target_include_directories(native_mmvq_heads_parity PRIVATE ${ROCM_INCLUDE})
+  target_link_libraries(native_mmvq_heads_parity PRIVATE strata_kernels ${ROCM_LIBRARY}/amdhip64.lib)
+  add_test(NAME native_mmvq_heads_parity COMMAND native_mmvq_heads_parity --selftest)
+
   add_executable(ds2_moe_parity src/kernels/ds2_moe_parity.cpp)
   target_include_directories(ds2_moe_parity PRIVATE ${ROCM_INCLUDE})
   target_link_libraries(ds2_moe_parity PRIVATE strata_kernels ${ROCM_LIBRARY}/amdhip64.lib)

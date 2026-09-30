@@ -870,7 +870,27 @@ bool ds2_token(const WeightTable& tables, const ModelGeometry& g, int64_t pos, S
     const int64_t k = s.k;
     float* x = s.ds2_x;
     float* xn = s.ds2_xn;
+    // **STRATA_DS2_TIMING: WHERE A deepseek2 TOKEN'S MILLISECONDS GO.**  The token-at-a-time path has exactly
+    // one blocking point per MoE layer - the router handoff's `hipStreamSynchronize` - and this splits each
+    // layer's wall time into the three terms that can each be attacked independently:
+    //   * `sync` - the hipStreamSynchronize at the handoff: the GPU executing this layer's attention+router
+    //              plus the previous layer's expert-finish tail, plus driver submission.
+    //   * `pool` - the CPU expert pool's own wall time (device idle for all of it).
+    //   * `rest` - the enqueue-only remainder (staging copies, kernel/enqueue of the MoE finish and residual).
+    // Off unless the env var is set; a diagnostic, not a run-path feature.
+    const bool ds2_timing = std::getenv("STRATA_DS2_TIMING") != nullptr;
+    double tk_sync = 0, tk_pool = 0, tk_rest = 0;
+    // The DEVICE's own view of the token: elapsed between an event recorded before the first kernel and one after
+    // the last.  This separates host-enqueue-bound (the device is idle with nothing queued) from GPU-bound.
+    static hipEvent_t ev_t0 = nullptr, ev_t1 = nullptr;
+    if (ds2_timing && ev_t0 == nullptr) {
+        hipEventCreate(&ev_t0);
+        hipEventCreate(&ev_t1);
+    }
+    if (ds2_timing && ev_t0 != nullptr) hipEventRecord(ev_t0, cs);
     for (int64_t l = 0; l < g.n_layers; ++l) {
+        const auto tl0 = std::chrono::steady_clock::now();
+        double l_sync = 0, l_pool = 0;
         const LayerView v(tables, l);
         const WeightRef* wan = v.get("attn_norm.weight");
         const WeightRef* wfn = v.get("ffn_norm.weight");
@@ -905,6 +925,7 @@ bool ds2_token(const WeightTable& tables, const ModelGeometry& g, int64_t pos, S
                 // The router's selection is produced on the device; the CPU pool needs it on the host.  This is
                 // the SYNCHRONOUS (token-at-a-time) handoff: no doorbell, no overlap, because a deepseek2 decode
                 // is the uncaptured path until a batched prefill exists.
+                const auto ts0 = std::chrono::steady_clock::now();
                 if (hipMemcpyAsync(s.ds2_x_host, xn, (size_t) g.n_embd * 4, hipMemcpyDeviceToHost, cs) != hipSuccess ||
                     hipMemcpyAsync(s.ds2_ids_host, s.moe.ids, (size_t) k * 4, hipMemcpyDeviceToHost, cs) != hipSuccess ||
                     hipMemcpyAsync(s.ds2_w_host, s.moe.weights, (size_t) k * 4, hipMemcpyDeviceToHost, cs) != hipSuccess ||
@@ -912,7 +933,11 @@ bool ds2_token(const WeightTable& tables, const ModelGeometry& g, int64_t pos, S
                     err = "ds2_token: the router staging copy failed";
                     return false;
                 }
+                const auto tp0 = std::chrono::steady_clock::now();
                 pool(user, l, s.ds2_x_host, s.ds2_ids_host, s.ds2_w_host, g.n_embd, k, s.ds2_parts_host);
+                const auto tp1 = std::chrono::steady_clock::now();
+                l_sync = std::chrono::duration<double, std::milli>(tp0 - ts0).count();
+                l_pool = std::chrono::duration<double, std::milli>(tp1 - tp0).count();
                 if (hipMemcpyAsync(s.ds2_parts, s.ds2_parts_host, (size_t) k * g.n_embd * 4, hipMemcpyHostToDevice,
                                    cs) != hipSuccess) {
                     err = "ds2_token: the expert-output upload failed";
@@ -929,6 +954,33 @@ bool ds2_token(const WeightTable& tables, const ModelGeometry& g, int64_t pos, S
 
         add_inplace(x, s.ds2_ffn, g.n_embd, cs);
 
+        if (ds2_timing) {
+            const double l_all = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tl0).count();
+            tk_sync += l_sync;
+            tk_pool += l_pool;
+            tk_rest += l_all - l_sync - l_pool;
+        }
+    }
+    if (ds2_timing) {
+        static double all_sync = 0, all_pool = 0, all_rest = 0, all_gpu = 0;
+        static int64_t all_tokens = 0;
+        float gpu_ms = 0;
+        if (ev_t0 != nullptr) {
+            hipEventRecord(ev_t1, cs);
+            hipEventSynchronize(ev_t1);
+            hipEventElapsedTime(&gpu_ms, ev_t0, ev_t1);
+        }
+        all_sync += tk_sync;
+        all_pool += tk_pool;
+        all_rest += tk_rest;
+        all_gpu += gpu_ms;
+        ++all_tokens;
+        std::fprintf(stderr,
+                     "strata ds2 timing: token %lld ms = sync(GPU+driver) %.2f + pool(CPU) %.2f + rest(enqueue) %.2f; "
+                     "device event span %.2f; avg over %lld tok: sync %.2f, pool %.2f, rest %.2f, device %.2f\n",
+                     (long long) all_tokens, tk_sync, tk_pool, tk_rest, (double) gpu_ms, (long long) all_tokens,
+                     all_sync / (double) all_tokens, all_pool / (double) all_tokens, all_rest / (double) all_tokens,
+                     all_gpu / (double) all_tokens);
     }
     return true;
 }

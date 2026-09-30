@@ -392,6 +392,12 @@ struct MlaBuffers {
     float* attn = nullptr;       ///< n_head * head_dim: the attention output after the `wv_b` up-projection
     float* scores = nullptr;     ///< max_cells: the attention's per-head cell scores scratch
     uint8_t* attn_q8k = nullptr; ///< the `wo` projection's Q8_K activation
+    /// Q8_1 scratch for the CONCATENATED per-head activations of `wk_b` (`n_head * nope`) and `wv_b`
+    /// (`n_head * n_lora_kv`).  The absorption and up-projection are per-head matrix-vector products, so the
+    /// activations were quantized one head at a time (two launches per head, 80 launches a layer).  Quantizing
+    /// the whole run once is bitwise identical - Q8_1 is per-32-block independent and the layout is contiguous -
+    /// and turns 2*`n_head` launches into 2 + `n_head`.  Sized `native_q8_1_bytes(n_head * max(nope, n_lora_kv))`.
+    uint8_t* act_q8 = nullptr;
     int32_t* pos = nullptr;      ///< 1 device int32: the token's sequence position
 };
 

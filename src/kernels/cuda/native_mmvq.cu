@@ -662,6 +662,55 @@ __global__ void native_q6_k_mmvq_kernel(const Q6KBlock* __restrict__ w,
     }
 }
 
+// ============================ heads: n_head independent matrices in one launch ============================
+//
+// The MLA absorption and up-projection are `n_head` matrix-vector products with a DIFFERENT weight and a
+// DIFFERENT activation per head (`q_abs[h] = wk_b[h] @ q_nope[h]`), which ncols cannot express (ncols shares the
+// weight).  The per-head host loop was 2 `n_head` launches that showed up measured as exposed per-layer GPU
+// time.  These kernels are BITWISE copies of the single-matrix kernels above with the only change being a
+// `blockIdx.z` head offset into `w`, `x` and `y`, so each head computes exactly what its own call did.
+template<bool SmallK>
+__launch_bounds__(WARPS * WARP, 1)
+__global__ void native_q6_heads_kernel(const Q6KBlock* __restrict__ w, const Q81Block* __restrict__ x,
+                                       float* __restrict__ y, int n_in, int n_out, int w_head_blocks,
+                                       int x_head_blocks) {
+    constexpr int ROWS = SmallK ? WARPS : 1;
+    constexpr int BLOCKS_PER_ITER = WARPS * WARP / 32;
+    const int h = int(blockIdx.z);
+    w += (std::size_t) h * w_head_blocks;
+    x += (std::size_t) h * x_head_blocks;
+    y += (std::size_t) h * n_out;
+    const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
+    const int row0 = ROWS * int(blockIdx.x);
+    const int blocks_per_row = n_in / 256;
+    float tmp[ROWS] = {};
+    for (int kbx = tid / 32; kbx < blocks_per_row; kbx += BLOCKS_PER_ITER) {
+        const int kby = kbx * 8;
+        const int kqs = tid % 32;
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i) {
+            if (row0 + i < n_out) {
+                const std::size_t block = std::size_t(row0 + i) * blocks_per_row + kbx;
+                tmp[i] += q6_q8_dot(w + block, x + kby, kqs);
+            }
+        }
+    }
+    __shared__ float partial[WARPS - 1][ROWS][WARP];
+    if (threadIdx.y > 0) {
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i) partial[threadIdx.y - 1][i][threadIdx.x] = tmp[i];
+    }
+    __syncthreads();
+    if (threadIdx.y > 0) return;
+#pragma unroll
+    for (int i = 0; i < ROWS; ++i) {
+#pragma unroll
+        for (int l = 0; l < WARPS - 1; ++l) tmp[i] += partial[l][i][threadIdx.x];
+        tmp[i] = warp_sum(tmp[i]);
+        if (threadIdx.x == i && row0 + i < n_out) y[row0 + i] = tmp[i];
+    }
+}
+
 // The four 32-element formats use native two-byte loads and VDR=2. The affine
 // Q4_0/Q5_0 correction consumes the original-input sum stored in Q8_1, exactly
 // as the pinned CUDA dot does; a signed-integer code substitution would differ.
@@ -743,6 +792,49 @@ __global__ void native_small_mmvq_kernel(const Weight* __restrict__ w,
                                          float* __restrict__ y, int n_in, int n_out) {
     constexpr int ROWS = SmallK ? WARPS : 1;
     constexpr int BLOCKS_PER_ITER = 2 * WARPS * WARP / Qi;
+    const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
+    const int row0 = ROWS * int(blockIdx.x);
+    const int blocks_per_row = n_in / 32;
+    float tmp[ROWS] = {};
+    for (int kbx = tid / (Qi / 2); kbx < blocks_per_row; kbx += BLOCKS_PER_ITER) {
+        const int kqs = 2 * (tid % (Qi / 2));
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i) {
+            if (row0 + i < n_out) {
+                const std::size_t block = std::size_t(row0 + i) * blocks_per_row + kbx;
+                tmp[i] += small_q8_dot(w + block, x + kbx, kqs);
+            }
+        }
+    }
+    __shared__ float partial[WARPS - 1][ROWS][WARP];
+    if (threadIdx.y > 0) {
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i) partial[threadIdx.y - 1][i][threadIdx.x] = tmp[i];
+    }
+    __syncthreads();
+    if (threadIdx.y > 0) return;
+#pragma unroll
+    for (int i = 0; i < ROWS; ++i) {
+#pragma unroll
+        for (int l = 0; l < WARPS - 1; ++l) tmp[i] += partial[l][i][threadIdx.x];
+        tmp[i] = warp_sum(tmp[i]);
+        if (threadIdx.x == i && row0 + i < n_out) y[row0 + i] = tmp[i];
+    }
+}
+
+// The 32-element head-batched form (bitwise mirror of `native_small_mmvq_kernel`).  `w_head_blocks` is the
+// per-head weight stride in blocks, `x_head_blocks` the per-head Q8_1 stride.
+template<typename Weight, int Qi, bool SmallK>
+__launch_bounds__(WARPS * WARP, 1)
+__global__ void native_small_heads_kernel(const Weight* __restrict__ w, const Q81Block* __restrict__ x,
+                                          float* __restrict__ y, int n_in, int n_out, int w_head_blocks,
+                                          int x_head_blocks) {
+    constexpr int ROWS = SmallK ? WARPS : 1;
+    constexpr int BLOCKS_PER_ITER = 2 * WARPS * WARP / Qi;
+    const int h = int(blockIdx.z);
+    w += (std::size_t) h * w_head_blocks;
+    x += (std::size_t) h * x_head_blocks;
+    y += (std::size_t) h * n_out;
     const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
     const int row0 = ROWS * int(blockIdx.x);
     const int blocks_per_row = n_in / 32;
@@ -1437,6 +1529,68 @@ void native_iq4_nl_mmvq(const void* weights, const void* x_q8_1, float* y,
 void native_iq4_nl_f32(const void* weights, const float* x, void* scratch_q8_1,
                       float* y, int n_in, int n_out, int ncols, void* stream) {
     small_f32<IQ4NLBlock, 4>(weights, x, scratch_q8_1, y, n_in, n_out, ncols, stream);
+}
+
+bool native_mmvq_heads_supported(int ggml_type) noexcept {
+    return ggml_type == 8 || ggml_type == 14;   // Q8_0, Q6_K — the MLA per-head projections
+}
+
+void native_mmvq_heads(int ggml_type, const void* weights, const void* x_q8_1, float* y,
+                       int n_in, int n_out, int n_head, void* stream) {
+    if (n_head <= 0) throw std::invalid_argument("native MMVQ heads requires n_head > 0");
+    validate_pointer(weights);
+    validate_pointer(x_q8_1);
+    validate_pointer(y);
+    validate_stream(stream);
+    const auto s = static_cast<hipStream_t>(stream);
+    const dim3 threads(WARP, WARPS);
+    switch (ggml_type) {
+    case 8: {   // Q8_0: 32-element blocks, Qi=8 (mirrors native_q8_0_mmvq)
+        constexpr int Qi = 8;
+        validate_shape(n_in, 1, 32);
+        if (n_out <= 0) throw std::invalid_argument("native MMVQ requires n_out > 0");
+        const int blocks_per_row = n_in / 32;
+        const int w_head_blocks = blocks_per_row * n_out;
+        const auto* w = static_cast<const Q80Block*>(weights);
+        const auto* x = static_cast<const Q81Block*>(x_q8_1);
+        if (blocks_per_row < 2 * WARPS * WARP / Qi) {
+            const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
+            native_small_heads_kernel<Q80Block, Qi, true>
+                <<<dim3(blocks, 1, (unsigned) n_head), threads, 0, s>>>(w, x, y, n_in, n_out, w_head_blocks,
+                                                                        blocks_per_row);
+        } else {
+            native_small_heads_kernel<Q80Block, Qi, false>
+                <<<dim3((unsigned) n_out, 1, (unsigned) n_head), threads, 0, s>>>(w, x, y, n_in, n_out,
+                                                                                  w_head_blocks, blocks_per_row);
+        }
+        break;
+    }
+    case 14: {  // Q6_K: 256-element blocks (mirrors native_q6_k_mmvq)
+        validate_shape(n_in, 1, 256);
+        if (n_out <= 0) throw std::invalid_argument("native MMVQ requires n_out > 0");
+        const int blocks_per_row = n_in / 256;
+        const int w_head_blocks = blocks_per_row * n_out;
+        // A Q6_K block is 256 elements = 8 Q8_1 blocks, so one head's activation spans `n_in/32` Q8_1 blocks
+        // (the kernel walks it as `kbx * 8`).  This is NOT `blocks_per_row` - passing that was a real bug the
+        // end-to-end GLM run caught when the per-head loop was replaced (the synthetic Q8_0-only parity missed it).
+        const int x_head_blocks = n_in / 32;
+        const auto* w = static_cast<const Q6KBlock*>(weights);
+        const auto* x = static_cast<const Q81Block*>(x_q8_1);
+        if (blocks_per_row < WARPS * WARP / 32) {
+            const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
+            native_q6_heads_kernel<true>
+                <<<dim3(blocks, 1, (unsigned) n_head), threads, 0, s>>>(w, x, y, n_in, n_out, w_head_blocks,
+                                                                        x_head_blocks);
+        } else {
+            native_q6_heads_kernel<false>
+                <<<dim3((unsigned) n_out, 1, (unsigned) n_head), threads, 0, s>>>(w, x, y, n_in, n_out,
+                                                                                  w_head_blocks, x_head_blocks);
+        }
+        break;
+    }
+    default: throw std::invalid_argument("native MMVQ heads: unsupported GGML type");
+    }
+    launch_check();
 }
 
 bool native_mmvq_supported(int ggml_type) noexcept {
