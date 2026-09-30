@@ -247,6 +247,10 @@ struct Options {
     /// pinned arena while the CPU computes the rest (verify windows).
     double pcie_frac = -1.0;   ///< < 0: the model's default (0.2 direct for the Q2_0 pack, 0.55 DMA for native packs)
     std::string pcie_mode = "auto";   ///< auto | dma | kernel | direct
+    /// task_gpu_miss: `--gpu-miss 1` forces the MISSED experts onto the GPU, read directly from the pinned
+    /// arena over REBAR (`pcie_mode direct`, `pcie_frac 1.0`), instead of the CPU pool.  Default OFF until the
+    /// coherence gate (L1 <= 1e-3 vs the CPU reference) is proven on a real prompt.
+    int gpu_miss = 0;
     /// Plan v0.3 P6: every `adapt_every` rounds, swap up to `adapt_swaps` of the most-routed missing experts into
     /// the VRAM tier in place of the least-routed resident ones (decayed counts).  0 = static residency.
     int adapt_every = 4;
@@ -337,7 +341,10 @@ void usage() {
                  "  --native-head-gguf PATH  native Q5_K head from model shard 1; requires --stream-token\n"
                  "  --model-info PATH    read a GGUF's architecture + geometry and report this build's support, then exit\n"
                  "  --native-dense-gguf PATH native GDN/QSA/shared projections; repeat for each source model shard\n"
-                 "  --expert-cache-cpu-order  experimental GPU expert reduction matching CPU order\n"
+                  "  --expert-cache-cpu-order  experimental GPU expert reduction matching CPU order\n"
+                  "  --gpu-miss 0|1       force each layer's MISSED experts onto the GPU, read directly from the\n"
+                  "                       pinned arena over REBAR (pcie_mode direct, pcie_frac 1.0). Default 0 (off)\n"
+                  "                       until the coherence gate (L1 <= 1e-3 vs CPU) holds on a real prompt.\n"
                  "  --max-new N          tokens to generate (default 16)\n"
                  "  --max-context N      KV/state capacity (default 4096)\n"
                  "  --greedy             argmax (the default)\n"
@@ -957,6 +964,7 @@ int main(int argc, char** argv) {
         else if (a == "--stop-eos") o.stop_eos = true;
         else if (a == "--spec-split") o.spec_split = true;
         else if (a == "--pcie-mode") o.pcie_mode = next("--pcie-mode");
+        else if (a == "--gpu-miss") o.gpu_miss = std::atoi(next("--gpu-miss"));
         else if (a == "--serve") o.serve = true;
         else if (a == "--vision") o.vision = true;
         else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
@@ -2621,7 +2629,7 @@ int main(int argc, char** argv) {
         // cudaMemcpyAsync + cudaLaunchHostFunc inside a verify window while the GPU spins on the flag they raise;
         // issue #31's thread dumps show the host stuck in that cudaMemcpyAsync on a driver lock for good.  The copy
         // kernel needs no host CUDA call there, and costs ~1-3% decode on IQ3_S (45.3 -> 44.8 tok/s, 8 requests).
-        ver.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
+        ver.set_pcie_mode(o.gpu_miss ? 1 : (o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2));
         std::vector<int64_t> cur;
         // ---- the conversation cache (see ConvCheckpoint).  `live` is what the session holds right now: the tokens
         // it has consumed, so a request that starts with exactly them continues without any copy.  `checks` are the
@@ -2669,7 +2677,7 @@ int main(int argc, char** argv) {
             return true;
         };
         drive.d.plan = ver.plan_sink();
-        drive.d.pcie_num = std::max(0, std::min(256, (int) (o.pcie_frac * 256.0 + 0.5)));
+        drive.d.pcie_num = o.gpu_miss ? 256 : std::max(0, std::min(256, (int) (o.pcie_frac * 256.0 + 0.5)));
         if (o.adapt_every > 0 && o.adapt_swaps > 0) drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
         hipStream_t adapt_stream = nullptr;
         if (hipStreamCreateWithFlags(&adapt_stream, hipStreamNonBlocking) != hipSuccess) {
@@ -3838,9 +3846,9 @@ int main(int argc, char** argv) {
         // cudaMemcpyAsync + cudaLaunchHostFunc inside a verify window while the GPU spins on the flag they raise;
         // issue #31's thread dumps show the host stuck in that cudaMemcpyAsync on a driver lock for good.  The copy
         // kernel needs no host CUDA call there, and costs ~1-3% decode on IQ3_S (45.3 -> 44.8 tok/s, 8 requests).
-        ver.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
+        ver.set_pcie_mode(o.gpu_miss ? 1 : (o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2));
         drive.d.plan = ver.plan_sink();
-        drive.d.pcie_num = (int) (o.pcie_frac * 256.0 + 0.5);
+        drive.d.pcie_num = o.gpu_miss ? 256 : (int) (o.pcie_frac * 256.0 + 0.5);
         if (drive.d.pcie_num < 0) drive.d.pcie_num = 0;
         if (drive.d.pcie_num > 256) drive.d.pcie_num = 256;
         const int64_t pcie0 = drive.d.pcie_experts;
