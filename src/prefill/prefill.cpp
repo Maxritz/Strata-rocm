@@ -1238,7 +1238,12 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         std::fill(m.cnt.begin(), m.cnt.end(), 0);
                         for (int64_t i = 0; i < T * K; ++i) {
                             const int32_t e = m.ids_host[(size_t) i];
-                            if (e < 0 || e >= NE) { err = "prefill: routed id out of range"; return false; }
+                            if (e < 0 || e >= NE) {
+                                err = "prefill: routed id out of range: id " + std::to_string(e) + " at " +
+                                      std::to_string(i) + " of " + std::to_string(T * K) + " (NE " +
+                                      std::to_string(NE) + ", K " + std::to_string(K) + ", T " + std::to_string(T) + ")";
+                                return false;
+                            }
                             ++m.cnt[(size_t) e];
                         }
                         m.off[0] = 0;
