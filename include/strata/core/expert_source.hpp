@@ -26,6 +26,7 @@
 #include "strata/kernels/cpu/pool.hpp"
 
 #include <cstdint>
+#include <cstdio>
 #include <string>
 #include <vector>
 
@@ -350,6 +351,79 @@ private:
     double gib_per_s_ = 0.0;
     uint64_t pinned_bytes_ = 0;
     std::string gguf_;
+};
+
+// ================================ THE BOUNDED RING (docs §15) ================================
+//
+// **THE ARENA ABOVE IS ONE BLOB LONGER THAN THE FILE AND RESIDENT FOREVER (34.2 GiB).**  This class is the
+// bounded replacement: a fixed ring of `slots_` page-locked, GPU-registered slots, each holding exactly one
+// blob, with LRU eviction and a disk read on a miss.  RAM is `slots_ x max_blob` BY CONSTRUCTION - there is no
+// code path here that can hold more than that - which is how `--expert-ram-gb {20|22|24}` is honoured.
+//
+// **THE CONTRACT THAT MUST BE RIGHT IS THE POINTER'S LIFETIME.**  `ExpertSource::blob` returns a pointer its
+// callers treat as persistent (the whole-model stream in `prefill.cpp`, the per-layer device alias).  Here a
+// returned pointer is valid only until its slot is evicted, and a slot may not be evicted while a consumer
+// still references it (a queued `hipMemcpyAsync` sourced from it, or a queued kernel reading its alias).
+// `begin_layer` protects every slot touched during a layer; `held_epoch_` is the protection set and eviction
+// skips it.  **With the current call sites the protection must be extended to an event-based release in the
+// prefill loop (docs §15.5 step 2)** - this class is the mechanism, and until that step lands it is selected
+// only by `--expert-ram-gb` and is not the default.
+class RingExpertSource : public ExpertSource {
+public:
+    RingExpertSource() = default;
+    ~RingExpertSource() override;
+    RingExpertSource(const RingExpertSource&) = delete;
+    RingExpertSource& operator=(const RingExpertSource&) = delete;
+
+    /// Allocates a page-locked ring of `ram_bytes / max_blob` slots and opens `<pack_dir>/experts.bin` (or the
+    /// native GGUF shard set via `set_gguf`).  Loads NO blobs - the first access is the first read.
+    bool open(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, uint64_t ram_bytes, std::string& err);
+    void set_gguf(const std::string& shard1) { gguf_ = shard1; }
+    void close();
+
+    bool mapped() const { return base_ != nullptr; }
+    int64_t blobs() const { return blobs_; }
+    const uint8_t* blob(int64_t layer, int64_t expert) override;
+    int64_t reads() const override { return reads_; }
+    bool pinned(int64_t layer, int64_t expert) const override;
+    const uint8_t* device_alias(int64_t layer, int64_t expert) const override;
+    /// Protect every slot touched so far this layer (docs §15.4); with `ids` non-null, warm the layer's experts.
+    void begin_layer(int64_t layer, const int32_t* ids, int64_t k) override;
+    /// A slot for `(layer, expert)`, filling on a miss (evicting the LRU unprotected slot).  -1 if impossible.
+    int64_t acquire(int64_t layer, int64_t expert);
+    /// The host base of slot `s`, and its device alias (null when the registration failed).
+    const uint8_t* slot_host(int64_t s) const { return base_ + (uint64_t) s * (uint64_t) slot_bytes_; }
+    const uint8_t* slot_device(int64_t s) const { return dev_ == nullptr ? nullptr : dev_ + (uint64_t) s * (uint64_t) slot_bytes_; }
+
+    /// What the pool did, for the startup/summary print.  `misses` nonzero and `thrash` nonzero together mean
+    /// the pool is smaller than a working set and the disk read is on the token path.
+    int64_t slots() const { return slots_; }
+    int64_t slot_bytes() const { return slot_bytes_; }
+    int64_t hits() const { return hits_; }
+    int64_t misses() const { return misses_; }
+    int64_t evictions() const { return evictions_; }
+    int64_t thrash() const { return thrash_; }
+
+private:
+    struct Slot { int64_t layer = -1; int64_t expert = -1; uint64_t lru = 0; bool held = false; };
+    void read_blob(int64_t layer, int64_t expert, uint8_t* dst);
+    int64_t evictable_slot() const;
+
+    void* arena_ = nullptr;              ///< the PinnedArena, owned
+    uint8_t* base_ = nullptr;            ///< slot 0 of the ring (host)
+    const uint8_t* dev_ = nullptr;       ///< its device alias, or null if registration failed
+    std::vector<Slot> slot_;
+    std::vector<int64_t> index_;         ///< (layer * n_expert + expert) -> slot, -1 when absent
+    int64_t slots_ = 0;
+    int64_t slot_bytes_ = 0;
+    int64_t blobs_ = 0;
+    int64_t n_expert_ = 0;
+    uint64_t tick_ = 0;
+    int64_t held_layer_ = -1;
+    int64_t reads_ = 0, hits_ = 0, misses_ = 0, evictions_ = 0, thrash_ = 0;
+    std::string gguf_, path_;
+    std::FILE* file_ = nullptr;
+    bool native_ = false;
 };
 
 }  // namespace strata::core

@@ -835,6 +835,98 @@ kernel-suite); 6-8 follow. Each stage has a hard gate (byte/logit parity vs a re
 proceeding). `qwen35moe` (§13 line item) is the smaller sibling — same GDN + gated-attention lineage as
 qwen4exp — and is the recommended warm-up before the DeepSeek attention tower.
 
+## 15. Bounded-RAM expert residency — the `RingExpertSource` design (deploy-3 consensus)
+
+### 15.1 The problem, measured
+
+The expert arena pins the **whole** 33 GiB expert set (`ArenaExpertSource::open` →
+`hipHostRegister(PORTABLE)` of `lay.total = 35,456,548,864 B`). Measured peak WorkingSet: **arena 34.2 GiB**;
+`--mmap-experts` **30.1 GiB** (file-backed pages count) and ~1.6x slower. The target is a **tunable 20/22/24 GB**,
+so a fixed full-set residency misses it by design, not by a bug.
+
+### 15.2 Diagnosis (three independent agents — `deploy-3` — converged)
+
+1. **Unbounded residency, no admission control.** Cold experts are resident exactly like hot ones.
+2. **Transient-pointer contract violation.** Every call site treats `blob(l,e)` / `device_alias(l,e)` as
+   **persistent** (the whole-model `seq` vector in `prefill.cpp:897`; the per-layer alias at `:1295`). A bounded
+   reader makes a returned pointer valid only until its pool slot is reused.
+3. **No hot/cold split.** There is no disk→RAM→VRAM admission policy; nothing uses the routing profile to decide
+   what stays.
+
+### 15.3 The design
+
+A **bounded pinned slot ring** replaces the whole-set arena:
+
+- `slots = floor(--expert-ram-gb · 2^30 / slot_bytes)`, each slot = one blob, `slot_bytes = max_l blob_bytes(l)`.
+- **Miss** → evict an *evictable* slot (LRU) and read the blob from disk straight into it (unbuffered/`retry`
+  read, the PLE `--ple-io direct` pattern in `ngram.cpp`). **Hit** → touch and return.
+- **Hot-set admission** seeded from `--expert-profile` (routing frequency), so the first tokens of a session are
+  not all misses.
+- The VRAM cache stays at the measured sweet spot (`--expert-cache 2600..6000`; 9000 over-subscribes and thrashes).
+
+### 15.4 The contract (state model — this is the part that must be right)
+
+Entities: `Slot { host_ptr, dev_alias, layer, expert, epoch, in_use }`, `Residency { key -> slot }`, and an LRU
+list. Invariants:
+
+- **I1** `residency_.size() <= slots` — RAM is bounded *by construction*.
+- **I2** a slot's bytes are the blob for exactly the `(layer, expert)` in its record.
+- **I3 (the transient rule)** a slot may be reused **iff** no in-flight consumer still references it. A consumer
+  is either a queued `hipMemcpyAsync` whose source is the slot, or a queued kernel reading `dev_alias`.
+
+Truth table for "may I evict slot S?":
+
+| S in use this epoch | copy from S queued | kernel reading S queued | evictable? |
+|---|---|---|---|
+| no | no | no | **yes** |
+| no | yes | no | no (`copied` event not signalled) |
+| no | no | yes | no (`used` event not signalled) |
+| no | yes | yes | no |
+| yes | — | — | no |
+
+So the pool needs an **explicit `release`**, and `release` must be keyed on the stream events the prefill already
+creates (`m.copied[sl]` / `m.used[sl]`), not on a host-side counter.
+
+### 15.5 Refactor plan (focused task; each step compiles and is independently testable)
+
+1. **`RingExpertSource`** in `expert_source.{hpp,cpp}`: slot ring, `pread` miss, LRU, `--expert-ram-gb`,
+   profile-seeded admission, `acquire(l,e)`→slot handle and `release(handle)`; `pinned()==true` for resident
+   slots (the pool is `hipHostRegisterMapped`), `device_alias()` for resident slots else null. **No call-site
+   change yet** — selectable, default off. *(done in this commit)*
+2. **Release-after-event in `prefill.cpp`**: replace the whole-model `seq` vector (`:897`) and the per-layer
+   `blob()` calls (`:1282`, `:1299`) with `acquire`; attach `release` to the slot's `copied`/`used` event; for the
+   direct path (`:1295`, `:1400`) acquire for the layer and release when `post[l]` is enqueued.
+3. **`--expert-ram-gb {20|22|24}` in `generate.cpp`** (`:1552`): build a `RingExpertSource` instead of the arena;
+   refuse `--mmap-experts` together with it.
+4. **Gate**: RAM = pool + small tensors (WorkingSet ≤ N GB + ~1 GB); coherence test (§11.7); prefill/decode within
+   a few percent of the arena. Sweep 20/22/24 to find the knee.
+
+### 15.7 Measured (this session — step 1 landed, step 2 proven necessary)
+
+Swift IQ2_XS, 18-token prompt, `--spec 2 --max-new 4`, `--expert-cache 2600`, `--expert-profile
+data/expert-profile.bin`:
+
+| arm | peak WorkingSet | `output` |
+|---|---|---|
+| arena (default) | **34.18 GB** | `248068 198 760 1156` |
+| `--expert-ram-gb 22` | **23.16 GB** | `248068 271 248069 271` |
+| `--expert-ram-gb 20` | **21.16 GB** | `248068 271 248069 271` |
+| `--expert-ram-gb 34` (no eviction) | 35.16 GB | `248068 198 760 1156` |
+
+**The RAM target is met** (22 → 23.16 GB, 20 → 21.16 GB). **The first token matches in every arm.** The
+no-eviction ring reproduces the arena byte-for-byte; only the evicting rings diverge — so the ring's read and
+indexing are correct and the divergence is **exactly the un-wired release**: a slot is reused while the async
+copy sourced from it is still in flight (or a layer's alias is still being read). That is docs §15.5 **step 2**,
+and this table is the gate it must flip (ring 20/22 must reproduce `248068 198 760 1156`).
+
+### 15.6 Physical limits (all three agents agree — do not design against these)
+
+- 33 GiB over a 30 GB/s PCIe-4.0 link is **≥ 1.1 s** cold; a full miss sweep cannot be free.
+- All experts resident in 16 GB VRAM is impossible (would need ~768 GB).
+- VRAM cache beyond the measured knee (≈6000 slots) **thrashes** (measured: 9000 → 230 tok/s).
+- Overlap must be stream-ordered; the earlier two-stream overlap attempt regressed (524 vs 485 ms) for exactly
+  this reason and stays opt-in.
+
 
 
 

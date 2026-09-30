@@ -174,6 +174,7 @@ struct Options {
     /// is reserved for a host thread that has nothing to do while the drain runs.
     bool no_host_worker = false;
     bool mmap_experts = false;    ///< R2.1: opt OUT of the resident arena, back to MapViewOfFile
+    int expert_ram_gb = 0;        ///< docs §15: >0 selects RingExpertSource, a pinned pool of this many GB
     /// R4: slots of VRAM-resident experts.  **0 = off, and off is the default.**
     /// **THE COMMENT THAT USED TO BE HERE WAS FALSE AND ROUND 328 MEASURED IT.**  It said "the cache has no
     /// consumer yet - `moe_hit_grouped_s2` does not exist - so switching it on costs the fill traffic and
@@ -408,6 +409,7 @@ void usage() {
                  "                       except the one the host loop spins on.  A sweep is how the pool's\n"
                  "                       deviation from `cpu_s2` is attributed.\n"
                  "  --mmap-experts       R2.1: opt OUT of the resident expert arena, back to MapViewOfFile.\n"
+                 "  --expert-ram-gb N    docs §15: bounded pinned expert ring of N GB (20/22/24), LRU evicted.\n"
                  "                       The A/B arm: the mmap's rate depends on the OS page cache holding\n"
                  "                       34 GB, and measured 71.97 vs 34.78 ms/token cold vs warm.\n");
 }
@@ -1006,6 +1008,7 @@ int main(int argc, char** argv) {
         else if (a == "--expert-profile") o.expert_profile = next("--expert-profile");
         else if (a == "--gpu-stages") o.gpu_stages = true;
         else if (a == "--mmap-experts") o.mmap_experts = true;
+        else if (a == "--expert-ram-gb") o.expert_ram_gb = std::atoi(next("--expert-ram-gb"));
         else if (a == "--stats") o.stats = true;
         else if (a == "--shared-late") o.shared_late = true;
         else if (a == "--keep-canonical") o.keep_canonical = true;
@@ -1551,8 +1554,29 @@ int main(int argc, char** argv) {
     // note in `pinned.cu`.
     strata::core::FileExpertSource src;
     strata::core::ArenaExpertSource arena_src;
+    strata::core::RingExpertSource ring_src;
     strata::core::ExpertSource* srcp = nullptr;
-    if (o.mmap_experts) {
+    // docs §15: the bounded ring replaces the whole-set arena when a RAM budget is given.  `--mmap-experts` is
+    // the opposite arm (opt out of residency), so the two together are refused rather than silently ordered.
+    if (o.expert_ram_gb > 0 && o.mmap_experts) {
+        std::fprintf(stderr, "strata generate: --expert-ram-gb and --mmap-experts are mutually exclusive\n");
+        return 1;
+    }
+    if (o.expert_ram_gb > 0) {
+        const uint64_t ram = (uint64_t) o.expert_ram_gb * 1024ull * 1024ull * 1024ull;
+        if (!ring_src.open(o.pack, g.n_layers, g.n_expert, ram, err)) {
+            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "strata generate: expert ring: %lld slots x %lld B = %.2f GiB (--expert-ram-gb %d)\n",
+                     (long long) ring_src.slots(), (long long) ring_src.slot_bytes(),
+                     (double) ((uint64_t) ring_src.slots() * (uint64_t) ring_src.slot_bytes()) /
+                         (1024.0 * 1024.0 * 1024.0),
+                     o.expert_ram_gb);
+        std::fprintf(stderr, "strata generate: NOTE the ring's transient-pointer release is not yet wired "
+                             "(docs §15.5 step 2); correctness with prefill streaming is not guaranteed\n");
+        srcp = &ring_src;
+    } else if (o.mmap_experts) {
         if (!src.open(o.pack, g.n_layers, g.n_expert, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;

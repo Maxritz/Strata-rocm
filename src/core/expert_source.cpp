@@ -766,4 +766,204 @@ const uint8_t* ArenaExpertSource::blob(int64_t layer, int64_t expert) {
     return base_ + strata::kernels::cpu::expert_layout().blob_offset(layer, expert);
 }
 
+// ================================ THE BOUNDED RING (docs §15) ================================
+
+namespace {
+
+// a portable 64-bit seek, so a >2 GB experts.bin works on both toolchains
+void seek_to(std::FILE* f, int64_t off) {
+#if defined(_WIN32)
+    _fseeki64(f, (long long) off, SEEK_SET);
+#else
+    fseeko(f, (off_t) off, SEEK_SET);
+#endif
+}
+
+}  // namespace
+
+RingExpertSource::~RingExpertSource() { close(); }
+
+bool RingExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, uint64_t ram_bytes,
+                            std::string& err) {
+    close();
+    const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+    if (lay.n_layers != n_layers || lay.n_expert != n_expert) {
+        err = "RingExpertSource: the expert layout was loaded for a different geometry";
+        return false;
+    }
+    if (lay.max_blob == 0) {
+        err = "RingExpertSource: the layout has no blob size";
+        return false;
+    }
+    // **`experts.bin` ONLY, FOR NOW.**  When it is present the blob offset IS the file offset (the arena loads it
+    // 1:1 with `lay.blob_offset`), so the ring reads one contiguous range.  A native pack WITHOUT it assembles
+    // each blob from three ranges across a per-layer shard (`lay.fmt`/`gguf_off`); reading a single range there
+    // would be a silent wrong token rather than an error, so it is refused until that read is written and gated.
+    const std::string path = pack_dir + "/experts.bin";
+    if (!std::ifstream(path, std::ios::binary)) {
+        err = "RingExpertSource: --expert-ram-gb needs experts.bin; a native GGUF pack without one is not "
+              "supported by the ring yet";
+        return false;
+    }
+    {
+        std::ifstream f(path, std::ios::binary | std::ios::ate);
+        if (!f) { err = "RingExpertSource: cannot open " + path; return false; }
+        const uint64_t got = (uint64_t) f.tellg();
+        if (got != lay.total) {
+            char buf[400];
+            std::snprintf(buf, sizeof buf,
+                          "RingExpertSource: %s is %llu B but the loaded geometry needs %llu B - this is not the "
+                          "pack the geometry came from", path.c_str(), (unsigned long long) got,
+                          (unsigned long long) lay.total);
+            err = buf;
+            return false;
+        }
+    }
+    slot_bytes_ = (int64_t) lay.max_blob;
+    blobs_ = n_layers * n_expert;
+    slots_ = (int64_t) (ram_bytes / (uint64_t) slot_bytes_);
+    if (slots_ > blobs_) slots_ = blobs_;
+    if (slots_ < 1) {
+        char buf[256];
+        std::snprintf(buf, sizeof buf,
+                      "RingExpertSource: %.2f GB is smaller than one expert blob (%lld B)",
+                      (double) ram_bytes / (1024.0 * 1024.0 * 1024.0), (long long) slot_bytes_);
+        err = buf;
+        return false;
+    }
+    // the ring is one registration slice: a copy from any slot starts anywhere in it
+    std::vector<uint64_t> bounds{0, (uint64_t) slots_ * (uint64_t) slot_bytes_};
+    PinnedArena* a = new PinnedArena((uint64_t) slots_ * (uint64_t) slot_bytes_, bounds);
+    if (!a->valid()) {
+        delete a;
+        err = "RingExpertSource: the pinned ring could not be reserved";
+        return false;
+    }
+    arena_ = a;
+    base_ = a->data();
+    if (a->registered_bytes > 0) {
+        void* d = nullptr;
+        if (hipHostGetDevicePointer(&d, (void*) base_, 0) == hipSuccess) dev_ = (const uint8_t*) d;
+        else (void) hipGetLastError();
+    }
+    file_ = std::fopen(path.c_str(), "rb");
+    if (file_ == nullptr) {
+        close();
+        err = "RingExpertSource: cannot open " + path + " for reading";
+        return false;
+    }
+    slot_.assign((size_t) slots_, Slot{});
+    index_.assign((size_t) blobs_, -1);
+    n_expert_ = n_expert;
+    reads_ = hits_ = misses_ = evictions_ = thrash_ = 0;
+    tick_ = 0;
+    held_layer_ = -1;
+    path_ = path;
+    return true;
+}
+
+void RingExpertSource::close() {
+    if (file_ != nullptr) { std::fclose(file_); file_ = nullptr; }
+    if (arena_ != nullptr) { delete (PinnedArena*) arena_; arena_ = nullptr; }
+    base_ = nullptr;
+    dev_ = nullptr;
+    slot_.clear();
+    index_.clear();
+    slots_ = 0;
+    blobs_ = 0;
+    n_expert_ = 0;
+    held_layer_ = -1;
+}
+
+void RingExpertSource::read_blob(int64_t layer, int64_t expert, uint8_t* dst) {
+    const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+    if (file_ == nullptr) return;
+    const uint64_t off = lay.blob_offset(layer, expert);
+    seek_to(file_, (int64_t) off);
+    (void) std::fread(dst, 1, (size_t) lay.blob_bytes(layer), file_);
+}
+
+// The LRU choice.  A held slot is the protection set (docs §15.4): it is the current layer's working set, and
+// nothing in it may be reused while a copy or a kernel may still read it.  When EVERY slot is held the pool is
+// smaller than one layer's working set - the read then has to happen, but it is counted as `thrash` because the
+// number is the one that says the pool is undersized (rather than the run failing quietly).
+int64_t RingExpertSource::evictable_slot() const {
+    int64_t best = -1;
+    uint64_t best_lru = ~0ull;
+    for (int64_t s = 0; s < slots_; ++s) {
+        if (slot_[(size_t) s].held) continue;
+        if (slot_[(size_t) s].lru < best_lru) { best_lru = slot_[(size_t) s].lru; best = s; }
+    }
+    if (best >= 0) return best;
+    for (int64_t s = 0; s < slots_; ++s)
+        if (slot_[(size_t) s].lru < best_lru) { best_lru = slot_[(size_t) s].lru; best = s; }
+    return best;
+}
+
+int64_t RingExpertSource::acquire(int64_t layer, int64_t expert) {
+    if (base_ == nullptr || layer < 0 || expert < 0 || expert >= n_expert_) return -1;
+    const int64_t key = layer * n_expert_ + expert;
+    if (key < 0 || key >= blobs_) return -1;
+    // a new layer begins: the previous layer's slots stop being protected (the event-based release of §15.5
+    // step 2 replaces this when the call sites are wired)
+    if (layer != held_layer_) {
+        for (Slot& s : slot_) s.held = false;
+        held_layer_ = layer;
+    }
+    const int64_t hit = index_[(size_t) key];
+    if (hit >= 0 && slot_[(size_t) hit].layer == layer && slot_[(size_t) hit].expert == expert) {
+        ++hits_;
+        slot_[(size_t) hit].lru = ++tick_;
+        slot_[(size_t) hit].held = true;
+        return hit;
+    }
+    ++misses_;
+    int64_t s = evictable_slot();
+    if (s < 0) return -1;
+    if (slot_[(size_t) s].held) ++thrash_;   // every slot held -> the layer's working set exceeds the pool
+    if (slot_[(size_t) s].layer >= 0) {
+        const int64_t old = slot_[(size_t) s].layer * n_expert_ + slot_[(size_t) s].expert;
+        if (old >= 0 && old < blobs_ && index_[(size_t) old] == s) index_[(size_t) old] = -1;
+        ++evictions_;
+    }
+    read_blob(layer, expert, base_ + (uint64_t) s * (uint64_t) slot_bytes_);
+    ++reads_;
+    slot_[(size_t) s].layer = layer;
+    slot_[(size_t) s].expert = expert;
+    slot_[(size_t) s].lru = ++tick_;
+    slot_[(size_t) s].held = true;
+    index_[(size_t) key] = s;
+    return s;
+}
+
+const uint8_t* RingExpertSource::blob(int64_t layer, int64_t expert) {
+    const int64_t s = acquire(layer, expert);
+    return s < 0 ? nullptr : base_ + (uint64_t) s * (uint64_t) slot_bytes_;
+}
+
+bool RingExpertSource::pinned(int64_t layer, int64_t expert) const {
+    (void) layer;
+    (void) expert;
+    // The ring is registered as a whole.  Every caller pairs this with a `blob()`/`device_alias()` that has
+    // already made the slot resident, so "registered" is the honest answer here.
+    return dev_ != nullptr;
+}
+
+const uint8_t* RingExpertSource::device_alias(int64_t layer, int64_t expert) const {
+    if (dev_ == nullptr) return nullptr;
+    const int64_t s = const_cast<RingExpertSource*>(this)->acquire(layer, expert);
+    return s < 0 ? nullptr : dev_ + (uint64_t) s * (uint64_t) slot_bytes_;
+}
+
+void RingExpertSource::begin_layer(int64_t layer, const int32_t* ids, int64_t k) {
+    if (layer != held_layer_) {
+        for (Slot& s : slot_) s.held = false;
+        held_layer_ = layer;
+    }
+    if (ids != nullptr) {
+        for (int64_t i = 0; i < k; ++i)
+            if (ids[i] >= 0 && ids[i] < n_expert_) (void) acquire(layer, ids[i]);
+    }
+}
+
 }  // namespace strata::core
