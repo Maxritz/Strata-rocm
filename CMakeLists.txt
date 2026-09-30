@@ -716,6 +716,13 @@ if(STRATA_BUILD_TESTS)
   target_link_libraries(expert_cache_per_layer_test PRIVATE strata_engine ${ROCM_LIBRARY}/amdhip64.lib)
   target_include_directories(expert_cache_per_layer_test PRIVATE ${ROCM_INCLUDE})
   add_test(NAME expert_cache_per_layer_test COMMAND expert_cache_per_layer_test)
+
+  # M2: the deepseek2/GLM native serving gate.  Reads the local GLM pack + GGUF and skips when they are absent;
+  # it is the only check that the 3-D `attn_k_b`/`attn_v_b` are actually attached.
+  add_executable(native_dense_3d_test src/core/native_dense_3d_test.cpp)
+  target_link_libraries(native_dense_3d_test PRIVATE strata_engine ${ROCM_LIBRARY}/amdhip64.lib)
+  target_include_directories(native_dense_3d_test PRIVATE ${ROCM_INCLUDE})
+  add_test(NAME native_dense_3d_test COMMAND native_dense_3d_test)
 endif()
 
 if(STRATA_BUILD_TESTS)

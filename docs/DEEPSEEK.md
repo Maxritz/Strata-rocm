@@ -136,9 +136,14 @@ IQ4_XS): no canonicalization pass is required.
   WHOLE `mla_layer` over 3 positions vs a double reference that models the Q8_0 weights and the Q8_1 activation
   quantization: **worst L1 8.6e-4** (the contract's G-COH bar is 1e-3).  The residual is the chained projections
   each re-quantizing their own input, not the core math.
+- **M2 step 5 — the GLM pack LOADS (2026-10-01).**  `NativeDense` now serves the MLA projections and the dense
+  layer-0 FFN (`eligible`), and a 3-D quantized tensor is uploaded whole with the per-head stride
+  `native_mmvq_weight_bytes(type, ne0, ne1)` (`attn_k_b` is `[192, 512, 20]`); `check_architecture` accepts
+  `deepseek2` with its own required keys.  Evidence: `build_gfx1201\native_dense_3d_test.exe` (gfx1201) ->
+  **PASS**, 423 native weights / 1310.4 MiB, `attn_k_b` Q8_0 `[192,512]`, `attn_v_b` Q6_K `[512,256]`.
 - **Still OPEN for M2:** the deepseek2 MoE variant (sigmoid gating + `exp_probs_b` selection bias, top-4,
-  weights-norm + scale 1.8, the ungated shared expert), the dense layer-0 FFN, native serving of the 3-D
-  `attn_k_b`/`attn_v_b`, and the decode/prefill wiring from `generate.cpp`/`session.cpp`.
+  weights-norm + scale 1.8, the ungated shared expert), the dense layer-0 FFN composition, and the
+  decode/prefill wiring from `generate.cpp`/`session.cpp`.
 
 
 

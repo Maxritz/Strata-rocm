@@ -464,6 +464,21 @@ struct Qwen4ExpGuard {
 inline std::string check_architecture(const GgufFile& g, const Qwen4ExpGuard& want = {}) {
     const MetaValue* arch = g.get("general.architecture");
     if (!arch) return "missing general.architecture";
+    if (arch->s == "deepseek2") {
+        // The MLA family (docs/DEEPSEEK.md).  Every key a kernel reads must be present and positive; the guard's
+        // fields are qwen4exp geometry and do not apply.
+        static const char* reqs[] = {"deepseek2.block_count", "deepseek2.embedding_length", "deepseek2.expert_count",
+                                     "deepseek2.expert_used_count", "deepseek2.attention.head_count",
+                                     "deepseek2.attention.head_count_kv", "deepseek2.attention.kv_lora_rank",
+                                     "deepseek2.attention.q_lora_rank", "deepseek2.attention.key_length_mla",
+                                     "deepseek2.rope.dimension_count"};
+        for (const char* key : reqs) {
+            const MetaValue* v = g.get(key);
+            if (!v) return std::string("missing ") + key;
+            if (v->u == 0) return std::string(key) + " = 0, expected a positive value";
+        }
+        return {}; // empty == ok
+    }
     if (arch->s != "qwen4exp") return "architecture is '" + arch->s + "', this engine requires 'qwen4exp'";
     struct Req {
         const char* key;

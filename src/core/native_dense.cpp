@@ -22,9 +22,14 @@ bool eligible(const std::string& name, bool include_ple_key) {
     // float (so they went to dense.bin), but a Q4/Q8 model (Whittle) stores them quantized - without them here
     // the pack marks them shape-only and `weights.cpp` refuses the load.  Their norms are 1-D F32 and are not
     // served this way.
+    // MLA (deepseek2) adds the low-rank q/kv projections and the per-head `attn_k_b`/`attn_v_b`; the leading
+    // dense FFN of a deepseek2 model (layer 0) adds `ffn_{gate,up,down}.weight`.  A qwen4exp pack has none of
+    // these names, so nothing about the running model changes.
     static const char* suffixes[] = {".attn_qkv.weight", ".attn_gate.weight", ".ssm_out.weight",
         ".attn_q.weight", ".attn_k.weight", ".attn_v.weight", ".attn_output.weight",
         ".indexer.q_proj.weight", ".indexer.k_proj.weight",
+        ".attn_q_a.weight", ".attn_q_b.weight", ".attn_kv_a_mqa.weight", ".attn_k_b.weight", ".attn_v_b.weight",
+        ".ffn_gate.weight", ".ffn_up.weight", ".ffn_down.weight",
         ".ffn_gate_shexp.weight", ".ffn_up_shexp.weight", ".ffn_down_shexp.weight"};
     for (const char* suffix : suffixes) if (name.ends_with(suffix)) return true;
     return false;
@@ -46,7 +51,7 @@ bool NativeDense::served_names(const std::vector<std::string>& shards, bool incl
             strata::GgufFile gguf(path);
             for (const auto& tensor : gguf.tensors())
                 if (eligible(tensor.name, include_ple_key) && strata::kernels::native_mmvq_supported(tensor.type) &&
-                    tensor.shape.size() == 2)
+                    tensor.shape.size() >= 2)
                     out.insert(tensor.name);
         }
         return true;
@@ -142,13 +147,21 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 auto& ref = found->second;
                 if (ref.native_data) { err = "native dense: override already attached"; return false; }
                 if (!strata::kernels::native_mmvq_supported(tensor.type)) continue;
-                if (!ref.quantized() || tensor.shape.size() != 2 ||
+                if (!ref.quantized() || tensor.shape.size() < 2 ||
                     ref.ne0 <= 0 || ref.ne0 > INT_MAX || ref.ne1 <= 0 || ref.ne1 > INT_MAX ||
                     tensor.shape[0] != (uint64_t) ref.ne0 || tensor.shape[1] != (uint64_t) ref.ne1) {
                     err = "native dense: incompatible matrix " + tensor.name; return false;
                 }
-                const auto bytes = strata::kernels::native_mmvq_weight_bytes(
-                    tensor.type, (int) ref.ne0, (int) ref.ne1);
+                // A 3-D tensor (MLA's per-head `attn_k_b`/`attn_v_b`) is uploaded whole; the caller steps
+                // `native_mmvq_weight_bytes(type, ne0, ne1)` per head.  Block geometry gives the full byte count.
+                int blk_elems = 0, blk_bytes = 0;
+                if (!strata::block_geometry(tensor.type, blk_elems, blk_bytes)) {
+                    err = "native dense: no block geometry " + tensor.name; return false;
+                }
+                uint64_t elements = 1;
+                for (uint64_t dim : tensor.shape) elements *= dim;
+                if (elements % (uint64_t) blk_elems) { err = "native dense: ragged tensor " + tensor.name; return false; }
+                const auto bytes = elements / (uint64_t) blk_elems * (uint64_t) blk_bytes;
                 void* allocation = nullptr;
                 auto status = hipMalloc(&allocation, bytes);
                 DevicePtr data(allocation);
