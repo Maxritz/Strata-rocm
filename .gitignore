@@ -47,3 +47,10 @@ build-vision.bat
 *.done
 /third_party/*.zip
 
+
+# hipcc --save-temps artifacts (repo root) and local scratch
+*-hip-amdgcn-amd-amdhsa*
+*-host-x86_64*
+*.hipfb
+*.tmp.bc
+task_*.txt
