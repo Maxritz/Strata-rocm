@@ -1057,7 +1057,7 @@ int main(int argc, char** argv) {
                 const bool ok = e > 0 && hc > 0 && lr > 0 && ff > 0 && sm == 128;
                 std::printf("support: %s\n", ok ? "SUPPORTED (qwen4exp; geometry read from the header)"
                                                 : "NOT runnable: needs ssm 128 and positive widths");
-            } else if (arch == "deepseek4") {
+            } else if (arch == "deepseek4" || arch == "deepseek4-dspark") {
                 std::printf("  MLA: heads %lld kv %lld key/value %lld  q_lora %lld  out_lora %lld x%lld  layers %lld embd %lld\n",
                             u("deepseek4.attention.head_count"), u("deepseek4.attention.head_count_kv"),
                             u("deepseek4.attention.key_length"), u("deepseek4.attention.q_lora_rank"),
@@ -1092,7 +1092,7 @@ int main(int argc, char** argv) {
                        arch == "nemotron_h" || arch == "nemotron_h_moe" || arch == "modern-bert" ||
                        arch == "clip" || arch == "diffuse" || arch == "laguna" || arch == "dflash" ||
                        arch == "dspark" || arch == "k2-horizon" || arch == "muse-glimmer" ||
-                       arch == "spark2_5" || arch == "deepseek4-dspark") {
+                       arch == "spark2_5") {
                 std::printf("support: recognised architecture, no decoder in this build (see docs/MODEL_SUPPORT.md)\n");
             } else {
                 std::printf("support: unsupported architecture (this build runs qwen4exp; see docs/MODEL_SUPPORT.md "
