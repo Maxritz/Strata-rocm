@@ -418,6 +418,30 @@ three named cases are **mixed-precision quantization, non-uniform pruning, and e
   time. It is the principled upgrade path for the `--expert-cache` / `--expert-ram-gb` sizing and the Q2_0-vs-
   IQ2_XS mixed-precision question.
 
+## 10e. CORRECTION — the nondeterminism is the VERIFY WINDOW, not the ring
+
+**A controlled A/B changed the conclusion.** Running the plain **arena with no ring at all** and varying one
+thing at a time (Swift IQ2_XS, 18-token prompt, `--prefill 128 --max-new 24`, 6 runs each):
+
+| configuration | identical runs |
+|---|---|
+| arena, `--expert-cache 0 --spec 1` (no cache, no speculation) | **4/4** |
+| arena, `--expert-cache 2600 --spec 1` (cache, no speculation) | **4/4** |
+| arena, `--expert-cache 2600 --spec 2` (speculation on) | **1/6** |
+| arena forced onto the per-layer prefill path (`STRATA_STREAM_ALL_MIN=999999`) | 2/6 |
+
+The per-layer prefill path and the bounded ring were **both innocent**: the divergence reproduces with the
+default arena and is triggered by **`--spec 2`** — the speculative **verify window**. `--spec 1` is
+deterministic. So the bug is in the verify-window dispatch/commit, and everything in §10c that blamed the
+ring's eviction was chasing the wrong layer of the stack.
+
+**What this changes.** The bounded ring's release is now **synchronous** (`release_layer` waits on the layer's
+completion event before un-protecting a slot, so correctness no longer depends on which stream the consumers
+were on) — keep it, it is strictly safer. But the ring is *not* the cause of the divergence, and un-blocking
+the ring requires fixing the verify window first. Next step: reproduce with `--spec 2` on the arena and audit
+`expert_pool_dispatch_multi` / `HitPhase::Launch|Combine` and the window's commit graph — the ring's
+allocations merely change the timing that exposes it.
+
 ## 10. One-line summary
 
 The 34 GB arena is unbounded residency; the fix — a bounded pinned LRU ring (`RingExpertSource`,

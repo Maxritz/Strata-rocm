@@ -1609,12 +1609,10 @@ int main(int argc, char** argv) {
                      (double) ((uint64_t) ring_src.slots() * (uint64_t) ring_src.slot_bytes()) /
                          (1024.0 * 1024.0 * 1024.0),
                      o.expert_ram_gb);
-        std::fprintf(stderr,
-                     "strata generate: WARNING -- the bounded ring's EVICTION path is still nondeterministic "
-                     "(the release is not yet per-consumer across the verify window); a pool that holds every "
-                     "expert (--expert-ram-gb 34) is byte-identical to the arena, an evicting one diverges on "
-                     "some runs.  Do not use it for correctness-critical output yet (docs/"
-                     "EXPERT_RESIDENCY_FINDINGS.md section 10c).\n");
+        // The eviction path is now released synchronously per layer, so it no longer races.  NOTE: the engine's
+        // own nondeterminism that this mask was chasing turned out to be in the SPECULATIVE VERIFY-WINDOW path,
+        // and it reproduces with NO ring at all (docs/EXPERT_RESIDENCY_FINDINGS.md section 10e).
+        std::fprintf(stderr, "strata generate: ring slots are released synchronously per layer (docs section 10c)\n");
         srcp = &ring_src;
     } else if (o.mmap_experts) {
         if (!src.open(o.pack, g.n_layers, g.n_expert, err)) {

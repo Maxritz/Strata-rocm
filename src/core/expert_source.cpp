@@ -35,7 +35,7 @@ namespace strata::core {
 // docs §7.4: how many layers back the decode-path release lags.  The verify window can still hold layer `l-1`'s
 // plan aliases in flight while layer `l` dispatches, so releasing `l-1` was one layer too eager - the source of
 // the bounded ring's nondeterminism.  Two layers of lag gave the window room; the pool is sized far above it.
-static constexpr int64_t LAG_DECODE = 4;
+static constexpr int64_t LAG_DECODE = 1;
 
 // ================================ THE FILE-BACKED SOURCE ================================
 
@@ -978,9 +978,17 @@ int64_t RingExpertSource::acquire(int64_t layer, int64_t expert) {
 
 void RingExpertSource::release_layer(int64_t layer, void* after_event) {
     if (layer != cur_layer_) return;   // nothing acquired for this layer (or the layer has already advanced)
+    // **SYNCHRONOUS RELEASE (the ds4 policy).**  `after_event` is recorded after every consumer of this layer's
+    // source blobs - the copies sourced from these slots, the kernels reading their aliases, and the stager's
+    // threads have been joined by the caller.  Waiting on it here means the moment this returns, EVERY consumer
+    // is provably finished, so the slots are safe to reuse with no gate at all: the correctness does not rest on
+    // which stream the consumers were on.  It costs a host stall per layer (the prefill no longer runs a whole
+    // chunk ahead), which is the price of a bounded pool that is deterministic - the previous event-gate version
+    // passed on some runs and diverged on others (docs/EXPERT_RESIDENCY_FINDINGS.md section 10c).
+    if (after_event != nullptr) (void) hipEventSynchronize((hipEvent_t) after_event);
     for (const int64_t s : layer_slots_) {
         Slot& sl = slot_[(size_t) s];
-        if (sl.held && sl.layer == layer) { sl.held = false; sl.gate = after_event; }
+        if (sl.held && sl.layer == layer) { sl.held = false; sl.gate = nullptr; }
     }
     layer_slots_.clear();
 }
