@@ -1084,13 +1084,18 @@ int main(int argc, char** argv) {
                 // "large MoE" shelf in the zoo.  A DIFFERENT decoder - its own gated/SSM attention and MoE
                 // router - so it is recognised and triaged here, not run (docs/MODEL_SUPPORT.md section 4).
                 const std::string p = arch + ".";
-                std::printf("  embd %lld  layers %lld  experts %lldx%lld  ff %lld  ffn %lld\n",
+                std::printf("  embd %lld  layers %lld  heads %lld/%lld  full_attn_every %lld  rope %lld  "
+                            "ssm state %lld conv %lld  experts %lldx%lld  ff %lld  shared ff %lld\n",
                             u((p + "embedding_length").c_str()), u((p + "block_count").c_str()),
+                            u((p + "attention.head_count").c_str()), u((p + "attention.head_count_kv").c_str()),
+                            u((p + "full_attention_interval").c_str()), u((p + "rope.dimension_count").c_str()),
+                            u((p + "ssm.state_size").c_str()), u((p + "ssm.conv_kernel").c_str()),
                             u((p + "expert_used_count").c_str()), u((p + "expert_count").c_str()),
-                            u((p + "expert_feed_forward_length").c_str()), u((p + "feed_forward_length").c_str()));
-                std::printf("support: RECOGNISED, not yet runnable (qwen35 family: a different attention - "
-                            "gated/SSM hybrid - and MoE than the compiled qwen4exp path; docs/MODEL_SUPPORT.md "
-                            "section 4)\n");
+                            u((p + "expert_feed_forward_length").c_str()),
+                            u((p + "expert_shared_feed_forward_length").c_str()));
+                std::printf("support: RECOGNISED, not yet runnable (a hybrid GDN + periodic full-attention MoE - "
+                            "structurally a sibling of qwen4exp; the reuse map and port plan are in "
+                            "docs/MODEL_SUPPORT.md section 3b)\n");
             } else if (arch == "deepseek2") {
                 std::printf("  embd %lld  layers %lld  experts %lldx%lld\n",
                             u("deepseek2.embedding_length"), u("deepseek2.block_count"),
