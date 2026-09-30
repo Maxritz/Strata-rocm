@@ -387,6 +387,37 @@ A/B to run first: force the ring's dispatch to the CPU path (`pinned()` policy) 
 20/22/24 for the knee. `--pcie-frac 0` is NOT a clean isolation — it diverges (`248068 271 248069 271`) and is
 slower, so it is its own (separate) bug to look at.
 
+## 10d. Budgeted expert selection — RCO (arXiv 2605.00649)
+
+**"Model Compression with Exact Budget Constraints via Riemannian Manifolds"** (Helcig & Alistarh, IST-DASLab;
+code: `github.com/IST-DASLab/RCO`). It formalises exactly our class of decision: *assign one of K options to
+each of N groups under a total cost budget*, where the loss depends on all assignments jointly — the paper's
+three named cases are **mixed-precision quantization, non-uniform pruning, and expert selection**.
+
+- **What it gives.** Under a softmax relaxation the budget defines a smooth Riemannian manifold in logit
+  space (closed-form normal, monotone cost shift, transport = one inner product), so **RCO** wraps tangent
+  projection + binary-search retraction + momentum transport around a plain Adam step. It optimises the
+  **actual loss**, enforces the expected budget **exactly at every iterate**, needs **no constraint
+  hyperparameters**, and handles **multiple simultaneous budgets**.
+
+- **Where it maps onto this engine.**
+  1. **Which experts stay resident** under `--expert-cache N` (VRAM) and `--expert-ram-gb N` (RAM). Today the
+     admission is a heuristic: rank by routing frequency from `--expert-profile`. RCO's frame would rank by
+     **actual loss impact per byte** instead — the principled version of the same knob.
+  2. **Per-expert bit-width** (the §11.10 item "per-expert mixed precision, more bits on rare-critical
+     experts") — an exact total-bytes budget across 24,576 experts.
+  3. **Expert carving**, which is literally what the **Whittle** family does ("the 256→180 expert carve
+     removed knowledge"); RCO is the tool for that decision under a parameter budget.
+
+- **Honest boundary.** RCO is a **pack/quant-time** optimiser (it wants the loss, hence a differentiable
+  relaxation and training data), **not** an inference-time scheduler. For residency at serve time the routing
+  profile remains the practical signal; RCO belongs in the pack-build step — deciding *how many bits* each
+  expert gets and *which* experts exist at all — not in the token loop.
+
+- **Status:** recorded, not yet used; it needs a DGX-style optimiser pass over a calibration set at pack
+  time. It is the principled upgrade path for the `--expert-cache` / `--expert-ram-gb` sizing and the Q2_0-vs-
+  IQ2_XS mixed-precision question.
+
 ## 10. One-line summary
 
 The 34 GB arena is unbounded residency; the fix — a bounded pinned LRU ring (`RingExpertSource`,
