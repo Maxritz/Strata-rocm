@@ -13,10 +13,12 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <random>
 #include <vector>
 namespace {
@@ -117,32 +119,46 @@ void run(bool mxfp4) {
             cond[(size_t) o] = sum_abs;
         }
 
-        uint16_t* d_x = nullptr; uint8_t* d_w = nullptr; float* d_y = nullptr;
-        check(hipMalloc(&d_x, x.size() * sizeof(uint16_t)), "hipMalloc x");
-        check(hipMalloc(&d_w, (size_t) w_bytes), "hipMalloc w");
-        check(hipMalloc(&d_y, (size_t) n_out * sizeof(float)), "hipMalloc y");
-        check(hipMemcpy(d_x, x.data(), x.size() * sizeof(uint16_t), hipMemcpyHostToDevice), "copy x");
-        check(hipMemcpy(d_w, w.data(), (size_t) w_bytes, hipMemcpyHostToDevice), "copy w");
-        strata::kernels::fp4_gemv(d_x, d_w, d_y, n_in, n_out, mxfp4);
-        std::vector<float> got((size_t) n_out);
-        check(hipMemcpy(got.data(), d_y, got.size() * sizeof(float), hipMemcpyDeviceToHost), "copy y");
-        check(hipFree(d_x), "free x"); check(hipFree(d_w), "free w"); check(hipFree(d_y), "free y");
+        // Compare a kernel's output to the validated scalar reference `ref`.  Both fp4_gemv and fp4_gemv_fast
+        // are parity-checked against this SAME reference - not against each other - so a decode bug unique to
+        // the fast kernel is caught instead of cancelled out.
+        auto compare = [&](const std::vector<float>& got, const char* which) -> int {
+            int bad = 0; double worst = 0.0, worst_res = 0.0;
+            for (long long o = 0; o < n_out; ++o) {
+                const double a = ref[(size_t) o], b = got[(size_t) o];
+                const double scale = cond[(size_t) o] > 1e-30 ? cond[(size_t) o] : 1e-30;
+                const double rel = std::fabs(a - b) / scale;
+                const double rel_res = std::fabs(a - b) / (std::fabs(a) > 1e-30 ? std::fabs(a) : 1e-30);
+                if (rel > worst) worst = rel;
+                if (rel_res > worst_res) worst_res = rel_res;
+                if (!(rel <= 1e-5)) ++bad;
+            }
+            double lo = ref[0], hi = ref[0];
+            for (float v : ref) { lo = std::fmin(lo, v); hi = std::fmax(hi, v); }
+            std::printf("  %-6s n_in %4lld n_out %3lld  %s  %d over tol  worst rel %.3e (rel-to-result %.3e)  spread [%.3g, %.3g]\n",
+                        name, (long long) n_in, n_out, which, bad, worst, worst_res, lo, hi);
+            if (bad) std::printf("      first ref=%g got=%g\n", ref[0], got[0]);
+            return bad;
+        };
 
-        int bad = 0; double worst = 0.0, worst_res = 0.0;
-        for (long long o = 0; o < n_out; ++o) {
-            const double a = ref[(size_t) o], b = got[(size_t) o];
-            const double scale = cond[(size_t) o] > 1e-30 ? cond[(size_t) o] : 1e-30;
-            const double rel = std::fabs(a - b) / scale;
-            const double rel_res = std::fabs(a - b) / (std::fabs(a) > 1e-30 ? std::fabs(a) : 1e-30);
-            if (rel > worst) worst = rel;
-            if (rel_res > worst_res) worst_res = rel_res;
-            if (!(rel <= 1e-5)) ++bad;
-        }
-        double lo = ref[0], hi = ref[0];
-        for (float v : ref) { lo = std::fmin(lo, v); hi = std::fmax(hi, v); }
-        std::printf("  %-6s n_in %4lld n_out %3lld  %d over tol  worst rel %.3e (rel-to-result %.3e)  spread [%.3g, %.3g]\n",
-                    name, (long long) n_in, n_out, bad, worst, worst_res, lo, hi);
-        if (bad) { std::printf("      first ref=%g got=%g\n", ref[0], got[0]); return; }
+        auto launch_and_copy = [&](auto fn, const char* /*which*/) -> std::vector<float> {
+            uint16_t* d_x = nullptr; uint8_t* d_w = nullptr; float* d_y = nullptr;
+            check(hipMalloc(&d_x, x.size() * sizeof(uint16_t)), "hipMalloc x");
+            check(hipMalloc(&d_w, (size_t) w_bytes), "hipMalloc w");
+            check(hipMalloc(&d_y, (size_t) n_out * sizeof(float)), "hipMalloc y");
+            check(hipMemcpy(d_x, x.data(), x.size() * sizeof(uint16_t), hipMemcpyHostToDevice), "copy x");
+            check(hipMemcpy(d_w, w.data(), (size_t) w_bytes, hipMemcpyHostToDevice), "copy w");
+            fn(d_x, d_w, d_y, n_in, n_out, mxfp4);
+            std::vector<float> got((size_t) n_out);
+            check(hipMemcpy(got.data(), d_y, got.size() * sizeof(float), hipMemcpyDeviceToHost), "copy y");
+            check(hipFree(d_x), "free x"); check(hipFree(d_w), "free w"); check(hipFree(d_y), "free y");
+            return got;
+        };
+
+        int allbad = 0;
+        allbad += compare(launch_and_copy(strata::kernels::fp4_gemv,        "baseline"),  "baseline");
+        allbad += compare(launch_and_copy(strata::kernels::fp4_gemv_fast,    "FAST    "), "FAST");
+        if (allbad) return;
     }
 
     // ---- nibble-layout pin (the bit-order hazard the random test can't own on its own).
@@ -167,7 +183,69 @@ void run(bool mxfp4) {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    const bool bench = argc > 1 && std::strcmp(argv[1], "--bench") == 0;
+    const long long n_in = bench && argc > 2 ? std::atoll(argv[2]) : 0;
+    const long long n_out = bench && argc > 3 ? std::atoll(argv[3]) : 0;
+    const int reps = bench && argc > 4 ? std::atoi(argv[4]) : 1;
+    if (bench) {
+        // Fair timing: identical input, both kernels, warmup + average over `reps`.  No fabricated numbers.
+        const bool mxfp4 = true;
+        const long long ELEMS = mxfp4 ? 32 : 64;
+        const int BLOCK_BYTES = mxfp4 ? 17 : 36;
+        std::mt19937 rng(0xC0FFEE);
+        std::vector<uint16_t> x((size_t)n_in);
+        for (auto& v : x) v = (uint16_t)(rng() & 0xFFFF);
+        std::vector<uint8_t> w((size_t)(n_in / ELEMS * n_out * BLOCK_BYTES), 0);
+        for (long long o = 0; o < n_out; ++o) {
+            for (long long b = 0; b < n_in / ELEMS; ++b) {
+                uint8_t* blk = w.data() + o * (n_in / ELEMS) * BLOCK_BYTES + b * BLOCK_BYTES;
+                blk[0] = (uint8_t)(120 + (rng() % 16));
+                for (int i = 1; i < BLOCK_BYTES; ++i) blk[i] = (uint8_t)(rng() & 0xFF);
+            }
+        }
+        uint16_t* d_x = nullptr; uint8_t* d_w = nullptr;
+        float *d_y1 = nullptr, *d_y2 = nullptr;
+        check(hipMalloc(&d_x, x.size()*2), "x");
+        check(hipMalloc(&d_w, w.size()), "w");
+        check(hipMalloc(&d_y1, n_out*4), "y1");
+        check(hipMalloc(&d_y2, n_out*4), "y2");
+        check(hipMemcpy(d_x, x.data(), x.size()*2, hipMemcpyHostToDevice), "cx");
+        check(hipMemcpy(d_w, w.data(), w.size(), hipMemcpyHostToDevice), "cw");
+        auto t = [](auto f, auto... a)->double {
+            hipEvent_t s,e; (void)hipEventCreate(&s); (void)hipEventCreate(&e);
+            (void)hipEventRecord(s); f(a...); (void)hipEventRecord(e); (void)hipEventSynchronize(e);
+            float ms=0; (void)hipEventElapsedTime(&ms,s,e); (void)hipEventDestroy(s); (void)hipEventDestroy(e); return ms;
+        };
+        strata::kernels::fp4_gemv(d_x,d_w,d_y1,n_in,n_out,mxfp4);
+        strata::kernels::fp4_gemv_fast(d_x,d_w,d_y2,n_in,n_out,mxfp4);
+        std::vector<float> g1((size_t)n_out), g2((size_t)n_out);
+        check(hipMemcpy(g1.data(), d_y1, n_out*4, hipMemcpyDeviceToHost), "c1");
+        check(hipMemcpy(g2.data(), d_y2, n_out*4, hipMemcpyDeviceToHost), "c2");
+        int mism = 0; long long maxdiff = 0;
+        for (long long i = 0; i < n_out; ++i) {
+            double rel = std::fabs((double)g1[i] - (double)g2[i]) /
+                         (std::fabs((double)g1[i]) > 1e-30 ? std::fabs((double)g1[i]) : 1e-30);
+            if (rel > 1e-5) ++mism;
+            long long diff = (long long) std::fabs((double)g1[i] - (double)g2[i]);
+            if (diff > maxdiff) maxdiff = diff;
+        }
+        strata::kernels::fp4_gemv(d_x,d_w,d_y1,n_in,n_out,mxfp4);
+        strata::kernels::fp4_gemv_fast(d_x,d_w,d_y2,n_in,n_out,mxfp4);
+        double t0=0,t1=0;
+        for (int i=0;i<reps;++i){ t0 += t(strata::kernels::fp4_gemv,        d_x,d_w,d_y1,n_in,n_out,mxfp4);
+                                t1 += t(strata::kernels::fp4_gemv_fast,    d_x,d_w,d_y2,n_in,n_out,mxfp4); }
+        double t0a=t0/reps, t1a=t1/reps;
+        const double elems = (double)n_in * (double)n_out;
+        std::printf("bench n_in=%lld n_out=%lld mxfp4=%d reps=%d  parity_mismatch=%d  maxabsdiff=%lld\n",
+                    (long long)n_in,(long long)n_out,(int)mxfp4,reps,mism,(long long)maxdiff);
+        std::printf("  baseline: %.4f ms  %.3f TOPS\n", t0a, elems/1e12/(t0a/1e3));
+        std::printf("  fast    : %.4f ms  %.3f TOPS\n", t1a, elems/1e12/(t1a/1e3));
+        std::printf("  speedup : %.2fx\n", t0a/t1a);
+        auto hFree = [](void* p){ (void)hipFree(p); };
+        hFree(d_x); hFree(d_w); hFree(d_y1); hFree(d_y2);
+        return 0;
+    }
     std::printf("fp4_gemv_parity\n");
     int bad = 0;
     run(true);   // MXFP4

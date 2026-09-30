@@ -35,4 +35,10 @@ namespace strata::kernels {
 void fp4_gemv(const uint16_t* x, const uint8_t* w, float* y,
               int64_t n_in, int64_t n_out, bool mxfp4);
 
+// The SAME matmul, vectorized decode (8 codes per load via the codebook table, fp16 activations two at a
+// time via __half22float2).  Numerics are identical to `fp4_gemv` aside from summation order, so it is
+// parity-tested against the same scalar reference - not against the naive kernel alone.
+void fp4_gemv_fast(const uint16_t* x, const uint8_t* w, float* y,
+                   int64_t n_in, int64_t n_out, bool mxfp4);
+
 }  // namespace strata::kernels

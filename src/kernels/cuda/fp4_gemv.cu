@@ -1,66 +1,15 @@
 #include "hip/hip_runtime.h"
 // src/kernels/cuda/fp4_gemv.cu - P2.S2: MXFP4 / NVFP4 GEMV (Path A: fp16 x, software FP4 decode, fp32 acc).
 //
-// See fp4_gemv.hpp.  This is the naive, parity-testable kernel against which the U44 dot path must match.
+// See fp4_gemv.hpp.  This is the naive baseline (one thread per output row) checked against the validated
+// scalar dequantizers in fp4_gemv_parity.cpp.  The FP4 decode helpers live in fp4_decode.hpp and are shared
+// with fp4_gemv_fast.cu so the two kernels cannot drift; a decode bug shows in BOTH parity tests.
 #include "strata/kernels/fp4_gemv.hpp"
-
-#include "strata/artifact/dequant.hpp"
+#include "strata/kernels/fp4_decode.hpp"
 
 #include <hip/hip_fp16.h>
 
 namespace strata::kernels {
-namespace {
-
-// ---- device copies of the validated scalar decoders (dequant.hpp).  These are bit-for-bit the host path
-// that `dequant_fp4_test` checks against ggml, transcribed to __device__ so a kernel-side scale bug cannot
-// diverge from the reference it is parity-tested against.
-
-__device__ __forceinline__ float e8m0_to_fp32_half_dev(uint8_t x) {
-    const uint32_t bits = x < 2 ? (0x00200000u << x) : ((uint32_t)(x - 1) << 23);
-    float f;
-    __builtin_memcpy(&f, &bits, sizeof(float));
-    return f;                                  // 2^(x-128)
-}
-
-__device__ __forceinline__ float ue4m3_to_fp32_dev(uint8_t x) {
-    if (x == 0 || x == 0x7F) return 0.0f;       // 0x7F is the UE4M3 NaN encoding -> mapped to 0 by ggml
-    const int exp = (x >> 3) & 0xF;
-    const int man = x & 0x7;
-    const float raw = exp == 0 ? ldexpf((float)man, -9) : ldexpf(1.0f + (float)man / 8.0f, exp - 7);
-    return raw * 0.5f;                          // halved, because codebooks here are stored DOUBLED
-}
-
-// The FP4 E2M1 codebook, verbatim from ggml-common.h / dequant.hpp: 0,1,2,3,4,6,8,12, 0,-1,-2,-3,-4,-6,-8,-12.
-// Stored as int8 so the signed kvalues plug straight into a signed int8 dot path.
-__device__ static const int8_t kFp4[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
-
-// ONE FP4 BLOCK, decoded to `out` (32 for MXFP4, 64 for NVFP4).  Mirrors dequantize_mxfp4 / dequantize_nvfp4
-// exactly: split-half nibble order, block-scale applied to every code.
-__device__ __forceinline__ void decode_mxfp4_block(const uint8_t* __restrict__ blk, float* __restrict__ out) {
-    const float d = e8m0_to_fp32_half_dev(blk[0]);
-    const uint8_t* qs = blk + 1;                // 16 bytes -> 32 values
-    for (int j = 0; j < 16; ++j) {
-        const uint8_t byte = qs[j];
-        out[j + 0]  = (float) kFp4[byte & 0x0F] * d;
-        out[j + 16] = (float) kFp4[byte >> 4]   * d;
-    }
-}
-
-__device__ __forceinline__ void decode_nvfp4_block(const uint8_t* __restrict__ blk, float* __restrict__ out) {
-    const uint8_t* d4 = blk;                    // 4 UE4M3 scales
-    const uint8_t* qs = blk + 4;                // 32 bytes -> 4 sub-blocks of 16
-    for (int s = 0; s < 4; ++s) {
-        const float d = ue4m3_to_fp32_dev(d4[s]);
-        float* yb = out + s * 16;
-        for (int j = 0; j < 8; ++j) {
-            const uint8_t byte = qs[s * 8 + j];
-            yb[j + 0] = (float) kFp4[byte & 0x0F] * d;
-            yb[j + 8] = (float) kFp4[byte >> 4]   * d;
-        }
-    }
-}
-
-}  // namespace
 
 __global__ void fp4_gemv_kernel(const uint16_t* __restrict__ x, const uint8_t* __restrict__ w, float* __restrict__ y,
                                 long long n_in, long long n_out, bool mxfp4) {

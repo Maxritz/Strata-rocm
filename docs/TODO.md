@@ -39,8 +39,12 @@ Decision basis for the FP4 matmul kernel, from `hipcc --offload-arch` probes + `
 - **The matmul dot is UDOT4**: `__builtin_amdgcn_udot4` compiles for gfx1201 (unsigned INT8 dot-4).
   That is the primitive the FP4 kernel uses — MX/NVFP4 4-bit codes are expanded to signed INT8 codes
   (from the `kvalues_fp4` codebook) and summed with the activations' INT8 codes via UDOT4, then rescaled.
-  RDNA4 also has `V_DOT8_U32_U4` (8 FP4 codes/instruction) as a fast follow-up, but that needs activations
-  quantized to INT4 first - out of scope for the parity-green baseline.
+  RDNA4's `V_DOT8_U32_U4` (8 FP4 codes/instruction) is **NOT usable here**: the FP4 codebook is nonlinear
+  (`0,1,2,3,4,6,8,12,0,-1,-2,-3,-4,-6,-8,-12`) and its magnitudes (up to ±12) overflow signed 4-bit (±7),
+  so feeding raw FP4 codes to a 4-bit dot computes `Σ code[i]·code[j]`, not `Σ kvalues[code]·x[i]`. A raw
+  4-bit dot is a silent correctness trap, not an acceleration. The correct fast dot is INT8 (`V_DOT4_I32_IU8` /
+  `sdot4`/`udot4`), but that needs the fp16 activation quantized to int8 too - a second numerical source,
+  so it is a separately-parity-tested path, not the baseline.
 - **WMMA is present**: `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12` (and the bf16 variant) compile
   for gfx1201 requiring `wmma-128b-insts`; they are rejected on gfx1031. The project currently uses none.
 - Inline-asm probes are unreliable for capability (clang keeps inline asm verbatim without ISA feature
@@ -51,9 +55,11 @@ Decision basis for the FP4 matmul kernel, from `hipcc --offload-arch` probes + `
    MXFP4 and NVFP4 against the validated scalar dequantizers (`dequantize_mxfp4`/`dequantize_nvfp4`) + a
    naive fp16 dot, on gfx1201: 0 mismatches, worst ~1.9e-7 (float32 rounding). Registered in CTest as
    `fp4_gemv_parity`.
-2. **FP4 GEMV UDOT8 path (Path B) — NEXT.** Swap the naive decode for `__builtin_amdgcn_udot4` (INT8 dot)
-   after quantizing the fp16 activation to INT8 per block, gated by a parity test that reproduces the
-   ~1.9e-7 baseline. Only ship when that test is green, not when it is fast.
+2. **FP4 GEMV fast decode (Path B) — NEXT.** Vectorize the decode (8 codes per load via a device codebook
+   table + broadcasted block scale) so the kernel stays fp16×fp32 and stays **bit-exact** to the baseline
+   within summation reordering - no activation quantization, no tolerance fudging, a new parity test that
+   compares against the same validated scalar dequantizers. The INT8 `V_DOT4_I32_IU8` path that quantizes
+   the activation to int8 is a *third* item, after this one, and ships only on its own green parity.
 
 
 1. **Verify-window nondeterminism (`--spec`).** The native path requires `--spec ≥ 2`, and that window
