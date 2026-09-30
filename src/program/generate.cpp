@@ -123,6 +123,9 @@ struct Options {
     bool native_router = false;       // pinned fused 512-expert top-10 router
     bool cpu_oracle_q8_0 = false;      // pinned x86 activation scales/codes at both expert stages
     std::string native_head_gguf;      // native output.weight experiment; same model shard as the pack
+    /// `--model-info GGUF`: read the model's architecture + geometry and report this build's support, then exit.
+    /// Stage 1 of the multi-architecture work (docs/ROCM_PORTING.md section 14): recognition before kernels.
+    std::string model_info;
     std::vector<std::string> native_dense_gguf; // repeat for native GDN/QSA projection shards
     /// Plan v0.3 P1: the whole native arithmetic set as ONE switch (model shard 1). It enables exactly the
     /// combination recorded in bench/results/2026-09-23-attention-ple plus the native indexer, and never the
@@ -330,6 +333,7 @@ void usage() {
                  "                       indexer, RoPE, PLE postops, and the CPU q8_0 contract unless the\n"
                  "                       expert cache is on. Individual --native-* flags stay for A/B.\n"
                  "  --native-head-gguf PATH  native Q5_K head from model shard 1; requires --stream-token\n"
+                 "  --model-info PATH    read a GGUF's architecture + geometry and report this build's support, then exit\n"
                  "  --native-dense-gguf PATH native GDN/QSA/shared projections; repeat for each source model shard\n"
                  "  --expert-cache-cpu-order  experimental GPU expert reduction matching CPU order\n"
                  "  --max-new N          tokens to generate (default 16)\n"
@@ -898,6 +902,7 @@ int main(int argc, char** argv) {
         else if (a == "--cpu-oracle-q8-0") o.cpu_oracle_q8_0 = true;
         else if (a == "--native") o.native_preset = next("--native");
         else if (a == "--native-head-gguf") o.native_head_gguf = next("--native-head-gguf");
+        else if (a == "--model-info") o.model_info = next("--model-info");
         else if (a == "--native-dense-gguf") o.native_dense_gguf.push_back(next("--native-dense-gguf"));
         else if (a == "--no-capture") o.no_capture = true;
         else if (a == "--no-pool") o.no_pool = true;
@@ -1013,13 +1018,54 @@ int main(int argc, char** argv) {
         have_tokens = true;
         o.stop_eos = true;
     }
+    if (!o.model_info.empty()) {
+        // Stage 1 of multi-architecture support (docs/ROCM_PORTING.md section 14): read the model's own metadata
+        // and report the architecture, its geometry, and whether THIS build can run it.  Recognition before kernels.
+        try {
+            strata::GgufFile f(o.model_info);
+            const strata::MetaValue* a = f.get("general.architecture");
+            const std::string arch = a ? a->s : std::string("(none)");
+            const auto u = [&](const char* k) -> long long {
+                const strata::MetaValue* v = f.get(k);
+                return v ? (long long) v->u : -1;
+            };
+            std::printf("model: %s\narchitecture: %s\n", o.model_info.c_str(), arch.c_str());
+            if (arch == "qwen4exp") {
+                const long long e = u("qwen4exp.embedding_length"), hc = u("qwen4exp.hyper_connection.count"),
+                                  lr = u("qwen4exp.hyper_connection.low_rank"), ff = u("qwen4exp.expert_feed_forward_length"),
+                                  q = u("qwen4exp.full_attention_interval"), sm = u("qwen4exp.ssm.state_size");
+                std::printf("  embd %lld  hc %lld  hc_lr %lld  n_ff %lld  qsa_interval %lld  ssm %lld  experts %lldx%lld\n",
+                            e, hc, lr, ff, q, sm, u("qwen4exp.expert_used_count"), u("qwen4exp.expert_count"));
+                std::printf("support: %s\n", (e == 2560 && hc == 4 && lr == 320 && ff == 640 && q == 4 && sm == 128)
+                                                  ? "SUPPORTED (matches the compiled prompt path)"
+                                                  : "NOT runnable: geometry differs from the compiled prompt path");
+            } else if (arch == "deepseek4") {
+                std::printf("  MLA: heads %lld kv %lld key/value %lld  q_lora %lld  out_lora %lld x%lld  layers %lld embd %lld\n",
+                            u("deepseek4.attention.head_count"), u("deepseek4.attention.head_count_kv"),
+                            u("deepseek4.attention.key_length"), u("deepseek4.attention.q_lora_rank"),
+                            u("deepseek4.attention.output_lora_rank"), u("deepseek4.attention.output_group_count"),
+                            u("deepseek4.block_count"), u("deepseek4.embedding_length"));
+                std::printf("  MoE %lldx%lld (used %lld, shared %lld, ff %lld)  hyper_connections %lld  engram_layers %lld\n",
+                            u("deepseek4.expert_used_count"), u("deepseek4.expert_count"), u("deepseek4.expert_used_count"),
+                            u("deepseek4.expert_shared_count"), u("deepseek4.expert_feed_forward_length"),
+                            u("deepseek4.hyper_connection.count"), u("deepseek4.hash_layer_count"));
+                std::printf("support: RECOGNISED, not yet runnable (MLA + compressed sparse attention; "
+                            "docs/ROCM_PORTING.md section 14)\n");
+            } else {
+                std::printf("support: unsupported architecture (this build runs qwen4exp; docs/ROCM_PORTING.md section 14)\n");
+            }
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "strata generate: --model-info: %s\n", e.what());
+            return 1;
+        }
+        return 0;
+    }
     if (!have_tokens) {
         std::fprintf(stderr, "strata generate: --tokens is required (this build has no tokenizer; see the "
                              "header of src/program/generate.cpp)\n");
         usage();
         return 2;
     }
-
     if ((o.ple_io != "direct" && o.ple_io != "mmap") || o.ple_row_cache < 0 || o.ple_inflight < 1 ||
         o.ple_inflight > 1024 || !(o.ple_delay_us >= 0)) {
         std::fprintf(stderr, "strata generate: invalid --ple-io/--ple-row-cache/--ple-inflight/--ple-delay-us\n");
