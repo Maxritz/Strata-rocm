@@ -551,7 +551,7 @@ bool ple_issue_token(const PleRun& p, std::string& err);
 bool ple_finish_token(const PleRun& p, void* stream, std::string& err);
 
 /// Internal PLE workspace plus one separate hc_dim normalized row for advancing history.
-uint64_t ple_run_scratch_bytes();
+uint64_t ple_run_scratch_bytes(const strata::kernels::PleGeom& geom);
 
 /// `ple` is the layer-1 PLE, or null to skip it (which is what every measurement before LEDGER L123 did).
 /// It is applied INSIDE `pre[1]`, before layer 1's own `gr_read`, because the block's output is

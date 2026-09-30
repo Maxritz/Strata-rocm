@@ -201,7 +201,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     const uint64_t NH = (uint64_t) g.n_head, HD = (uint64_t) g.head_dim, NKV = (uint64_t) g.n_head_kv;
     const uint64_t IQ = (uint64_t) g.idx_q_heads, ID = (uint64_t) g.idx_key_dim;
     const uint64_t nG = (uint64_t) g.n_gdn_layers(), nQ = (uint64_t) g.n_qsa_layers();
-    const uint64_t HS = (uint64_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM;
+    const uint64_t HS = (uint64_t) strata::kernels::NG_HIST * (uint64_t) g.hc * (uint64_t) g.n_embd;
     const uint64_t TS = (uint64_t) (s.idx_block - 1) * ID;
     const int max_in = (int) std::max<uint64_t>(std::max<uint64_t>(N, ZV), NH * HD);
 
@@ -355,7 +355,7 @@ bool Verifier::record_window(int T, hipStream_t cs, std::string& err) {
     const GrShapes gs{g.n_embd, g.hc, g.hc_lr};
     const uint64_t gdn_floats = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
                                 (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
-    const int64_t HS = (int64_t) NG_HIST * NG_HC_DIM;
+    const int64_t HS = (int64_t) NG_HIST * g.hc * g.n_embd;
     const int64_t TS = (s.idx_block - 1) * ID;
     const bool ple_on = ss.ple.ready();
     auto Rt = [&](int t) { return R_ + (size_t) t * HC * N; };
@@ -764,7 +764,7 @@ bool Verifier::capture_commit(std::string& err) {
     const uint64_t gdn_floats = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
                                 (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
     const int64_t TS = (s.idx_block - 1) * ID;
-    const int64_t HS = (int64_t) NG_HIST * NG_HC_DIM;
+    const int64_t HS = (int64_t) NG_HIST * g.hc * g.n_embd;
     if (hipStreamBeginCapture(cs_, hipStreamCaptureModeThreadLocal) != hipSuccess) {
         err = "verify: begin commit capture failed";
         return false;
@@ -836,10 +836,10 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         for (int64_t h = 0; h < g.n_head; ++h) h_pos_[t * g.n_head + h] = (int32_t) (pos0 + t);
     }
     if (ss.ple.ready()) {
-        uint32_t rows[kVerifyMaxT * PLE_N_HEADS];
+        uint32_t rows[kVerifyMaxT * PLE_N_HEADS_MAX];
         int32_t prev[2] = {ss.ple_prev[0], ss.ple_prev[1]};
         for (int t = 0; t < T; ++t) {
-            ngram_rows(&tokens[t], prev, 1, ss.ple.consts, rows + t * PLE_N_HEADS);
+            ngram_rows(&tokens[t], prev, 1, ss.ple.consts, rows + t * ss.ple.consts.geom.n_heads);
             prev[0] = prev[1];
             prev[1] = tokens[t];
         }

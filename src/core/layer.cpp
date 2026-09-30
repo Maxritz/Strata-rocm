@@ -1118,7 +1118,7 @@ bool block_layer_pre(const WeightTable& tables, const ModelGeometry& g, int64_t 
             gr_write(bb.R, bb.block_out, bb.inject2, gs0, bb.R, stream);
             pending_ffn = false;
         }
-        const int64_t hcd = strata::kernels::NG_HC_DIM;
+        const int64_t hcd = (int64_t) g.hc * g.n_embd;
         strata::kernels::PleOut po;
         // Exports must not alias the block's internal workspace. The previous diagnostic views used a
         // different layout inside that workspace: exporting gated values overwrote normalized values
@@ -1212,7 +1212,7 @@ st_begin(layer, 3, stream);
 }
 bool ple_issue_token(const PleRun& p, std::string& err) {
     if (!p.ready()) { err = "ple_issue_token: the PLE run is not ready"; return false; }
-    uint32_t rows[strata::kernels::PLE_N_HEADS];
+    uint32_t rows[strata::kernels::PLE_N_HEADS_MAX];
     strata::kernels::ngram_rows(p.token, p.prev, 1, p.consts, rows);
     if (!p.table->issue(rows)) { err = "ple_issue_token: the previous token's rows were never collected"; return false; }
     return true;
@@ -1221,7 +1221,7 @@ bool ple_issue_token(const PleRun& p, std::string& err) {
 bool ple_finish_token(const PleRun& p, void* stream, std::string& err) {
     if (!p.ready()) { err = "ple_finish_token: the PLE run is not ready"; return false; }
     if (!p.table->collect(p.emb_host, err)) { err = "ple_finish_token: " + err; return false; }
-    if (hipMemcpyAsync(p.emb_dev, p.emb_host, (size_t) strata::kernels::NG_N_EMBD * sizeof(float),
+    if (hipMemcpyAsync(p.emb_dev, p.emb_host, (size_t) p.consts.geom.n_embd * sizeof(float),
                         hipMemcpyHostToDevice, (hipStream_t) stream) != hipSuccess) {
         err = "ple_finish_token: the row upload failed";
         return false;
@@ -1234,9 +1234,9 @@ bool ple_stage_token(const PleRun& p, void* stream, std::string& err) {
     return ple_finish_token(p, stream, err);
 }
 
-uint64_t ple_run_scratch_bytes() {
+uint64_t ple_run_scratch_bytes(const strata::kernels::PleGeom& geom) {
     // Internal workspace followed by a disjoint normalized export used for the next history row.
-    return strata::kernels::ple_block_scratch_bytes() + strata::kernels::NG_HC_DIM * sizeof(float);
+    return strata::kernels::ple_block_scratch_bytes() + (uint64_t) geom.hc_dim() * sizeof(float);
 }
 
 bool block_layer_post(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t k,                      const MoEBuffers& mb, const BlockBuffers& bb, const float* parts, void* stream,                      std::string& err) {    const strata::kernels::GrShapes gs{g.n_embd, g.hc, g.hc_lr};
