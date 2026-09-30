@@ -722,6 +722,21 @@ So stages 2-5 become a **CUDA→HIP port with a test-vector gate**, not new rese
 "port `deepseek4-quantize` / build a DS4 pack (or read the existing GGUFs) and pin the test vectors",
 not "invent a pack format".
 
+**Ecosystem layering** (where each piece fits, so we don't rebuild what exists):
+
+- **Engine**: `ds4` (DwarfStar 4) for DeepSeek-V4, `ds4-ssd` for the SSD/slot-bank variant, and **Strata
+  (this repo)** for the qwen4exp family. These are the model-specific runtimes.
+- **Manager / proxy**: [`llamastash/llamastash`](https://github.com/llamastash/llamastash) — one Rust binary
+  (TUI + CLI + daemon + OpenAI/Ollama-compatible proxy) that **runs `ds4-server` as a generic OpenAI
+  backend** (its MTP / DSpark / SSD-streaming / disk-KV flags surfaced as knobs) and can equally front any
+  OpenAI-compatible server. Its **MTP auto-detect** (`--spec-type draft-mtp`, separate `mtp-*.gguf` head,
+  live draft-acceptance) is the decode lever (LIT-2) and the flag/head convention to match.
+- **Tooling**: `gguf-tools/` in `antirez/ds4` (quantize, `qwen4_exp_convert.py`, `qwen4_iq2.py`, native
+  n-gram packer) — the pack builders.
+
+So a full local stack is: **this engine (qwen4exp) + the ported `ds4` (deepseek4)**, both served behind
+**llamastash**'s single OpenAI-compatible endpoint. Strata's job is the engine; don't rebuild the manager.
+
 Stages, each independently testable (parity against a reference before the next):
 
 1. **Architecture selector + metadata schema.** Introduce an `Arch` enum (`qwen4exp`, `deepseek4`,
