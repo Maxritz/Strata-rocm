@@ -26,6 +26,7 @@
 #include "strata/kernels/native_rope.hpp"
 #include "strata/kernels/native_flash_attn.hpp"
 #include "strata/kernels/mla.hpp"
+#include "strata/kernels/ds2_moe.hpp"
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/kernels/cvec.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
@@ -469,6 +470,86 @@ bool moe_layer(const WeightTable& tables, const ModelGeometry& g, int64_t layer,
 // is what `session_token` (the uncaptured path) does and what the captured loop CANNOT, which is why the
 // loop uses the halves separately.
 if (!moe_route(tables, g, layer, k, b, x, stream, err, db)) return false;    return moe_finish(tables, g, layer, k, b, x, parts, out, stream, err);}
+// ================================ the deepseek2 MoE ================================
+// The GLM gating (`ds2_moe.hpp`) differs from qwen4exp's router in three ways: SIGMOID (not softmax), a
+// `exp_probs_b` selection bias added AFTER the nonlinearity, and a weights-norm + scale epilogue.  The shared
+// expert is an ordinary ungated SILU FFN, added plain to the routed output.  Layer 0 is a dense FFN.
+bool moe_route_ds2(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t k, const MoEBuffers& b,
+                   const float* x, float scale, bool norm, void* stream, std::string& err) {
+    using namespace strata::kernels;
+    const LayerView v(tables, layer);
+    const WeightRef* w_router = v.get("ffn_gate_inp.weight");
+    const WeightRef* w_bias = v.get("exp_probs_b.bias");
+    if (w_router == nullptr) { err = v.name("ffn_gate_inp.weight") + " is missing"; return false; }
+    if (w_bias == nullptr) { err = v.name("exp_probs_b.bias") + " is missing"; return false; }
+    if (k < 1 || k > 64) { err = "moe_route_ds2: k must be 1..64"; return false; }
+    if (!native_bf16_projections) f32_to_bf16_bulk(x, b.x_bf16, g.n_embd, stream);
+    project_bf16(x, b.x_bf16, (const uint16_t*) w_router->data, b.logits, g.n_embd, g.n_expert, true, stream);
+    try {
+        ds2_router(b.logits, (const float*) w_bias->data, 1, (int) g.n_expert, (int) k, scale, norm, b.ids, b.weights,
+                   stream);
+    } catch (const std::exception& error) {
+        err = v.name("ds2_router") + ": " + error.what();
+        return false;
+    }
+    return true;
+}
+// One native SILU FFN: `gate`/`up` from `x`, `silu(gate)*up` quantized, then `down`.  `scratch` is laid out as
+// `shared_expert_scratch_bytes`: gate (n_ff f32) | up (n_ff f32) | ...; `q8_1` is the shared native scratch.
+static bool ds2_ffn_native(const LayerView& v, const WeightRef* wg, const WeightRef* wu, const WeightRef* wd,
+                           int64_t n_embd, int64_t n_ff, float* scratch, void* q8_1, const float* x, float* out,
+                           void* stream, std::string& err) {
+    using namespace strata::kernels;
+    if (!wg->native_data || !wu->native_data || !wd->native_data) {
+        err = v.name("ffn_*") + ": the deepseek2 FFN needs the native Q8_0 projections";
+        return false;
+    }
+    const uint64_t a = ((uint64_t) n_ff * 4 + 15) & ~(uint64_t) 15;
+    float* gate = scratch;
+    float* up = (float*) ((uint8_t*) scratch + a);
+    try {
+        native_quantize_q8_1(x, q8_1, (int) n_embd, 1, stream);
+        native_mmvq(wg->native_type, wg->native_data, q8_1, gate, (int) n_embd, (int) n_ff, 1, stream);
+        native_mmvq(wu->native_type, wu->native_data, q8_1, up, (int) n_embd, (int) n_ff, 1, stream);
+        swiglu_mul(gate, up, gate, n_ff, stream);
+        native_quantize_q8_1(gate, q8_1, (int) n_ff, 1, stream);
+        native_mmvq(wd->native_type, wd->native_data, q8_1, out, (int) n_ff, (int) n_embd, 1, stream);
+    } catch (const std::exception& error) {
+        err = v.name("ds2_ffn") + ": " + error.what();
+        return false;
+    }
+    return true;
+}
+bool moe_shared_ds2(const WeightTable& tables, const ModelGeometry& g, int64_t layer, const MoEBuffers& b,
+                    const float* x, void* stream, std::string& err) {
+    const LayerView v(tables, layer);
+    const WeightRef* wg = v.get("ffn_gate_shexp.weight");
+    const WeightRef* wu = v.get("ffn_up_shexp.weight");
+    const WeightRef* wd = v.get("ffn_down_shexp.weight");
+    const char* missing = !wg ? "ffn_gate_shexp.weight" : !wu ? "ffn_up_shexp.weight"
+                          : !wd ? "ffn_down_shexp.weight" : nullptr;
+    if (missing) { err = v.name(missing) + " is missing"; return false; }
+    void* q8 = wg->native_q8_1 ? wg->native_q8_1 : wu->native_q8_1 ? wu->native_q8_1 : wd->native_q8_1;
+    if (!q8) { err = v.name("ffn_gate_shexp.weight") + ": no native Q8_1 scratch"; return false; }
+    return ds2_ffn_native(v, wg, wu, wd, g.n_embd, g.n_ff, b.sh_scratch, q8, x, b.shared, stream, err);
+}
+bool dense_ffn_ds2(const WeightTable& tables, const ModelGeometry& g, int64_t layer, float* scratch, const float* x,
+                   float* out, void* stream, std::string& err) {
+    const LayerView v(tables, layer);
+    const WeightRef* wg = v.get("ffn_gate.weight");
+    const WeightRef* wu = v.get("ffn_up.weight");
+    const WeightRef* wd = v.get("ffn_down.weight");
+    const char* missing = !wg ? "ffn_gate.weight" : !wu ? "ffn_up.weight" : !wd ? "ffn_down.weight" : nullptr;
+    if (missing) { err = v.name(missing) + " is missing"; return false; }
+    void* q8 = wg->native_q8_1 ? wg->native_q8_1 : wu->native_q8_1 ? wu->native_q8_1 : wd->native_q8_1;
+    if (!q8 || !scratch) { err = v.name("ffn_gate.weight") + ": missing native scratch"; return false; }
+    return ds2_ffn_native(v, wg, wu, wd, g.n_embd, wg->ne1, scratch, q8, x, out, stream, err);
+}
+bool moe_finish_ds2(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t k, const MoEBuffers& b,
+                    const float* x, const float* parts, float* out, void* stream, std::string& err) {
+    if (!moe_shared_ds2(tables, g, layer, b, x, stream, err)) return false;
+    return moe_combine_parts(g, layer, k, b, parts, out, stream, err);
+}
 // ================================ the QSA mixer ================================
 namespace {using strata::kernels::QsaIndexerBuffers;using strata::kernels::QsaShapes;
 /// The geometry the QSA kernels want, from the one place that defines it.  `ModelGeometry` carries the widths

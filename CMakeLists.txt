@@ -222,6 +222,7 @@ if(STRATA_ENABLE_HIP)
                           src/kernels/cuda/native_qsa.cu
                           src/kernels/cuda/native_rope.cu
                           src/kernels/cuda/mla.cu
+                          src/kernels/cuda/ds2_moe.cu
                           src/kernels/cuda/native_ple_postops.cu
                           src/kernels/cuda/native_flash_attn.cu
                           src/kernels/cuda/native_qsa_indexer.cu
@@ -415,6 +416,11 @@ if(STRATA_ENABLE_HIP)
   target_include_directories(mla_parity PRIVATE ${ROCM_INCLUDE})
   target_link_libraries(mla_parity PRIVATE strata_engine ${ROCM_LIBRARY}/amdhip64.lib)
   add_test(NAME mla_parity COMMAND mla_parity --selftest)
+
+  add_executable(ds2_moe_parity src/kernels/ds2_moe_parity.cpp)
+  target_include_directories(ds2_moe_parity PRIVATE ${ROCM_INCLUDE})
+  target_link_libraries(ds2_moe_parity PRIVATE strata_kernels ${ROCM_LIBRARY}/amdhip64.lib)
+  add_test(NAME ds2_moe_parity COMMAND ds2_moe_parity --selftest)
 
   # ---- P2.S4: the PLE n-gram hash, the IQ4_NL table read, and the PLE block ----
   # `ngram.cpp` is host-only but lives in `strata_kernels` because `ple.cu` shares its geometry constants, and

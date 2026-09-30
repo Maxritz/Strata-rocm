@@ -141,9 +141,15 @@ IQ4_XS): no canonicalization pass is required.
   `native_mmvq_weight_bytes(type, ne0, ne1)` (`attn_k_b` is `[192, 512, 20]`); `check_architecture` accepts
   `deepseek2` with its own required keys.  Evidence: `build_gfx1201\native_dense_3d_test.exe` (gfx1201) ->
   **PASS**, 423 native weights / 1310.4 MiB, `attn_k_b` Q8_0 `[192,512]`, `attn_v_b` Q6_K `[512,256]`.
-- **Still OPEN for M2:** the deepseek2 MoE variant (sigmoid gating + `exp_probs_b` selection bias, top-4,
-  weights-norm + scale 1.8, the ungated shared expert), the dense layer-0 FFN composition, and the
-  decode/prefill wiring from `generate.cpp`/`session.cpp`.
+- **M2 step 6 — the deepseek2 MoE arithmetic is implemented and parity-green (2026-10-01).**  `ds2_moe.cu` adds
+  the SIGMOID router with the `exp_probs_b` selection bias and the `expert_weights_norm`/`scale` epilogue
+  (`ds2_router`) and `swiglu_mul`; `layer.cpp` composes the ungated shared expert and the dense layer-0 FFN
+  (`moe_route_ds2`/`moe_shared_ds2`/`moe_finish_ds2`/`dense_ffn_ds2`) from `native_mmvq` + `swiglu_mul` +
+  `native_quantize_q8_1`.  Evidence: `build_gfx1201\ds2_moe_parity.exe --selftest` -> **PASS**; ids exact and
+  weights exact over 8 seeds (scale 1.0/1.8, norm on/off), the bias is shown to reorder the selection, the
+  weight is the unbiased sigmoid, and `swiglu_mul` matches.
+- **Still OPEN for M2:** the decode/prefill wiring from `generate.cpp`/`session.cpp` (the engine still runs only
+  `qwen4exp`; the MLA/MoE functions are not yet called from a session), and the geometry guard.
 
 
 

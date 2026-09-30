@@ -183,6 +183,24 @@ bool moe_shared(const WeightTable& tables, const ModelGeometry& g, int64_t layer
 bool moe_combine_parts(const ModelGeometry& g, int64_t layer, int64_t k, const MoEBuffers& b, const float* parts,
                        float* out, void* stream, std::string& err);
 
+/// The deepseek2 / GLM MoE (`docs/DEEPSEEK.md` §5): the SIGMOID router with the `exp_probs_b` selection bias and
+/// the `expert_weights_norm`/`scale` epilogue, then the UNGATED shared expert (`ffn_{gate,up,down}_shexp`, SILU,
+/// added plain to the routed output).  Layer 0 is a dense FFN, not MoE.
+///
+/// `moe_route_ds2` fills `b.ids`/`b.weights` for THIS layer; the caller's expert matmuls fill `parts` and
+/// `moe_finish_ds2` computes the shared expert into `b.shared` and combines.  `scale`/`norm` are
+/// `deepseek2.expert_weights_scale` / `expert_weights_norm`.
+bool moe_route_ds2(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t k, const MoEBuffers& b,
+                   const float* x, float scale, bool norm, void* stream, std::string& err);
+bool moe_shared_ds2(const WeightTable& tables, const ModelGeometry& g, int64_t layer, const MoEBuffers& b,
+                    const float* x, void* stream, std::string& err);
+bool moe_finish_ds2(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t k, const MoEBuffers& b,
+                    const float* x, const float* parts, float* out, void* stream, std::string& err);
+/// The deepseek2 dense layer-0 FFN (`ffn_{gate,up,down}.weight`, SILU).  `scratch` is the caller's, sized
+/// `shared_expert_scratch_bytes(dense_n_ff)`.
+bool dense_ffn_ds2(const WeightTable& tables, const ModelGeometry& g, int64_t layer, float* scratch, const float* x,
+                   float* out, void* stream, std::string& err);
+
 /// Plan v0.3 P3 (default ON): the shared expert runs at the END OF `pre[l]`, after the doorbell has rung, so
 /// the GPU computes it while the host runs the CPU pool; `post[l]` then only combines.  Same kernels on the
 /// same inputs in the same stream order relative to their consumers, so the result is bitwise unchanged.
