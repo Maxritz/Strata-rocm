@@ -67,6 +67,12 @@ public:
     /// `after_event` (a `hipEvent_t`) completes - a copy sourced from a slot, or a kernel reading its alias.
     /// A persistent source (the arena, the mmap) has nothing to release: this is a no-op for it.
     virtual void release_layer(int64_t layer, void* after_event) { (void) layer; (void) after_event; }
+
+    /// **WHETHER A RETURNED POINTER SURVIVES PAST THE NEXT CALL.**  A persistent source (arena, mmap) says false;
+    /// a bounded source says true, and any path that collects blobs across layers and consumes them later must
+    /// NOT run against it.  `prefill.cpp`'s whole-model `stream_all` sequence is exactly such a path, so it is
+    /// disabled for a transient source.
+    virtual bool transient() const { return false; }
 };
 
 /// Plan v0.3 P6: what the GPU computes in a verify window's layer, written by the pool (mapped host memory) right
@@ -402,6 +408,8 @@ public:
     /// after the layer's consumers - the copies sourced from these slots and the kernels reading their aliases)
     /// completes.  This is what makes eviction safe when the host runs ahead of the GPU.
     void release_layer(int64_t layer, void* after_event) override;
+    /// A returned pointer here is valid only until its slot is reused: the ring is transient.
+    bool transient() const override { return true; }
     /// The host base of slot `s`, and its device alias (null when the registration failed).
     const uint8_t* slot_host(int64_t s) const { return base_ + (uint64_t) s * (uint64_t) slot_bytes_; }
     const uint8_t* slot_device(int64_t s) const { return dev_ == nullptr ? nullptr : dev_ + (uint64_t) s * (uint64_t) slot_bytes_; }

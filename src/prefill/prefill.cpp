@@ -898,7 +898,10 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         // k lands in ring slot k % ring); a copy is issued once the entry `ring` before it is consumed (its slot's
         // `used` event recorded), so the copy stream never waits on an event that is not queued yet
         const strata::kernels::cpu::ExpertLayout& lay0 = strata::kernels::cpu::expert_layout();
-        const bool stream_all = m.ring > STAGE && T >= stream_all_min() && m.src != nullptr;
+        // a transient source (the bounded ring) cannot back the whole-model `seq` below - it holds 24,576
+        // pointers across all 48 layers and a bounded ring reuses slots long before they are consumed - so the
+        // per-layer path is used instead (docs EXPERT_RESIDENCY_FINDINGS §7.4)
+        const bool stream_all = m.ring > STAGE && T >= stream_all_min() && m.src != nullptr && !m.src->transient();
         struct StreamEntry { int32_t l, e; const uint8_t* blob; int job; };
         std::vector<StreamEntry> seq;
         std::vector<size_t> seq_start;

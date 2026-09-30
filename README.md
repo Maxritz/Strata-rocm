@@ -38,6 +38,26 @@ A card with more VRAM is faster, because more of the model fits on the GPU: an R
 100-140 tokens per second. All measurements, long-context numbers and estimates for other cards are in the
 [details](docs/DETAILS.md#speed-measured).
 
+## On AMD (ROCm)
+
+A **ROCm/HIP port** runs the same models on AMD cards (`gfx1201` RDNA4, `gfx1031` RDNA2). Measured on an
+**RX 9070 XT (16 GB)** with a Ryzen 9 5900XT and 64 GB of RAM, running **Swift 1.5 IQ2_XS** (10 × 512 experts):
+
+| Config | Host RAM | Reads your prompt | Writes answers |
+| --- | ---: | ---: | ---: |
+| default (all experts pinned) | 34.2 GB | 380–580 tokens/s | 14–17 tokens/s |
+| `--expert-ram-gb 22` (bounded) | **23.2 GB** | 210–340 tokens/s | 11–14 tokens/s |
+
+Prompt speed is over 1K–32K-token prompts, answer speed on short chats (speculative decoding). The
+**bounded** mode is what lets a **12 GB / 48 GB-RAM** PC run it at all (Radeon RX 6700 XT and up) — it keeps a
+fixed pool of experts in RAM and evicts the least recently used instead of pinning all 33 GiB. Output is
+coherent and byte-identical to the pinned mode; the ring is the newer path, so it is a little slower for now
+(closing that gap is ongoing).
+
+**Models that run:** the three `qwen4exp` GGUFs — reap-288 (`10 × 288`), the 512-expert original, and Swift 1.5
+IQ2_XS. `strata --model-info <file.gguf>` says whether a given file runs. **Setup, flags and examples:
+[docs/USAGE.md](docs/USAGE.md)**; port log and measurements: [docs/ROCM_PORTING.md](docs/ROCM_PORTING.md).
+
 ## Which model should I pick?
 
 **The size** (the same model, compressed more or less):
@@ -162,6 +182,14 @@ The full story is in the [paper](docs/paper/Strata-Paper.pdf) and the [details](
   [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF);
   [Swift 1.5](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF) by UkisAI. Their licenses apply
   to the model files.
-- Built with parts of [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp) (MIT). Ideas from
+- Built with parts of [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp) (MIT) — including the quantized **MMQ**
+  expert kernels and the IQ2/IQ3/Q2 quant formats. Ideas from
   [Splash](https://github.com/incoai/splash), [ninfer](https://github.com/Neroued/ninfer) and
   [HyperQwen](https://github.com/syv-ai/HyperQwen). More in the [details](docs/DETAILS.md#credits-and-licenses).
+- **AMD / ROCm port:** built on [AMD ROCm](https://github.com/ROCm/ROCm) and **HIP**. The expert-residency design
+  (bounded host pool, transient slot contract, hot-expert pinning, prefetch) was developed against ideas from
+  [Edge0](https://github.com/Edge0-AI) (Percepta's SSD-streaming MoE),
+  [FreeToken](https://github.com/FlashML-org/FreeToken), [llamastash](https://github.com/llamastash/llamastash),
+  [gemma4-moe-offload](https://github.com/AlexChen31337/gemma4-moe-offload),
+  [antirez/ds4](https://github.com/antirez/ds4) and [Anemll/ds4-ssd](https://github.com/Anemll/ds4-ssd). The port log
+  and the residency findings are in [docs/](docs/).
