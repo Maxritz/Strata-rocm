@@ -129,3 +129,30 @@ Extend `expert_hit_run` (:489) and `moe_hit_grouped_s2` (s2_expert_grouped.cu) t
 no CPU `drive_pool_multi` call for those experts.  Gate each new kernel with a parity test against the
 CPU `expert_pool_dispatch_multi` output (L1 <= 1e-3).  The admission/eviction policy in `ExpertCache`
 and the `fill_slot` REBAR read in `expert_hit_run` are the precedents to follow.
+
+## THE SEAM (confirmed 2026-09-30): no new kernel is needed for the miss path
+`gu_kernel` (`src/kernels/cuda/s2_expert_grouped.cu:119`, weight load at :134) and `down_kernel` (:176,
+weight load at :189) index the expert blob as **`blob_base + (size_t) slot_index[h] * blob_bytes`**.  That
+is a plain `const uint8_t* base` — it does NOT have to be the VRAM cache.  Therefore:
+  - For a layer L, the PinnedArena stores expert `e` at `layer_offset(L) + e * blob_bytes(L)`
+    (`expert_layout` / `ExpertSource::blob`).
+  - Pass **`blob_base = arena_base + layer_offset(L)`**, **`slot_index[h] = e`** (the routed expert id, an
+    int32 that already exists in `ids[]`), **`blob_bytes = blob_bytes(L)`**.
+  - The SAME `moe_hit_grouped_s2(...)` call then computes the missed experts on the GPU, reading their
+    blobs over REBAR (the arena is `hipHostRegister`ed — `pinned.cu:139`), exactly like the resident ones.
+So Step 3/4 is a DRIVER change in `src/core/expert_source.cpp`, not a kernel rewrite:
+  1. In `expert_hit_run` (Launch phase, :494-538) stop dropping `kd==1` experts to the pool; append them to
+     the GPU hit list with `slot = e` (not `cache->slot_of`) and `dst = i` (the routed position), and set
+     `blob_base` to the per-layer arena base while `blob_bytes` stays `blob_bytes(L)`.
+  2. Keep `kd==0` (VRAM resident) as today; the two groups differ only in `blob_base`.
+     (If a single call must span both bases, add a `blob_sel` per hit, or issue two `moe_hit_grouped_s2`
+     calls — one on `cache_base`, one on the arena — into the same `hit_out`, since the kernel writes
+     `out[dst]` per hit and `add_inplace` already sums.)
+  3. The `Combine` phase (`add_inplace(d.parts_out, d.hit_out, ...)` :593) is unchanged; `parts_out` is now
+     the GPU output too, and the CPU pool call at :501 can be skipped for a layer once its misses are GPU.
+  4. Coherence: the int8 Q8_0 activation path the hit kernels use (`quantize_q8_0_scaled`, :567) must be
+     the same one the miss experts use — it is, since both go through `moe_hit_grouped_s2`'s `x_q8_0`.
+Caveats to verify before flipping `--gpu-miss` on: `blob_bytes(L)` is per-layer (`expert_layout().blob_bytes`),
+so the arena stride for the base must match; and the `x_scales` fp32 path (:362) is required for coherence
+(R4.2h).  Reuse `hit_cpu_order` (`moe_hit_grouped_s2_cpu_order`, :743) if the CPU order is needed.
+
