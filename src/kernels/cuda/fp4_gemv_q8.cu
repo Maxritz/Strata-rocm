@@ -110,28 +110,37 @@ __global__ void fp4_gemv_q8_kernel(const int8_t* __restrict__ xq, const float* _
     if (lane == 0) y[row] = acc;
 }
 
-void fp4_gemv_q8(const uint16_t* x, const uint8_t* w, float* y,
-                 int64_t n_in, int64_t n_out, bool mxfp4) {
+// ---- Launchers.  STREAM-parameterised, NO per-call hipMalloc, NO hipDeviceSynchronize: the caller owns
+// the workspace and the stream, exactly like iq_mmvq.  (The old version malloc'd xq/xd and synced on every
+// call - ~1 ms of overhead against a ~6 us matvec at the engine's real expert shape, i.e. ~190x.)
+
+void fp4_quantize_x_q8(const uint16_t* x, int8_t* xq, float* xd, int64_t n, void* stream) {
+    if (n <= 0 || n % 32 != 0) return;
+    fp4_quantize_x_q8_kernel<<<(unsigned)((n / 32 + 255) / 256), 256, 0, (hipStream_t) stream>>>(x, xq, xd, n);
+    const hipError_t e = hipGetLastError();
+    if (e != hipSuccess) { std::fprintf(stderr, "fp4_quantize_x_q8 launch: %s\n", hipGetErrorString(e)); std::exit(1); }
+}
+
+void fp4_gemv_q8_mv(const int8_t* xq, const float* xd, const uint8_t* w, float* y,
+                    int64_t n_in, int64_t n_out, bool mxfp4, void* stream) {
     if (n_in <= 0 || n_out <= 0) return;
     const long long ELEMS = mxfp4 ? 32 : 64;
     if (n_in % ELEMS != 0 || n_in % 32 != 0) {
-        std::fprintf(stderr, "fp4_gemv_q8: n_in %lld must be a multiple of %lld and 32\n",
+        std::fprintf(stderr, "fp4_gemv_q8_mv: n_in %lld must be a multiple of %lld and 32\n",
                      (long long) n_in, (long long) ELEMS);
         std::exit(1);
     }
-    int8_t* d_xq = nullptr; float* d_xd = nullptr;
-    if (hipMalloc(&d_xq, (size_t) n_in) != hipSuccess ||
-        hipMalloc(&d_xd, (size_t)(n_in / 32) * sizeof(float)) != hipSuccess) {
-        std::fprintf(stderr, "fp4_gemv_q8: x-scratch malloc failed\n"); std::exit(1);
-    }
-    fp4_quantize_x_q8_kernel<<<(unsigned)((n_in / 32 + 255) / 256), 256>>>(x, d_xq, d_xd, n_in);
     const int grid = (int) ((n_out + kQ8Warps - 1) / kQ8Warps);
-    fp4_gemv_q8_kernel<<<grid, kQ8Warps * 32>>>(d_xq, d_xd, w, y, n_in, n_out, mxfp4);
+    fp4_gemv_q8_kernel<<<grid, kQ8Warps * 32, 0, (hipStream_t) stream>>>(xq, xd, w, y, n_in, n_out, mxfp4);
     const hipError_t e = hipGetLastError();
-    if (e != hipSuccess) { std::fprintf(stderr, "fp4_gemv_q8 launch: %s\n", hipGetErrorString(e)); std::exit(1); }
-    const hipError_t s = hipDeviceSynchronize();
-    if (s != hipSuccess) { std::fprintf(stderr, "fp4_gemv_q8: %s\n", hipGetErrorString(s)); std::exit(1); }
-    (void) hipFree(d_xq); (void) hipFree(d_xd);
+    if (e != hipSuccess) { std::fprintf(stderr, "fp4_gemv_q8_mv launch: %s\n", hipGetErrorString(e)); std::exit(1); }
+}
+
+// Convenience: caller provides xq (n_in int8) and xd ((n_in/32) float) scratch, allocated ONCE.
+void fp4_gemv_q8(const uint16_t* x, int8_t* xq, float* xd, const uint8_t* w, float* y,
+                 int64_t n_in, int64_t n_out, bool mxfp4, void* stream) {
+    fp4_quantize_x_q8(x, xq, xd, n_in, stream);
+    fp4_gemv_q8_mv(xq, xd, w, y, n_in, n_out, mxfp4, stream);
 }
 
 }  // namespace strata::kernels

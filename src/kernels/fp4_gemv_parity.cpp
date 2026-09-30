@@ -255,14 +255,17 @@ void run_q8(bool mxfp4) {
             ref[(size_t) o] = acc;
         }
         uint16_t* d_x=nullptr; uint8_t* d_w=nullptr; float* d_y=nullptr;
+        int8_t* d_xq=nullptr; float* d_xd=nullptr;
         check(hipMalloc(&d_x, x.size()*2), "q8 x"); check(hipMalloc(&d_w, (size_t) w_bytes), "q8 w");
         check(hipMalloc(&d_y, (size_t) n_out*4), "q8 y");
+        check(hipMalloc(&d_xq, (size_t) n_in), "q8 xq"); check(hipMalloc(&d_xd, (size_t)(n_in/32)*4), "q8 xd");
         check(hipMemcpy(d_x, x.data(), x.size()*2, hipMemcpyHostToDevice), "q8 cx");
         check(hipMemcpy(d_w, w.data(), (size_t) w_bytes, hipMemcpyHostToDevice), "q8 cw");
-        strata::kernels::fp4_gemv_q8(d_x, d_w, d_y, n_in, n_out, mxfp4);
+        strata::kernels::fp4_gemv_q8(d_x, d_xq, d_xd, d_w, d_y, n_in, n_out, mxfp4, nullptr);
         std::vector<float> got((size_t) n_out);
         check(hipMemcpy(got.data(), d_y, got.size()*4, hipMemcpyDeviceToHost), "q8 cy");
         check(hipFree(d_x), "q8 fx"); check(hipFree(d_w), "q8 fw"); check(hipFree(d_y), "q8 fy");
+        check(hipFree(d_xq), "q8 fxq"); check(hipFree(d_xd), "q8 fxd");
         // Tolerance: int8 activations add real error vs the fp32 path, so compare kernel-to-reference (same
         // quantized activations) tightly; this checks the DOT, not the quantization.
         int bad = 0; double worst = 0.0;
@@ -360,12 +363,15 @@ int main(int argc, char** argv) {
             if (rel>1e-5) ++mism_t;
         }
         double t0=0,t1=0,t2=0,t3=0,t4=0;
+        // Caller-owned int8-activation scratch, allocated ONCE (the launcher no longer allocates or syncs).
+        int8_t* d_xq = nullptr; float* d_xd = nullptr;
+        check(hipMalloc(&d_xq, (size_t)n_in), "xq"); check(hipMalloc(&d_xd, (size_t)(n_in/32)*4), "xd");
         for (int i=0;i<reps;++i){
             t0 += tb(strata::kernels::fp4_gemv,          d_x,d_w,d_y1,n_in,n_out,mxfp4);
             t1 += tb(strata::kernels::fp4_gemv_fast,     d_x,d_w,d_y2,n_in,n_out,mxfp4);
             t2 += tb(strata::kernels::fp4_gemv_tiled,    d_x,d_w,d_y3,n_in,n_out,mxfp4);
             t3 += tb(strata::kernels::fp4_gemv_coalesced,d_x,d_w,d_y4,n_in,n_out,mxfp4);
-            t4 += tb(strata::kernels::fp4_gemv_q8,       d_x,d_w,d_y4,n_in,n_out,mxfp4); }
+            t4 += tb(strata::kernels::fp4_gemv_q8,       d_x,d_xq,d_xd,d_w,d_y4,n_in,n_out,mxfp4,nullptr); }
         const double t0a=t0/reps, t1a=t1/reps, t2a=t2/reps, t3a=t3/reps, t4a=t4/reps;
         const double elems = (double)n_in * (double)n_out;
         const double wbytes = (double)(n_in / (mxfp4 ? 32 : 64)) * (double)n_out * (double)(mxfp4 ? 17 : 36);
@@ -378,6 +384,12 @@ int main(int argc, char** argv) {
                     t3a, elems/1e12/(t3a/1e3), t0a/t3a, wbytes/1e9/(t3a/1e3));
         std::printf("  Q8(int8) : %.4f ms  %.3f TOPS  (%.2fx naive)  <- MoE-shaped (warp/row, int MAC)\n",
                     t4a, elems/1e12/(t4a/1e3), t0a/t4a);
+        // Split the Q8 path: activation-quantize vs the matvec itself.
+        const double tq = tb(strata::kernels::fp4_quantize_x_q8, d_x, d_xq, d_xd, (long long)n_in, nullptr);
+        const double tmv = tb(strata::kernels::fp4_gemv_q8_mv, d_xq, d_xd, d_w, d_y4, n_in, n_out, mxfp4, nullptr);
+        std::printf("  Q8 split : quantize %.4f ms (%.1f%%) + matvec %.4f ms (%.3f TOPS, %.2fx naive)\n",
+                    tq, 100.0*tq/(tq+tmv), tmv, elems/1e12/(tmv/1e3), t0a/tmv);
+        (void) hipFree(d_xq); (void) hipFree(d_xd);
         // memory floor: same bytes, coalesced read, no decode
         float* d_probeout = nullptr;
         check(hipMalloc(&d_probeout, 4096*4), "probeout");

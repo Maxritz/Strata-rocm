@@ -61,7 +61,13 @@ void fp4_memprobe(const uint8_t* w, float* out, int64_t bytes, int grid);
 // The MoE-shaped path: activation quantized to int8 per 32-element group, integer MAC (like the engine's
 // vec_dot_q4_K_q8_1 + row_dot), warp-per-row, warp-shuffle reduce.  Changes the activation numerics
 // (int8), so parity is against a reference that models the same quantization - NOT the fp32 reference.
-void fp4_gemv_q8(const uint16_t* x, const uint8_t* w, float* y,
-                 int64_t n_in, int64_t n_out, bool mxfp4);
+//
+// The launcher is stream-parameterised with NO per-call allocation and NO synchronize (matching iq_mmvq):
+// the caller owns `xq` (n_in int8) and `xd` ((n_in/32) float) scratch, allocated once.
+void fp4_quantize_x_q8(const uint16_t* x, int8_t* xq, float* xd, int64_t n, void* stream);
+void fp4_gemv_q8_mv(const int8_t* xq, const float* xd, const uint8_t* w, float* y,
+                    int64_t n_in, int64_t n_out, bool mxfp4, void* stream);
+void fp4_gemv_q8(const uint16_t* x, int8_t* xq, float* xd, const uint8_t* w, float* y,
+                 int64_t n_in, int64_t n_out, bool mxfp4, void* stream);
 
 }  // namespace strata::kernels
