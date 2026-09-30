@@ -4,9 +4,12 @@
 # `strata-pack` are added when their sources exist - a target with no sources would make the build graph
 # claim something the tree does not have, which is worse than an absent target.
 #
-# CUDA targets arrive in Phase 2 and this build REJECTS any architecture other than 120: the engine is
-# written against sm_120 (RTX 5000 / Blackwell) and silently building for an older arch would produce a
-# binary that runs and is wrong about its own performance, which is the worst of both outcomes.
+# This is a dual-target AMD build: CMAKE_HIP_ARCHITECTURES defaults to gfx1031 (RX 6700 XT / RDNA2) AND
+# gfx1201 (RX 9070 XT / RDNA4, the host this tree is developed and verified against). It does not reject
+# any other arch. A stale comment here used to claim the engine was written against sm_120 "RTX 5000 /
+# Blackwell" and that the build rejected every other architecture -- both were untrue and they made people
+# read a 12 GB RDNA2 capacity analysis as if it described the machine in front of them. See section 0 of
+# docs/RESEARCH_NOTES.md for the measured host.
 cmake_minimum_required(VERSION 3.24)
 project(strata VERSION 0.1.15 LANGUAGES CXX)
 add_compile_definitions(STRATA_VERSION="${PROJECT_VERSION}")

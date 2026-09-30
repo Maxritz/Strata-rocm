@@ -7,6 +7,29 @@ The single list. Priorities: **P0** blocks a shipping milestone, **P1** a family
 
 ## P0 — correctness (blocks trust in any output)
 
+0. **The CPU expert library SIGILLs on any CPU without AVX-512** (found 2026-09-30). This host is a
+   Ryzen 9 5900XT (Zen 3, **no AVX-512**), and `strata_kernels_cpu` is compiled with **unconditional**
+   `-mavx512f -mavx512bw -mavx512vl -mavx512dq -mavx512vnni -mavx512vbmi` for the whole target. Clang
+   therefore emits EVEX/AVX-512 into *every* function of that translation unit, including
+   `act_quant_q8_1` (`expert.cpp:396-412`, `_mm512_set1_ps` / `_mm512_cvtepi32_epi8`), which is **not**
+   on the VNNI path the runtime guard protects.
+   *Evidence:* raw CPUID leaf 7 here returns AVX512F/BW/VL/VNNI/VBMI = 0; `-march=native` correctly
+   resolves to `__znver3__`, so this is not accidental auto-vectorisation; the faulting RIP is
+   `pool_test+0x8c36` = `vpmovdb %xmm0,%xmm0`. Clang states the defect directly when the target
+   features are absent: `always_inline function '_mm512_set1_ps' requires target feature 'avx512f',
+   but would be inlined into function 'act_quant_q8_1' that is compiled without support for 'avx512f'`.
+   *Blast radius:* `pool_test`, `pool_stress`, `expert_parity`, `expert_multi_test` all die with
+   0xC000001D before printing. `ple_parity` fails separately.
+   *Consequence for the roadmap:* the gfx1031 tier **cannot be re-verified from this machine** — its
+   binaries are built for a different GPU *and* hit this defect — so "gfx1031 parity passes" can only be
+   re-checked on gfx1031 hardware. See the new section 0 in `RESEARCH_NOTES.md`.
+   *Fix:* drop the `-mavx512*` flags from the target and put each AVX-512 kernel behind
+   `__attribute__((target("avx512f,avx512vnni,avx512vbmi")))` with runtime dispatch off
+   `cpu::cpu_features()` (`expert.hpp:89`). A runtime guard cannot protect code that the compiler was
+   told to emit unconditionally.
+   *Not yet established:* whether the guard's early-return is being optimised away, or whether an AVX-512
+   static initialiser runs first. The Release build has no PDB, so this was not symbolised — do not assume.
+
 1. **Verify-window nondeterminism (`--spec`).** The native path requires `--spec ≥ 2`, and that window
    diverges on ~1/6 runs (Swift: correct `248068 198 760…` vs degenerate). Ruled out: VRAM cache size, the
    CPU pool's sync, the prefill, draft variability. It is the window's own logits. *Done:* `--spec 2`
@@ -153,7 +176,10 @@ Serves the poor-hardware mission directly. **Mostly assembled already** (`--dump
 ## P1 — scale-down / hardware targets
 
 20. **gfx1031 (RX 6700 XT) tuning pass** — the same binaries run (no WMMA; `sdot4` path), but kernel shapes
-    and cache sizes must be measured on ~384 GB/s, not the 9070 XT's ~640.
+    and cache sizes must be measured on that tier's bandwidth, not assumed from this host's. The `~384 GB/s`
+    and `~640 GB/s` figures that used to sit here were **never measured on this machine** — measure both
+    tiers with the project's own bench harness before tuning against either. (Blocked on P0 item 0 for any
+    gfx1031 verification.)
 21. **`--expert-ram-gb` default from available RAM** (48 GB box → ~32; leave the OS room).
 22. **Canonical packs** for the models users want — they run the deterministic token path and sidestep the
     verify-window bug entirely.

@@ -1,13 +1,55 @@
-# Research Notes: FP4, MoE Streaming, and KV/State Quantization for gfx1031
+# Research Notes: FP4, MoE Streaming, and KV/State Quantization
 
 Status: synthesis of a 45-paper corpus. Every numeric claim below carries a
 verification state. Nothing here is a placeholder.
 
+## 0. Which hardware this analysis is written against
+
+**Read this first. The corpus was filtered against gfx1031, and the host we
+actually run on is gfx1201.** The verdicts are only as good as that filter, so
+the premise is stated up front rather than buried in section 1.
+
+`CMakeLists.txt` builds **both** `gfx1031` and `gfx1201` by default, so the
+project is dual-target. This document was written from the gfx1031 lens. Any
+verdict whose stated reason contains "gfx1031", "no WMMA", "no tensor core",
+"12 GB", or a bandwidth figure is **premise-dependent** and must be re-read for
+gfx1201 before the work is scheduled. Section 2 separates the two tiers.
+
+### Measured on this host (2026-09-30, `strata-device --selftest`)
+
+| Property | Value |
+|---|---|
+| GPU | AMD Radeon RX 9070 XT |
+| Arch | gfx1201 (RDNA4), compute capability 12.0 / sm_120 |
+| SMs | 32 |
+| VRAM | 15.922 GiB total (17,095,983,104 B) |
+| Driver / runtime | 71260602 / 71260602 |
+| CPU | AMD Ryzen 9 5900XT, 16 cores / 32 threads (Zen 3 — **no AVX-512**) |
+| System RAM | 95.9 GB |
+| ROCm (this tier) | `G:\ROCM10RT-gfx1201` |
+
+Not measured on this host, and deliberately not guessed: **VRAM bandwidth**.
+The `~350 GB/s` figure quoted throughout this document belongs to the gfx1031
+tier, not to this GPU. Measure it with the project's own bench harness before
+any bandwidth-derived decision.
+
+### Two known-bad premises this corrects
+
+- **"RX 6700 XT, 12 GB" is not the machine under test.** That is the gfx1031
+  tier, not this host. Any capacity, residency, or bandwidth arithmetic that
+  assumes 12 GB is wrong here by 33% of VRAM.
+- **The gfx1031 binaries cannot be executed on this host.** They are built for a
+  different GPU, and a separate defect (see `docs/TODO.md`) makes their CPU-side
+  kernels raise `STATUS_ILLEGAL_INSTRUCTION` (0xC000001D) here regardless. So
+  "gfx1031 parity passes" is **not** re-verifiable from this machine; it can only
+  be checked on gfx1031 hardware.
+
 ## 1. Scope and how to read this document
 
-**Target hardware.** AMD Radeon RX 6700 XT, gfx1031 (RDNA2), 12 GB VRAM,
-48 GB system RAM, ~350 GB/s VRAM bandwidth. This is the binding constraint on
-every decision below.
+**Primary analysis tier.** AMD Radeon RX 6700 XT, gfx1031 (RDNA2), 12 GB VRAM,
+48 GB system RAM, ~350 GB/s VRAM bandwidth. This was the binding constraint
+assumed while reading the corpus. See section 0 — the host we run on is
+gfx1201/16 GB, so treat gfx1031-specific verdicts as provisional.
 
 **Target software.** `strata` (this repository), an OpenAI-compatible
 CPU+ROCm hybrid inference engine that disk-streams MoE expert weights, keeps a
@@ -18,10 +60,10 @@ VRAM traffic.
 
 | Verdict | Meaning |
 |---|---|
-| `ADOPT` | Implement. Directly actionable on gfx1031 with the code we already have. |
+| `ADOPT` | Implement. Directly actionable with the code we already have. |
 | `ADOPT-HYBRID` | Take the idea, not the artifact. The paper's kernel/hardware is wrong for us; the algorithm transfers. |
 | `DEFER` | Sound idea, wrong time. Park it with a named trigger for revisiting. |
-| `REJECT` | Does not apply to gfx1031 or to this project's scope. |
+| `REJECT` | Does not apply to our scope. **If the stated reason is a gfx1031 property, it is only rejected for that tier** — re-check before treating it as settled on gfx1201. |
 
 **Verification legend**
 
@@ -37,25 +79,46 @@ section 6.
 
 ## 2. Hardware reality check (the filter applied to every paper)
 
-These are facts about our target, established before reading the corpus, and
-they disqualify a large fraction of the literature on contact:
+These are the facts assumed while reading the corpus. They disqualify a large
+fraction of the literature on contact. **Read the tier column before acting on
+any of them** — three of the five facts are true of gfx1031 and *unverified*
+for the gfx1201 host we actually run on.
 
-- **No FP4 or INT4 matrix-multiply hardware.** gfx1031 has no FP4 tensor core
-  and no WMMA-INT path. `__dp4a` (INT8 dot-4-accumulate) and MFMA are the
-  integer fast paths. `sudot4`/`sdot4` do not exist on this ISA. Any paper
-  whose contribution is "run FP4 on the FP4 tensor core" is `REJECT` as a
-  kernel, regardless of how good the algorithm is.
-- **No native MXFP4/NVFP4 unpack path.** Every FP4 weight must be converted in
-  software. This makes *software-only* FP4 error-reduction techniques unusually
-  valuable to us, because we are already paying the conversion cost.
-- **No sparse tensor cores.** 2:4 structured sparsity gets no hardware benefit.
-- **Bandwidth-bound, not compute-bound.** At 350 GB/s VRAM and ~1.5-2 TB/s
-  host-to-device, almost every win in this corpus is a *traffic* win, not a
-  FLOP win. Papers reporting "throughput" on B200/B300/H100 are reporting a
-  different bottleneck entirely.
-- **VRAM is 12 GB.** This is why the whole engine streams experts from host
-  memory and disk, and why papers about server-side HBM-resident serving
-  (2603.10031's 2 TB HBM3e cluster) transfer only at the algorithmic level.
+| Fact | gfx1031 (analysis tier) | gfx1201 (this host) |
+|---|---|---|
+| FP4 / INT4 matmul hardware | none; no FP4 tensor core, no WMMA-INT | **UNVERIFIED** — see below |
+| WMMA | absent | present in hardware; **the project uses no WMMA at all** |
+| 2:4 structured sparsity | no benefit | **UNVERIFIED** |
+| Native MXFP4/NVFP4 unpack | none, software only | **UNVERIFIED** |
+| VRAM | 12 GB | 15.922 GiB measured |
+| Bandwidth | ~350 GB/s assumed | **not measured** |
+
+- **No FP4 or INT4 matrix-multiply hardware (gfx1031).** `__dp4a` (INT8
+  dot-4-accumulate) and `sdot4` are the integer fast paths, and both tiers have
+  them. Any paper whose contribution is "run FP4 on the FP4 tensor core" is
+  `REJECT` *as a kernel* on gfx1031, regardless of how good the algorithm is.
+- **The project emits no WMMA.** Grepping the tree finds no
+  `__builtin_amdgcn_wmma*` use, so on gfx1201 the WMMA path is available but
+  unclaimed. Whether gfx1201 has a *usable* FP4 path is **UNVERIFIED** and is
+  worth one probe kernel before any FP4 work is scheduled. Verify with
+  `rocminfo | grep -i -E 'fp4|int4|wmma'` on gfx1201 hardware, or by compiling a
+  single `_builtin_amdgcn_...` probe and reading the ISA from the disassembly —
+  do not infer it from RDNA generation alone.
+- **No native MXFP4/NVFP4 unpack path (gfx1031).** Every FP4 weight must be
+  converted in software. This makes *software-only* FP4 error-reduction
+  techniques unusually valuable, because we are already paying the conversion
+  cost. Unverified for gfx1201.
+- **No sparse tensor cores (gfx1031).** 2:4 structured sparsity gets no hardware
+  benefit. Unverified for gfx1201.
+- **Bandwidth-bound, not compute-bound (gfx1031).** At 350 GB/s VRAM and
+  ~1.5-2 TB/s host-to-device, almost every win in this corpus is a *traffic* win,
+  not a FLOP win. Papers reporting "throughput" on B200/B300/H100 are reporting
+  a different bottleneck entirely. **This reasoning is unchanged on gfx1201 in
+  direction but not in magnitude** — the absolute figure is unmeasured.
+- **VRAM is 12 GB (gfx1031); 15.922 GiB here.** This is why the engine streams
+  experts from host memory and disk on the small tier. The 16 GB host has more
+  room, which shifts the expert-cache/ring tuning thresholds rather than
+  removing the need to stream.
 
 ## 3. Authoritative format facts (verified from source, not from papers)
 
