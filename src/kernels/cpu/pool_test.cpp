@@ -65,7 +65,7 @@ int main(int argc, char** argv) {
 
     const cpu::CpuFeatures feat = cpu::cpu_features();
     if (!feat.usable()) {
-        std::printf("  CPU lacks %s - the VNNI path cannot run here; pool test SKIPPED, not passed.\n",
+        std::printf("  CPU %s - the VNNI path cannot run here; pool test SKIPPED, not passed.\n",
                     feat.reason());
         std::printf("\npool: 0 failures, 1 SKIPPED\n");
         return 0;

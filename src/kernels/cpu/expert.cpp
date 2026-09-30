@@ -150,7 +150,7 @@ inline float hsum_ps(__m256 v) {
 // products built for eight blocks at a time; the weight-independent correction is one FMA per eight blocks.
 // The sum order differs from the 256-bit kernel (last-bit differences); the verify window and plain decode both
 // use this kernel, so speculative decode still reproduces plain decode exactly.
-static const bool kZmm = std::getenv("STRATA_CPU_YMM") == nullptr;
+inline bool kZmm() { static const bool v = std::getenv("STRATA_CPU_YMM") == nullptr; return v; }   // lazy: nothing runs before main
 
 inline __m512i unpack64_q2_0(const uint8_t* codes) {
     const __m128i packed = _mm_loadu_si128((const __m128i*) codes);          // 8 u16 = 64 codes
@@ -230,7 +230,7 @@ inline void row_dot_multi_z(const uint8_t* codes, const uint8_t* scales, const A
 /// 64-weight block (two 8-lane horizontal sums: a store plus 16 scalar adds) cost far more than the dot
 /// products themselves - it made the kernel compute-bound at 21 GB/s instead of DRAM-bound at 32.
 inline float row_dot(const uint8_t* codes, const uint8_t* scales, const ActQ& a, int nblocks) {
-    if (kZmm) return row_dot_z(codes, scales, a, nblocks);
+    if (kZmm()) return row_dot_z(codes, scales, a, nblocks);
     __m256 acc = _mm256_setzero_ps();
     // The -sum(xhat) term is a SCALAR: broadcasting it into all 8 lanes and letting hsum_ps add them would
     // apply it eight times per block.
@@ -277,7 +277,7 @@ inline float row_dot_oracle(const uint8_t* codes, const uint8_t* scales, const A
 template<int NT>
 inline void row_dot_multi(const uint8_t* codes, const uint8_t* scales, const ActQ* const* a, int nblocks,
                           float* res) {
-    if (kZmm) { row_dot_multi_z<NT>(codes, scales, a, nblocks, res); return; }
+    if (kZmm()) { row_dot_multi_z<NT>(codes, scales, a, nblocks, res); return; }
     __m256 acc[NT];
     float corr[NT];
     for (int t = 0; t < NT; ++t) { acc[t] = _mm256_setzero_ps(); corr[t] = 0.f; }
@@ -337,51 +337,6 @@ void expert_oracle_q8_0(const uint8_t* blob, const ActQ& a1, float* out, ExpertS
 }
 
 }  // namespace
-
-const char* CpuFeatures::reason() const {
-    if (usable()) return "ok";
-    // Named individually: "AVX-512 not supported" sends a user looking for a new CPU when the machine may have
-    // AVX-512F and be missing only VNNI, which is a much narrower and more explicable gap.
-    static char buf[160];
-    std::snprintf(buf, sizeof buf, "missing %s%s%s%s%s", avx512f ? "" : "AVX512F ",
-                  avx512bw ? "" : "AVX512BW ", avx512vl ? "" : "AVX512VL ",
-                  avx512_vnni ? "" : "AVX512-VNNI ", avx512_vbmi ? "" : "AVX512-VBMI");
-    return buf;
-}
-
-CpuFeatures cpu_features() {
-    CpuFeatures f;
-    int reg[4] = {0, 0, 0, 0};
-#if defined(_MSC_VER)
-    __cpuid(reg, 0);
-    if (reg[0] < 7) return f;
-    __cpuidex(reg, 7, 0);
-#else
-    unsigned r[4] = {0, 0, 0, 0};
-    __cpuid_count(0, 0, r[0], r[1], r[2], r[3]);
-    if (r[0] < 7) return f;
-    __cpuid_count(7, 0, r[0], r[1], r[2], r[3]);
-    for (int i = 0; i < 4; ++i) reg[i] = (int) r[i];
-#endif
-    const unsigned ebx = (unsigned) reg[1], ecx = (unsigned) reg[2];
-    f.avx512f = (ebx >> 16) & 1u;
-    f.avx512bw = (ebx >> 30) & 1u;
-    f.avx512vl = (ebx >> 31) & 1u;
-    f.avx512_vnni = (ecx >> 11) & 1u;
-    f.avx512_vbmi = (ecx >> 1) & 1u;
-    return f;
-}
-
-void cpu_require_expert_support() {
-    const CpuFeatures f = cpu_features();
-    if (f.usable()) return;
-    std::fprintf(stderr,
-                 "strata: this CPU cannot run the expert kernel: %s.\n"
-                 "        The engine needs AVX512-VNNI and AVX512-VBMI (Intel Ice Lake / AMD Zen 4 or newer).\n"
-                 "        The scalar fallback exists for tests only and is far too slow to decode with.\n",
-                 f.reason());
-    std::exit(1);
-}
 
 void act_quant_q8_1(const float* x, int n, ActQ& a) {
     if (oracle_q8_0.load(std::memory_order_relaxed)) {

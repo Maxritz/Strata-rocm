@@ -1,5 +1,6 @@
 // src/kernels/cpu/expert_layout.cpp - plan v0.3 P6: the per-layer expert table.  See the header.
 #include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/kernels/cpu/expert.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -49,6 +50,53 @@ bool cpu_avx512_ok() {
         return ((ebx >> 16) & 1u) && ((ebx >> 30) & 1u) && ((ebx >> 31) & 1u) && ((ecx >> 11) & 1u) && ((ecx >> 1) & 1u);
     }();
     return ok;
+}
+
+// The CPU-probe lives HERE, not in expert.cpp: that file is compiled with -mavx512*, and a TU built for AVX-512
+// may use AVX-512 in ANY of its code - including the probe and a namespace-scope dynamic initializer that runs
+// before main.  On a CPU without AVX-512 that is a STATUS_ILLEGAL_INSTRUCTION (0xC000001D) before the runtime
+// guard can skip.  This file carries no ISA flags, so the probe and the skip path are safe on any x86-64.
+const char* CpuFeatures::reason() const {
+    if (usable()) return "ok";
+    static char buf[160];
+    std::snprintf(buf, sizeof buf, "missing %s%s%s%s%s", avx512f ? "" : "AVX512F ",
+                  avx512bw ? "" : "AVX512BW ", avx512vl ? "" : "AVX512VL ",
+                  avx512_vnni ? "" : "AVX512-VNNI ", avx512_vbmi ? "" : "AVX512-VBMI");
+    return buf;
+}
+
+CpuFeatures cpu_features() {
+    CpuFeatures f;
+    int reg[4] = {0, 0, 0, 0};
+#if defined(_MSC_VER)
+    __cpuid(reg, 0);
+    if (reg[0] < 7) return f;
+    __cpuidex(reg, 7, 0);
+#else
+    unsigned r[4] = {0, 0, 0, 0};
+    __cpuid_count(0, 0, r[0], r[1], r[2], r[3]);
+    if (r[0] < 7) return f;
+    __cpuid_count(7, 0, r[0], r[1], r[2], r[3]);
+    for (int i = 0; i < 4; ++i) reg[i] = (int) r[i];
+#endif
+    const unsigned ebx = (unsigned) reg[1], ecx = (unsigned) reg[2];
+    f.avx512f = (ebx >> 16) & 1u;
+    f.avx512bw = (ebx >> 30) & 1u;
+    f.avx512vl = (ebx >> 31) & 1u;
+    f.avx512_vnni = (ecx >> 11) & 1u;
+    f.avx512_vbmi = (ecx >> 1) & 1u;
+    return f;
+}
+
+void cpu_require_expert_support() {
+    const CpuFeatures f = cpu_features();
+    if (f.usable()) return;
+    std::fprintf(stderr,
+                 "strata: this CPU cannot run the expert kernel: %s.\n"
+                 "        The engine needs AVX512-VNNI and AVX512-VBMI (Intel Ice Lake / AMD Zen 4 or newer).\n"
+                 "        The scalar fallback exists for tests only and is far too slow to decode with.\n",
+                 f.reason());
+    std::exit(1);
 }
 
 void q2_rows_any(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt, float* const* out,
