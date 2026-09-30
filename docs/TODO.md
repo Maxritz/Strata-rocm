@@ -50,16 +50,28 @@ Decision basis for the FP4 matmul kernel, from `hipcc --offload-arch` probes + `
 - Inline-asm probes are unreliable for capability (clang keeps inline asm verbatim without ISA feature
   validation); only the `__builtin_*` feature-rejection path was trusted.
 
-1. **FP4 GEMV parity baseline — DONE.** `fp4_gemv.cu` (naive fp32 decode + accumulate, one thread per output
-   row, one input vector broadcast over `n_out` rows like `s_gemv`) with `fp4_gemv_parity.cpp` checks
-   MXFP4 and NVFP4 against the validated scalar dequantizers (`dequantize_mxfp4`/`dequantize_nvfp4`) + a
-   naive fp16 dot, on gfx1201: 0 mismatches, worst ~1.9e-7 (float32 rounding). Registered in CTest as
-   `fp4_gemv_parity`.
-2. **FP4 GEMV fast decode (Path B) — NEXT.** Vectorize the decode (8 codes per load via a device codebook
-   table + broadcasted block scale) so the kernel stays fp16×fp32 and stays **bit-exact** to the baseline
-   within summation reordering - no activation quantization, no tolerance fudging, a new parity test that
-   compares against the same validated scalar dequantizers. The INT8 `V_DOT4_I32_IU8` path that quantizes
-   the activation to int8 is a *third* item, after this one, and ships only on its own green parity.
+1. **FP4 GEMV parity baseline — DONE.** `fp4_gemv.cu` + `fp4_gemv_fast.cu` + `fp4_gemv_tiled.cu` share the
+   decode via `include/strata/kernels/fp4_decode.hpp`; `fp4_gemv_parity.cpp` checks MXFP4 and NVFP4 against the
+   validated scalar dequantizers (`dequantize_mxfp4`/`dequantize_nvfp4`), on gfx1201: 0 mismatches, worst ~1.9e-7
+   (float32 summation reorder). Registered in CTest as `fp4_gemv_parity`.
+2. **FP4 GEMV fast decode (Path B) — DONE, parity-green but NOT faster.** `fp4_gemv_fast.cu` vectorizes the decode
+   (8 codes per uint32 load via `fp4_codebook()` + broadcasted block scale, fp16 activations two at a time).
+   Bit-identical to the baseline.  **Measured 0.99x on 4096x32768** — the decode is register-bound and cheap; the
+   kernel is NOT decode-bound.
+3. **FP4 GEMV shared-memory x-tile (Path B+) — DONE, parity-green but 1.04x only.** `fp4_gemv_tiled.cu` loads the
+   single activation vector once per 32-row block into shared memory (the MoE broadcast pattern).  **Measured
+   1.04x (naive 1.138 ms / 0.118 TOPS -> tiled 1.090 ms / 0.123 TOPS), mismatch=0.** Why it's not the win:
+   4096x32768 = 134 M MACs in 1.1 ms = 0.12 TOPS vs ~1.4 TFLOP fp32 peak -> the kernel is **compute-bound in the
+   scalar decode+fp32-FMA path**, NOT bandwidth-bound. L2 (48 MB on gfx1201) already holds the 8 KB `x` reused
+   across all 32768 rows, so the baseline's "redundant" x reads are L2 hits (~1 cycle), and weight traffic is
+   only ~34 MB.  Vectorizing/tile-moving the decode cannot recover the 1000x gap to peak.
+4. **FP4 int8 dot path (Path C) — DEFERRED, needs a numerics sign-off.** The ONLY FP4 speedup available on
+   gfx1201 (no FP4 tensor core) is `V_DOT4_I32_IU8` (`__builtin_amdgcn_sdot4`/`:udot4`, confirmed to compile),
+   which requires the fp16 activation quantized to INT8 per block (symmetric, scale=max/127).  That changes the
+   numerics — the parity test must model the same activation quantization (int8-scaled dot vs the scalar
+   fp32 reference), and the user must accept the resulting error budget.  NOT implemented: it is a separate,
+   separately-parity-tested path behind a numerics sign-off, per the standing "no numerics change without an
+   explicit parity gate" rule.
 
 
 1. **Verify-window nondeterminism (`--spec`).** The native path requires `--spec ≥ 2`, and that window

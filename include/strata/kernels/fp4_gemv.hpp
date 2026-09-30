@@ -41,4 +41,11 @@ void fp4_gemv(const uint16_t* x, const uint8_t* w, float* y,
 void fp4_gemv_fast(const uint16_t* x, const uint8_t* w, float* y,
                    int64_t n_in, int64_t n_out, bool mxfp4);
 
+// Tiled GEMV: `x` is a single vector of length `n_in` reused across all `n_out` rows (the MoE pattern),
+// loaded once per 32-row block into shared memory so the kernel is no longer activation-bandwidth-bound.
+// Numerically identical to the others (same dot order j=0..n_in), parity-tested against the scalar
+// reference.  `n_in` must fit in the fixed shared-memory tile (kXTile = 4096).
+void fp4_gemv_tiled(const uint16_t* x, const uint8_t* w, float* y,
+                    int64_t n_in, int64_t n_out, bool mxfp4);
+
 }  // namespace strata::kernels

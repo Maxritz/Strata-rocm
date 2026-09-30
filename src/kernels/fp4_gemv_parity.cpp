@@ -1,12 +1,12 @@
 #include "hip/hip_runtime.h"
-// src/kernels/fp4_gemv_parity.cpp - parity test for the MXFP4 / NVFP4 GEMV.
+// src/kernels/fp4_gemv_parity.cpp - parity test for the MXPF4 / NVFP4 GEMV.
 //
 // Reference for each format is the VALIDATED scalar dequantizer in strata/artifact/dequant.hpp - the one
 // `dequant_fp4_test` checks bit-for-bit against ggml - applied to the SAME weight bytes handed to the kernel,
 // followed by a naive fp32 dot with the fp16 activation.  The kernel decodes FP4 in software on gfx1201 (no
 // FP4 tensor core exists here, per the RDNA4 ISA table and `amd_hip_fp4.h`'s gfx950/gfx1250 gate), so the
-// reference is the scalar path plus the dot, NOT the kernel against itself: a kernel compared to another copy
-// of its own decode proves nothing.
+// reference is the scalar path plus the dot, NOT the kernel against another copy of its own decode: a kernel
+// compared to another kernel that shares its decode proves nothing.
 #include "strata/artifact/dequant.hpp"
 #include "strata/kernels/fp4_gemv.hpp"
 
@@ -70,12 +70,11 @@ void run(bool mxfp4) {
     const int BLOCK_BYTES = mxfp4 ? 17 : 36;
     std::mt19937 rng(mxfp4 ? 0x4D584634uLL : 0x4E564634uLL);
     const int n_scales = (int) (sizeof(kScales) / sizeof(kScales[0]));
-    const long long n_out = 48;                               // spans >1 block of 128 threads
+    const long long n_out = 48;                               // spans >1 block of 32 rows (tiled) / 128 threads
 
-    // Three row widths (MXFP4): 32 (one block), 128, 640.  NVFP4 starts at 64 (one block) - the 32 case is
-    // structurally impossible (640/2560 shapes never have n_in=32 for NVFP4), so only test valid widths.
+    // Three row widths.  MXFP4: 32 (one block), 128, 640.  NVFP4: 64 (one block), 128, 640.
     for (long long n_in : (mxfp4 ? std::vector<long long>{32, 128, 640}
-                                : std::vector<long long>{64, 128, 640})) {
+                                 : std::vector<long long>{64, 128, 640})) {
         const long long blocks_per_row = n_in / ELEMS;
         const long long w_bytes = n_out * blocks_per_row * BLOCK_BYTES;
 
@@ -119,9 +118,9 @@ void run(bool mxfp4) {
             cond[(size_t) o] = sum_abs;
         }
 
-        // Compare a kernel's output to the validated scalar reference `ref`.  Both fp4_gemv and fp4_gemv_fast
-        // are parity-checked against this SAME reference - not against each other - so a decode bug unique to
-        // the fast kernel is caught instead of cancelled out.
+        // Compare a kernel's output to the validated scalar reference `ref`.  All three kernels are
+        // parity-checked against THIS reference - not against each other - so a decode bug unique to any
+        // one kernel is caught instead of cancelled out.
         auto compare = [&](const std::vector<float>& got, const char* which) -> int {
             int bad = 0; double worst = 0.0, worst_res = 0.0;
             for (long long o = 0; o < n_out; ++o) {
@@ -158,6 +157,7 @@ void run(bool mxfp4) {
         int allbad = 0;
         allbad += compare(launch_and_copy(strata::kernels::fp4_gemv,        "baseline"),  "baseline");
         allbad += compare(launch_and_copy(strata::kernels::fp4_gemv_fast,    "FAST    "), "FAST");
+        allbad += compare(launch_and_copy(strata::kernels::fp4_gemv_tiled,   "TILED   "), "TILED");
         if (allbad) return;
     }
 
@@ -189,63 +189,59 @@ int main(int argc, char** argv) {
     const long long n_out = bench && argc > 3 ? std::atoll(argv[3]) : 0;
     const int reps = bench && argc > 4 ? std::atoi(argv[4]) : 1;
     if (bench) {
-        // Fair timing: identical input, both kernels, warmup + average over `reps`.  No fabricated numbers.
+        // Fair timing: identical input, all three kernels, warmup + average over `reps`.  No fabricated numbers.
         const bool mxfp4 = true;
         const long long ELEMS = mxfp4 ? 32 : 64;
         const int BLOCK_BYTES = mxfp4 ? 17 : 36;
         std::mt19937 rng(0xC0FFEE);
-        std::vector<uint16_t> x((size_t)n_in);
+        std::vector<uint16_t> x((size_t) n_in);
         for (auto& v : x) v = (uint16_t)(rng() & 0xFFFF);
         std::vector<uint8_t> w((size_t)(n_in / ELEMS * n_out * BLOCK_BYTES), 0);
-        for (long long o = 0; o < n_out; ++o) {
+        for (long long o = 0; o < n_out; ++o)
             for (long long b = 0; b < n_in / ELEMS; ++b) {
                 uint8_t* blk = w.data() + o * (n_in / ELEMS) * BLOCK_BYTES + b * BLOCK_BYTES;
                 blk[0] = (uint8_t)(120 + (rng() % 16));
                 for (int i = 1; i < BLOCK_BYTES; ++i) blk[i] = (uint8_t)(rng() & 0xFF);
             }
-        }
-        uint16_t* d_x = nullptr; uint8_t* d_w = nullptr;
-        float *d_y1 = nullptr, *d_y2 = nullptr;
-        check(hipMalloc(&d_x, x.size()*2), "x");
-        check(hipMalloc(&d_w, w.size()), "w");
-        check(hipMalloc(&d_y1, n_out*4), "y1");
-        check(hipMalloc(&d_y2, n_out*4), "y2");
+        uint16_t* d_x=nullptr; uint8_t* d_w=nullptr; float *d_y1=nullptr, *d_y2=nullptr, *d_y3=nullptr;
+        check(hipMalloc(&d_x, x.size()*2), "x"); check(hipMalloc(&d_w, w.size()), "w");
+        check(hipMalloc(&d_y1, n_out*4), "y1"); check(hipMalloc(&d_y2, n_out*4), "y2"); check(hipMalloc(&d_y3, n_out*4), "y3");
         check(hipMemcpy(d_x, x.data(), x.size()*2, hipMemcpyHostToDevice), "cx");
         check(hipMemcpy(d_w, w.data(), w.size(), hipMemcpyHostToDevice), "cw");
-        auto t = [](auto f, auto... a)->double {
+        auto tb = [](auto f, auto... a)->double {
             hipEvent_t s,e; (void)hipEventCreate(&s); (void)hipEventCreate(&e);
             (void)hipEventRecord(s); f(a...); (void)hipEventRecord(e); (void)hipEventSynchronize(e);
             float ms=0; (void)hipEventElapsedTime(&ms,s,e); (void)hipEventDestroy(s); (void)hipEventDestroy(e); return ms;
         };
+        // warmup + tiled-vs-baseline parity on this input
         strata::kernels::fp4_gemv(d_x,d_w,d_y1,n_in,n_out,mxfp4);
         strata::kernels::fp4_gemv_fast(d_x,d_w,d_y2,n_in,n_out,mxfp4);
-        std::vector<float> g1((size_t)n_out), g2((size_t)n_out);
-        check(hipMemcpy(g1.data(), d_y1, n_out*4, hipMemcpyDeviceToHost), "c1");
-        check(hipMemcpy(g2.data(), d_y2, n_out*4, hipMemcpyDeviceToHost), "c2");
-        int mism = 0; long long maxdiff = 0;
-        for (long long i = 0; i < n_out; ++i) {
-            double rel = std::fabs((double)g1[i] - (double)g2[i]) /
-                         (std::fabs((double)g1[i]) > 1e-30 ? std::fabs((double)g1[i]) : 1e-30);
-            if (rel > 1e-5) ++mism;
-            long long diff = (long long) std::fabs((double)g1[i] - (double)g2[i]);
-            if (diff > maxdiff) maxdiff = diff;
+        strata::kernels::fp4_gemv_tiled(d_x,d_w,d_y3,n_in,n_out,mxfp4);
+        std::vector<float> r1((size_t)n_out), r3((size_t)n_out);
+        check(hipMemcpy(r1.data(), d_y1, n_out*4, hipMemcpyDeviceToHost), "cr1");
+        check(hipMemcpy(r3.data(), d_y3, n_out*4, hipMemcpyDeviceToHost), "cr3");
+        int mism_t=0;
+        for (long long i=0;i<n_out;++i) {
+            double rel=std::fabs((double)r1[i]-(double)r3[i]) /
+                       (std::fabs((double)r1[i])>1e-30 ? std::fabs((double)r1[i]) : 1e-30);
+            if (rel>1e-5) ++mism_t;
         }
-        strata::kernels::fp4_gemv(d_x,d_w,d_y1,n_in,n_out,mxfp4);
-        strata::kernels::fp4_gemv_fast(d_x,d_w,d_y2,n_in,n_out,mxfp4);
-        double t0=0,t1=0;
-        for (int i=0;i<reps;++i){ t0 += t(strata::kernels::fp4_gemv,        d_x,d_w,d_y1,n_in,n_out,mxfp4);
-                                t1 += t(strata::kernels::fp4_gemv_fast,    d_x,d_w,d_y2,n_in,n_out,mxfp4); }
-        double t0a=t0/reps, t1a=t1/reps;
+        double t0=0,t1=0,t2=0;
+        for (int i=0;i<reps;++i){
+            t0 += tb(strata::kernels::fp4_gemv,        d_x,d_w,d_y1,n_in,n_out,mxfp4);
+            t1 += tb(strata::kernels::fp4_gemv_fast,    d_x,d_w,d_y2,n_in,n_out,mxfp4);
+            t2 += tb(strata::kernels::fp4_gemv_tiled,   d_x,d_w,d_y3,n_in,n_out,mxfp4); }
+        const double t0a=t0/reps, t1a=t1/reps, t2a=t2/reps;
         const double elems = (double)n_in * (double)n_out;
-        std::printf("bench n_in=%lld n_out=%lld mxfp4=%d reps=%d  parity_mismatch=%d  maxabsdiff=%lld\n",
-                    (long long)n_in,(long long)n_out,(int)mxfp4,reps,mism,(long long)maxdiff);
-        std::printf("  baseline: %.4f ms  %.3f TOPS\n", t0a, elems/1e12/(t0a/1e3));
-        std::printf("  fast    : %.4f ms  %.3f TOPS\n", t1a, elems/1e12/(t1a/1e3));
-        std::printf("  speedup : %.2fx\n", t0a/t1a);
+        std::printf("bench n_in=%lld n_out=%lld mxfp4=%d reps=%d  tiled_vs_baseline_mismatch=%d\n",
+                    (long long)n_in,(long long)n_out,(int)mxfp4,reps,mism_t);
+        std::printf("  naive   : %.4f ms  %.3f TOPS\n", t0a, elems/1e12/(t0a/1e3));
+        std::printf("  fast    : %.4f ms  %.3f TOPS  (%.2fx naive)\n", t1a, elems/1e12/(t1a/1e3), t0a/t1a);
+        std::printf("  TILED   : %.4f ms  %.3f TOPS  (%.2fx naive, %.2fx fast)\n", t2a, elems/1e12/(t2a/1e3), t0a/t2a, t1a/t2a);
         auto hFree = [](void* p){ (void)hipFree(p); };
-        hFree(d_x); hFree(d_w); hFree(d_y1); hFree(d_y2);
+        hFree(d_x); hFree(d_w); hFree(d_y1); hFree(d_y2); hFree(d_y3);
         return 0;
-    }
+    }  // if (bench)
     std::printf("fp4_gemv_parity\n");
     int bad = 0;
     run(true);   // MXFP4
