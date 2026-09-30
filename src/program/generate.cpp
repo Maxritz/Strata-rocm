@@ -1268,16 +1268,42 @@ int main(int argc, char** argv) {
     g.n_expert = strata::kernels::cpu::expert_layout().n_expert;
     int64_t K = 10;
     if (!o.native_preset.empty()) {
-        // a pruned variant (GSQ-RCO Coder) ships fewer experts than the canonical 512x10; the model file
-        // is the authority on its own MoE shape - everything else in the geometry is unchanged
+        // a pruned/renamed variant (GSQ-RCO Coder, Whittle...) ships a different MoE shape; the model file is the
+        // authority on its own geometry.  Read every field the prompt path needs.
         try {
             strata::GgufFile model_gguf(o.native_preset);
-            if (const strata::MetaValue* v = model_gguf.get("qwen4exp.expert_count")) g.n_expert = (int64_t) v->u;
-            if (const strata::MetaValue* v = model_gguf.get("qwen4exp.expert_used_count")) K = (int64_t) v->u;
+            const auto u = [&](const char* k, int64_t dflt) -> int64_t {
+                const strata::MetaValue* v = model_gguf.get(k);
+                return v ? (int64_t) v->u : dflt;
+            };
+            g.n_expert = u("qwen4exp.expert_count", g.n_expert);
+            K = u("qwen4exp.expert_used_count", K);
+            g.n_layers = u("qwen4exp.block_count", g.n_layers);
+            g.n_embd = u("qwen4exp.embedding_length", g.n_embd);
+            g.n_head = u("qwen4exp.attention.head_count", g.n_head);
+            g.n_head_kv = u("qwen4exp.attention.head_count_kv", g.n_head_kv);
+            g.head_dim = u("qwen4exp.attention.key_length", g.head_dim);
+            g.n_ff = u("qwen4exp.expert_feed_forward_length", g.n_ff);
+            g.qsa_interval = u("qwen4exp.full_attention_interval", g.qsa_interval);
+            g.hc = u("qwen4exp.hyper_connection.count", g.hc);
+            g.hc_lr = u("qwen4exp.hyper_connection.low_rank", g.hc_lr);
+            g.ssm_state_size = u("qwen4exp.ssm.state_size", g.ssm_state_size);
         } catch (const std::exception& e) {
-            std::fprintf(stderr, "strata generate: reading the model's expert shape from %s: %s\n",
+            std::fprintf(stderr, "strata generate: reading the model's geometry from %s: %s\n",
                          o.native_preset.c_str(), e.what());
             return 1;
+        }
+        // The prompt path (src/prefill/prefill.cpp) is compiled for ONE geometry.  A model that differs from it is
+        // refused LOUDLY here rather than silently mis-run.  Making N / n_ff / hc / K runtime is the next step.
+        if (g.n_embd != 2560 || g.hc != 4 || g.hc_lr != 320 || g.n_ff != 640 || g.qsa_interval != 4 ||
+            g.ssm_state_size != 128) {
+            std::fprintf(stderr,
+                         "strata generate: %s geometry (n_embd %lld, hc %lld, hc_lr %lld, n_ff %lld, qsa_interval "
+                         "%lld, ssm %lld) is not the compiled prompt path (2560/4/320/640/4/128); this build can only "
+                         "run the Qwen3.8-Flash-Next shape\n",
+                         o.native_preset.c_str(), (long long) g.n_embd, (long long) g.hc, (long long) g.hc_lr,
+                         (long long) g.n_ff, (long long) g.qsa_interval, (long long) g.ssm_state_size);
+            return 2;
         }
     }
     // before session_init: every graph captured from here on has the vector's kernels where it applies
