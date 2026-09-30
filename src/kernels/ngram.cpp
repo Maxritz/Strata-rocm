@@ -88,7 +88,18 @@ void ngram_rows(const int32_t* tokens, const int32_t* prev, int n_tokens, const 
 
 namespace {
 const int8_t kIq4Nl[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+
+// ggml's `get_scale_min_k4` (ggml-quants.c): the 6-bit scale and min of sub-block `j` of a Q4_K super-block.
+inline void get_scale_min_k4(int j, const uint8_t* q, uint8_t* d, uint8_t* m) {
+    if (j < 4) {
+        *d = q[j] & 63;
+        *m = q[j + 4] & 63;
+    } else {
+        *d = (q[j + 4] & 0x0F) | ((q[j - 4] >> 6) << 4);
+        *m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
+    }
 }
+}  // namespace
 
 int iq4nl_code(int code) { return kIq4Nl[code & 15]; }
 
@@ -127,9 +138,50 @@ void q5_0_dequant_row(const uint8_t* row, float* out160) {
     }
 }
 
+// Q4_K rows: the n-gram table of a **Q4_K_M** model (e.g. logic65/Whittle-Qwen-3.8-35B-A3B, whose
+// `per_layer_token_embd.weight` is [256, 39040000] Q4_K).  One Q4_K super-block is QK_K = 256 values in 144
+// bytes: `{ half d; half dmin; uint8_t scales[12]; uint8_t qs[128]; }`.  Six-bit scales/mins are unpacked by
+// ggml's `get_scale_min_k4` and the value is `d*sc*q - dmin*m` (Q4_K has a MIN term; IQ4_NL does not).
+// `head_dim` = 256 here, which is exactly one super-block per row, but the loop handles head_dim = k*256.
+void q4_K_dequant_row(const uint8_t* row, float* out, int head_dim) {
+    const int nb = head_dim / 256;
+    for (int b = 0; b < nb; ++b) {
+        const uint8_t* blk = row + (size_t) b * 144;
+        uint16_t dbits, mbits;
+        std::memcpy(&dbits, blk, 2);
+        std::memcpy(&mbits, blk + 2, 2);
+        const float d = f32_from_f16(dbits);
+        const float dmin = f32_from_f16(mbits);
+        const uint8_t* sc = blk + 4;          // scales[12]
+        const uint8_t* q = blk + 16;          // qs[128]
+        float* y = out + (size_t) b * 256;
+        int is = 0;
+        for (int j = 0; j < 256; j += 64) {
+            uint8_t s0, m0, s1, m1;
+            get_scale_min_k4(is + 0, sc, &s0, &m0);
+            get_scale_min_k4(is + 1, sc, &s1, &m1);
+            const float d1 = d * (float) s0, b1 = dmin * (float) m0;
+            const float d2 = d * (float) s1, b2 = dmin * (float) m1;
+            for (int l = 0; l < 32; ++l) *y++ = d1 * (float) (q[l] & 0x0F) - b1;
+            for (int l = 0; l < 32; ++l) *y++ = d2 * (float) (q[l] >> 4) - b2;
+            q += 32;
+            is += 2;
+        }
+    }
+}
+
 void ple_dequant_row(bool q5_0, const uint8_t* row, float* out160) {
     if (q5_0) q5_0_dequant_row(row, out160);
     else iq4nl_dequant_row(row, out160);
+}
+
+void ple_dequant_row_fmt(PleFmt fmt, const uint8_t* row, float* out, int head_dim) {
+    switch (fmt) {
+        case PleFmt::Q4K: q4_K_dequant_row(row, out, head_dim); break;
+        case PleFmt::Q5_0: q5_0_dequant_row(row, out); break;
+        case PleFmt::IQ4NL:
+        default: iq4nl_dequant_row(row, out); break;
+    }
 }
 
 // ---------------------------------------------------------------------------------------------------

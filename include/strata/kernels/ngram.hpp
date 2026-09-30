@@ -104,6 +104,16 @@ void iq4nl_dequant_row(const uint8_t* row, float* out160);
 /// NEVER KEEP THE SHARD MAPPED WHILE READING IT DIRECT: a live section on the same file serializes the unbuffered
 /// reads (311 -> 1,575 us per token, bench/results/2026-09-23-p2-ssd-direct). Direct mode drops its own mapping
 /// after the header parse; nothing else in the process may hold one.
+/// The n-gram table's row quantization.  `IQ4NL` is the canonical Flash-Next table (`[160, 320001536]`, 90-byte
+/// rows); `Q5_0` is a plain Q4_K_M packing of the same 160-wide head (110-byte rows); `Q4K` is a **Q4_K_M
+/// n-gram table** - the Whittle family, `[256, 39040000]`, one 144-byte super-block per 256-wide head.
+enum class PleFmt { IQ4NL, Q5_0, Q4K };
+
+/// One Q4_K row (`head_dim` values, a multiple of 256) -> floats.  `ple_dequant_row_fmt` dispatches on the row
+/// format; the two existing dequantizers (`iq4nl_dequant_row` / `q5_0_dequant_row`) keep their 160-wide bodies.
+void q4_K_dequant_row(const uint8_t* row, float* out, int head_dim);
+void ple_dequant_row_fmt(PleFmt fmt, const uint8_t* row, float* out, int head_dim);
+
 enum class PleIo { Direct, Mmap };
 
 struct PleIoOptions {
