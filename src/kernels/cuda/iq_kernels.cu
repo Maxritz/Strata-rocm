@@ -98,6 +98,30 @@ __device__ __forceinline__ float vec_dot_q4_K_q8_1(const void* __restrict__ vbq,
     }
     return (d * (float) sc) * d8 * (float) sumi - (dmin * (float) m) * s8;
 }
+// Q5_K (ggml type 13) against one q8_1 activation: one call per 32-value group (qk=256, ipb=8, step=1), the
+// same shape as Q4_K above.  `x = d*sc*code - dmin*m` with code in 0..31; the low 4 bits live in `qs`, the
+// 5th bit in `qh`.  The q8_1 block's precomputed d*sum (`ds.y`) corrects the min in closed form.
+__device__ __forceinline__ float vec_dot_q5_K_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1,
+                                                   const int& kbx, const int& iqs) {
+    const uint8_t* b = (const uint8_t*) vbq + (size_t) kbx * 176;
+    const float d = __half2float(__ushort_as_half((uint16_t) (b[0] | (b[1] << 8))));
+    const float dmin = __half2float(__ushort_as_half((uint16_t) (b[2] | (b[3] << 8))));
+    const uint8_t* s = b + 4;
+    int sc, m;
+    if (iqs < 4) { sc = s[iqs] & 63; m = s[iqs + 4] & 63; }
+    else { sc = (s[iqs + 4] & 0xF) | ((s[iqs - 4] >> 6) << 4); m = (s[iqs + 4] >> 4) | ((s[iqs] >> 6) << 4); }
+    const uint8_t* ql = b + 48 + 32 * (iqs >> 1);
+    const uint8_t* qh = b + 16;
+    const uint8_t u = (uint8_t) ((iqs & 1) ? 2 : 1) << (2 * (iqs >> 1));
+    const block_q8_1* y = bq8_1 + iqs;
+    const float d8 = __low2float(y->ds), s8 = __high2float(y->ds);
+    int sumi = 0;
+    for (int l = 0; l < 32; ++l) {
+        const int code = ((iqs & 1) ? (ql[l] >> 4) : (ql[l] & 0xF)) + ((qh[l] & u) ? 16 : 0);
+        sumi += code * (int) y->qs[l];
+    }
+    return (d * (float) sc) * d8 * (float) sumi - (dmin * (float) m) * s8;
+}
 __device__ __forceinline__ float vec_dot_q6_K_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1,
                                                    const int& kbx, const int& iqs) {
     const uint8_t* b = (const uint8_t*) vbq + (size_t) kbx * 210;
@@ -396,6 +420,8 @@ template<> struct Fmt<42> { static constexpr int qk = 64, ipb = 2, step = 1;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q2_0_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<12> { static constexpr int qk = 256, ipb = 8, step = 1;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q4_K_q8_1(v, y, kbx, iqs); } };
+template<> struct Fmt<13> { static constexpr int qk = 256, ipb = 8, step = 1;
+    __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q5_K_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<14> { static constexpr int qk = 256, ipb = 8, step = 1;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q6_K_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<8> { static constexpr int qk = 32, ipb = 1, step = 1;
@@ -788,6 +814,7 @@ size_t iq_row_bytes(int t, int64_t n) noexcept {
         case 6: return (size_t) (n / 32) * 22;
         case 8: return (size_t) (n / 32) * 34;
         case 12: return (size_t) (n / 256) * sizeof(block_q4_K);
+        case 13: return (size_t) (n / 256) * sizeof(block_q5_K);
         case 14: return (size_t) (n / 256) * sizeof(block_q6_K);
         case 42: return (size_t) (n / 64) * sizeof(block_q2_0);
         default: return 0;
@@ -903,6 +930,8 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         case 29: native_gu_kernel<29><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
         case 42: native_gu_kernel<42><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
         case 12: native_gu_kernel<12><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+        case 13: native_gu_kernel<13><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+        case 14: native_gu_kernel<14><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
         default: std::fprintf(stderr, "native_expert_grouped: gate/up type %d\n", L.gu_type); std::exit(1);
     }
     check("native_expert_grouped/gu");
@@ -916,6 +945,8 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         case 42: native_down_kernel<42><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         case 8: native_down_kernel<8><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         case 6: native_down_kernel<6><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+        case 13: native_down_kernel<13><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+        case 14: native_down_kernel<14><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         default: std::fprintf(stderr, "native_expert_grouped: down type %d\n", L.d_type); std::exit(1);
     }
     check("native_expert_grouped/down");
