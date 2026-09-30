@@ -295,6 +295,10 @@ struct Prefill::Impl {
     int ring = STAGE;                        // the slots of this layout's ring (ring_slots)
     std::unique_ptr<Stager> stager;          // the unpinned experts' host copies (step 4)
     hipEvent_t copied[RING_MAX] = {}, used[RING_MAX] = {};
+    /// docs §4/§7.4: recorded on `cs` after each layer's expert consumers; the bounded ring gates slot reuse on
+    /// it (`RingExpertSource::release_layer`), so a source slot is never overwritten while a copy from it, or a
+    /// kernel reading its alias, is still in flight.
+    hipEvent_t layer_done = nullptr;
     bool stage_live[RING_MAX] = {};
     // PLE
     float* ple_emb = nullptr;
@@ -369,6 +373,7 @@ Prefill::~Prefill() {
         if (impl_->copied[i]) hipEventDestroy(impl_->copied[i]);
         if (impl_->used[i]) hipEventDestroy(impl_->used[i]);
     }
+    if (impl_->layer_done) { hipEventDestroy(impl_->layer_done); impl_->layer_done = nullptr; }
     for (int b = 0; b < 2; ++b) {
         if (impl_->ple_copied[b]) hipEventDestroy(impl_->ple_copied[b]);
         if (impl_->ple_emb_host[b] && impl_->ple_pageable[b].empty()) hipHostFree(impl_->ple_emb_host[b]);
@@ -475,6 +480,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         if (hipEventCreateWithFlags(&m.copied[i], hipEventDisableTiming) != hipSuccess) ok = false;
         if (hipEventCreateWithFlags(&m.used[i], hipEventDisableTiming) != hipSuccess) ok = false;
     }
+    if (!m.layer_done && hipEventCreateWithFlags(&m.layer_done, hipEventDisableTiming) != hipSuccess) ok = false;
     if (!m.stager) {
         m.stager = std::make_unique<Stager>();
         const int hw = (int) std::thread::hardware_concurrency();
@@ -1439,6 +1445,14 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             }
                         }
                         release_to(NE);
+                    }
+                    // docs §4/§7.4: every consumer of this layer's source blobs - the copies sourced from the
+                    // ring (`m.copy`, waited on before each compute) and the kernels reading the ring's alias
+                    // (`m.cs`) - is stream-ordered before this record, so the bounded ring may reuse the layer's
+                    // slots once it completes.  A no-op for the arena/mmap (their slots are persistent).
+                    if (m.src != nullptr) {
+                        hipEventRecord(m.layer_done, m.cs);
+                        m.src->release_layer(l, m.layer_done);
                     }
                     pt.mark(kPfCombine, cs);
                     moe_combine(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs);

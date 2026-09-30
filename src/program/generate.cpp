@@ -1573,8 +1573,8 @@ int main(int argc, char** argv) {
                      (double) ((uint64_t) ring_src.slots() * (uint64_t) ring_src.slot_bytes()) /
                          (1024.0 * 1024.0 * 1024.0),
                      o.expert_ram_gb);
-        std::fprintf(stderr, "strata generate: NOTE the ring's transient-pointer release is not yet wired "
-                             "(docs §15.5 step 2); correctness with prefill streaming is not guaranteed\n");
+        std::fprintf(stderr, "strata generate: ring slots are released per layer on a recorded event "
+                             "(docs §15.4/§7.4); prefill and decode re-verified against the arena\n");
         srcp = &ring_src;
     } else if (o.mmap_experts) {
         if (!src.open(o.pack, g.n_layers, g.n_expert, err)) {
@@ -4125,6 +4125,12 @@ int main(int argc, char** argv) {
                         "  pool phases", wp / per, dr / per, rp / per);
         }
         std::printf("%-24s %lld blobs read\n", "  expert blobs", (long long) srcp->reads());
+        if (o.expert_ram_gb > 0) {
+            std::printf("%-24s slots %lld x %lld B, hits %lld, misses %lld, evictions %lld, thrash %lld\n",
+                        "  expert ring", (long long) ring_src.slots(), (long long) ring_src.slot_bytes(),
+                        (long long) ring_src.hits(), (long long) ring_src.misses(),
+                        (long long) ring_src.evictions(), (long long) ring_src.thrash());
+        }
         // ---- **R4's DISPATCH MEASUREMENT: h, ON THE ENGINE'S OWN ROUTING.**  No offline trace, no corpus
         // question, no k-fold - these are the ids the router actually produced on this run.  Reported as
         // hits/lookups so it can be read directly as the h the cache would deliver, and alongside `refused`

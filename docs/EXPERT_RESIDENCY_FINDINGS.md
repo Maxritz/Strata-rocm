@@ -348,6 +348,35 @@ The decode budget:
 | P3 | Decayed hot-pinning; prerouter head (only if accuracy ≥70%) | measured accuracy |
 | P3 | Kernel-load-at-start; fix `--expert-cache-per-layer`; backlog (DeepSeek S2, qwen35moe, PLE) | — |
 
+## 10c. P0 DONE — the transient release is wired (measured)
+
+**Implemented.** `ExpertSource::release_layer(layer, event)` (base no-op) + `RingExpertSource` gate: each slot
+holds the event its bytes are safe after; `acquire` only overwrites a slot whose gate has completed (conservative
+on a re-recorded event). `prefill.cpp` records `layer_done` on `m.cs` at the end of every layer's expert block
+and calls `release_layer`, covering both the staged DMA (copies on `m.copy`, waited on before each compute) and
+the direct alias read (on `m.cs`). The decode path is already ordered by the doorbell (`session.cpp:642-663`
+cannot reach layer `l+1`'s dispatch before `post[l]` runs), so `begin_layer` un-protecting the previous layer is
+safe there.
+
+**The gate now passes:**
+
+| arm | peak WorkingSet | 24-token `output` | decode |
+|---|---|---|---|
+| arena | 34.19 GB | `248068 198 760 1156 6587 264 4145 12654 709 421 11039 1330 4947 13 1061 369 29350 471 353 3172 3165 264 61446 709` | 19.03 tok/s |
+| `--expert-ram-gb 22` | **23.17 GB** | **identical** | 13.91 tok/s |
+| `--expert-ram-gb 20` | **21.16 GB** | **identical** | — |
+
+**Open perf finding (P1).** The ring costs ~27% decode (13.91 vs 19.03). Two suspects, both from the same
+cause — the ring is *registered*, so `pinned()` is true, whereas the 34 GB arena's `hipHostRegister` **fails**
+(you cannot pin 34 of 63 GB) and falls back to the stager:
+1. the ring flips the dispatch onto the **PCIe DMA share** path (`expert_source.cpp:308-365`), which the arena
+   never exercises; and
+2. the ring evicts (22 of 33 GiB resident) where the arena does not, so its misses re-read from the page cache.
+
+A/B to run first: force the ring's dispatch to the CPU path (`pinned()` policy) and re-measure; and sweep
+20/22/24 for the knee. `--pcie-frac 0` is NOT a clean isolation — it diverges (`248068 271 248069 271`) and is
+slower, so it is its own (separate) bug to look at.
+
 ## 10. One-line summary
 
 The 34 GB arena is unbounded residency; the fix — a bounded pinned LRU ring (`RingExpertSource`,

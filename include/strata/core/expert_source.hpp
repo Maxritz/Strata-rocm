@@ -27,6 +27,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <list>
 #include <string>
 #include <vector>
 
@@ -60,6 +61,12 @@ public:
     virtual void begin_layer(int64_t layer, const int32_t* ids, int64_t k) { (void) layer; (void) ids; (void) k; }
     /// Plan v0.3 P6: the DEVICE address of a pinned, mapped blob (the GPU can read it over PCIe), or null.
     virtual const uint8_t* device_alias(int64_t layer, int64_t expert) const { (void) layer; (void) expert; return nullptr; }
+
+    /// **THE TRANSIENT CONTRACT (docs EXPERT_RESIDENCY_FINDINGS §4/§7.4).**  A bounded source reuses a slot; the
+    /// blobs it returned for `layer` are valid only until then.  The caller promises they are consumed once
+    /// `after_event` (a `hipEvent_t`) completes - a copy sourced from a slot, or a kernel reading its alias.
+    /// A persistent source (the arena, the mmap) has nothing to release: this is a no-op for it.
+    virtual void release_layer(int64_t layer, void* after_event) { (void) layer; (void) after_event; }
 };
 
 /// Plan v0.3 P6: what the GPU computes in a verify window's layer, written by the pool (mapped host memory) right
@@ -391,6 +398,10 @@ public:
     void begin_layer(int64_t layer, const int32_t* ids, int64_t k) override;
     /// A slot for `(layer, expert)`, filling on a miss (evicting the LRU unprotected slot).  -1 if impossible.
     int64_t acquire(int64_t layer, int64_t expert);
+    /// Gate every slot acquired for `layer`: it may be reused only once `after_event` (a `hipEvent_t` recorded
+    /// after the layer's consumers - the copies sourced from these slots and the kernels reading their aliases)
+    /// completes.  This is what makes eviction safe when the host runs ahead of the GPU.
+    void release_layer(int64_t layer, void* after_event) override;
     /// The host base of slot `s`, and its device alias (null when the registration failed).
     const uint8_t* slot_host(int64_t s) const { return base_ + (uint64_t) s * (uint64_t) slot_bytes_; }
     const uint8_t* slot_device(int64_t s) const { return dev_ == nullptr ? nullptr : dev_ + (uint64_t) s * (uint64_t) slot_bytes_; }
@@ -405,20 +416,31 @@ public:
     int64_t thrash() const { return thrash_; }
 
 private:
-    struct Slot { int64_t layer = -1; int64_t expert = -1; uint64_t lru = 0; bool held = false; };
+    /// One slot's residency record.  `gate` is the event that must have completed before the bytes may be
+    /// overwritten: set by `release_layer`, null while the slot is still held (the current layer's working set).
+    struct Slot {
+        int64_t layer = -1, expert = -1;
+        bool held = false;
+        void* gate = nullptr;                        ///< reuse blocked until this `hipEvent_t` completes
+        std::list<int64_t>::iterator lru{};          ///< position in `lru_`; front is the least recently used
+    };
     void read_blob(int64_t layer, int64_t expert, uint8_t* dst);
-    int64_t evictable_slot() const;
+    /// The least-recently-used slot that is safe to overwrite: not held and its gate has completed.  -1 if none.
+    int64_t reusable_slot();
+    static bool gate_done(const void* gate);
 
     void* arena_ = nullptr;              ///< the PinnedArena, owned
     uint8_t* base_ = nullptr;            ///< slot 0 of the ring (host)
     const uint8_t* dev_ = nullptr;       ///< its device alias, or null if registration failed
     std::vector<Slot> slot_;
     std::vector<int64_t> index_;         ///< (layer * n_expert + expert) -> slot, -1 when absent
+    std::list<int64_t> lru_;             ///< slots by last use, front = least recent (the eviction order)
+    std::vector<int64_t> layer_slots_;   ///< the slots this layer acquired, for `release_layer`
+    int64_t cur_layer_ = -1;             ///< the layer `layer_slots_` belongs to
     int64_t slots_ = 0;
     int64_t slot_bytes_ = 0;
     int64_t blobs_ = 0;
     int64_t n_expert_ = 0;
-    uint64_t tick_ = 0;
     int64_t held_layer_ = -1;
     int64_t reads_ = 0, hits_ = 0, misses_ = 0, evictions_ = 0, thrash_ = 0;
     std::string gguf_, path_;

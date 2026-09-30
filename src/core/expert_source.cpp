@@ -854,9 +854,17 @@ bool RingExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
     }
     slot_.assign((size_t) slots_, Slot{});
     index_.assign((size_t) blobs_, -1);
+    // every slot starts free, oldest first, so the first `slots_` misses fill the pool and only then does reuse
+    // (and the gate) matter
+    lru_.clear();
+    for (int64_t s = 0; s < slots_; ++s) {
+        lru_.push_back(s);
+        slot_[(size_t) s].lru = std::prev(lru_.end());
+    }
+    layer_slots_.clear();
+    cur_layer_ = -1;
     n_expert_ = n_expert;
     reads_ = hits_ = misses_ = evictions_ = thrash_ = 0;
-    tick_ = 0;
     held_layer_ = -1;
     path_ = path;
     return true;
@@ -869,6 +877,9 @@ void RingExpertSource::close() {
     dev_ = nullptr;
     slot_.clear();
     index_.clear();
+    lru_.clear();
+    layer_slots_.clear();
+    cur_layer_ = -1;
     slots_ = 0;
     blobs_ = 0;
     n_expert_ = 0;
@@ -883,57 +894,79 @@ void RingExpertSource::read_blob(int64_t layer, int64_t expert, uint8_t* dst) {
     (void) std::fread(dst, 1, (size_t) lay.blob_bytes(layer), file_);
 }
 
-// The LRU choice.  A held slot is the protection set (docs §15.4): it is the current layer's working set, and
-// nothing in it may be reused while a copy or a kernel may still read it.  When EVERY slot is held the pool is
-// smaller than one layer's working set - the read then has to happen, but it is counted as `thrash` because the
-// number is the one that says the pool is undersized (rather than the run failing quietly).
-int64_t RingExpertSource::evictable_slot() const {
-    int64_t best = -1;
-    uint64_t best_lru = ~0ull;
-    for (int64_t s = 0; s < slots_; ++s) {
-        if (slot_[(size_t) s].held) continue;
-        if (slot_[(size_t) s].lru < best_lru) { best_lru = slot_[(size_t) s].lru; best = s; }
+// **THE GATE (docs §7.4).**  A slot's bytes may be overwritten only once the event stored by `release_layer`
+// has completed - that event was recorded after the layer's consumers, so its completion means every copy
+// sourced from the slot and every kernel reading its alias is done.  Querying a **re-recorded** event can only
+// report *less* complete than the record we stored, so a false "done" is impossible and a false "not done" is
+// merely conservative.  A null gate (a slot never released) is treated as done for the arena-like case.
+bool RingExpertSource::gate_done(const void* gate) {
+    if (gate == nullptr) return true;
+    return hipEventQuery((hipEvent_t) gate) == hipSuccess;
+}
+
+// The least-recently-used slot that is safe to overwrite.  Normally `lru_.front()` is free (O(1)); the scan
+// walks forward only while the oldest slots are still held or gated.
+int64_t RingExpertSource::reusable_slot() {
+    for (auto it = lru_.begin(); it != lru_.end(); ++it) {
+        const Slot& s = slot_[(size_t) *it];
+        if (!s.held && gate_done(s.gate)) return *it;
     }
-    if (best >= 0) return best;
-    for (int64_t s = 0; s < slots_; ++s)
-        if (slot_[(size_t) s].lru < best_lru) { best_lru = slot_[(size_t) s].lru; best = s; }
-    return best;
+    return -1;
 }
 
 int64_t RingExpertSource::acquire(int64_t layer, int64_t expert) {
     if (base_ == nullptr || layer < 0 || expert < 0 || expert >= n_expert_) return -1;
     const int64_t key = layer * n_expert_ + expert;
     if (key < 0 || key >= blobs_) return -1;
-    // a new layer begins: the previous layer's slots stop being protected (the event-based release of §15.5
-    // step 2 replaces this when the call sites are wired)
-    if (layer != held_layer_) {
-        for (Slot& s : slot_) s.held = false;
-        held_layer_ = layer;
-    }
+    if (layer != cur_layer_) { cur_layer_ = layer; layer_slots_.clear(); }
+
     const int64_t hit = index_[(size_t) key];
     if (hit >= 0 && slot_[(size_t) hit].layer == layer && slot_[(size_t) hit].expert == expert) {
         ++hits_;
-        slot_[(size_t) hit].lru = ++tick_;
-        slot_[(size_t) hit].held = true;
+        Slot& s = slot_[(size_t) hit];
+        s.held = true;
+        lru_.splice(lru_.end(), lru_, s.lru);      // most recently used: the end of the list
+        layer_slots_.push_back(hit);
         return hit;
     }
+
     ++misses_;
-    int64_t s = evictable_slot();
-    if (s < 0) return -1;
-    if (slot_[(size_t) s].held) ++thrash_;   // every slot held -> the layer's working set exceeds the pool
-    if (slot_[(size_t) s].layer >= 0) {
-        const int64_t old = slot_[(size_t) s].layer * n_expert_ + slot_[(size_t) s].expert;
+    int64_t s = reusable_slot();
+    if (s < 0) {
+        // No free slot: the pool is smaller than the live working set.  Wait for the oldest gate, then take it.
+        // This is the one path that blocks the host, and it is counted: a nonzero `thrash` means the pool is
+        // undersized for the request, which is the number an `--expert-ram-gb` sweep is reading.
+        ++thrash_;
+        s = lru_.front();
+        Slot& v = slot_[(size_t) s];
+        if (v.gate != nullptr) { hipEventSynchronize((hipEvent_t) v.gate); v.gate = nullptr; }
+        v.held = false;
+    }
+    Slot& v = slot_[(size_t) s];
+    if (v.layer >= 0) {
+        const int64_t old = v.layer * n_expert_ + v.expert;
         if (old >= 0 && old < blobs_ && index_[(size_t) old] == s) index_[(size_t) old] = -1;
         ++evictions_;
     }
     read_blob(layer, expert, base_ + (uint64_t) s * (uint64_t) slot_bytes_);
     ++reads_;
-    slot_[(size_t) s].layer = layer;
-    slot_[(size_t) s].expert = expert;
-    slot_[(size_t) s].lru = ++tick_;
-    slot_[(size_t) s].held = true;
+    v.layer = layer;
+    v.expert = expert;
+    v.held = true;
+    v.gate = nullptr;
     index_[(size_t) key] = s;
+    lru_.splice(lru_.end(), lru_, v.lru);
+    layer_slots_.push_back(s);
     return s;
+}
+
+void RingExpertSource::release_layer(int64_t layer, void* after_event) {
+    if (layer != cur_layer_) return;   // nothing acquired for this layer (or the layer has already advanced)
+    for (const int64_t s : layer_slots_) {
+        Slot& sl = slot_[(size_t) s];
+        if (sl.held && sl.layer == layer) { sl.held = false; sl.gate = after_event; }
+    }
+    layer_slots_.clear();
 }
 
 const uint8_t* RingExpertSource::blob(int64_t layer, int64_t expert) {
@@ -956,9 +989,15 @@ const uint8_t* RingExpertSource::device_alias(int64_t layer, int64_t expert) con
 }
 
 void RingExpertSource::begin_layer(int64_t layer, const int32_t* ids, int64_t k) {
-    if (layer != held_layer_) {
+    // **A NEW LAYER'S DISPATCH.**  On the decode path the session loop cannot reach this call for layer `l+1`
+    // until layer `l`'s `post` has run (its doorbell requires `pre[l+1]`, which is stream-ordered after
+    // `post[l]`), so every consumer of layer `l`'s slots is complete and un-protecting them is safe.  The
+    // **prefill** path does NOT call this - its host legitimately runs ahead - so it uses `release_layer` with
+    // an event instead (docs EXPERT_RESIDENCY_FINDINGS §4/§7.4).
+    if (layer != cur_layer_) {
         for (Slot& s : slot_) s.held = false;
-        held_layer_ = layer;
+        layer_slots_.clear();
+        cur_layer_ = layer;
     }
     if (ids != nullptr) {
         for (int64_t i = 0; i < k; ++i)
