@@ -72,38 +72,60 @@ __global__ void fp4_gemv_q8_kernel(const int8_t* __restrict__ xq, const float* _
     __syncthreads();
     if (row >= n_out) return;
 
+    // The weight bytes are read once and never reused: load them NON-TEMPORAL so they stream past L1/L2 instead
+    // of evicting the hot activation `xq` (shader opt #1), and run two blocks with independent accumulators so
+    // two loads are in flight per lane (ILP, opt #2) - the kernel was latency-bound, not bandwidth-bound.
     const uint8_t* wrow = w + row * blocks_per_row * BLOCK_BYTES;
 
-    float acc = 0.0f;
-    for (long long b = lane; b < blocks_per_row; b += 32) {
-        const uint8_t* blk = wrow + b * BLOCK_BYTES;
-        const long long base = b * ELEMS;
-        long long sumi = 0;
-        if (mxfp4) {
-            // Split-half: byte qs[j] low -> elem j, high -> elem j+16; x group = b (32 elems/group).
-            const uint8_t* qs = blk + 1;
-            const int8_t* xg = xq + base;
-            for (int j = 0; j < 16; ++j) {
-                const short p = kv2[qs[j]];
-                sumi += (long long) (signed char) (p & 0xFF)   * xg[j];
-                sumi += (long long) (signed char) (p >> 8)     * xg[16 + j];
-            }
-            acc += fp4_e8m0_to_fp32(blk[0]) * xd[base / 32] * (float) sumi;
-        } else {
-            // 4 sub-blocks of 16, each with its own scale; x group (32) = 2b + s/2.
-            const uint8_t* qs = blk + 4;
-            for (int s = 0; s < 4; ++s) {
-                const int8_t* xg = xq + base + s * 16;
-                const uint8_t* qsb = qs + s * 8;
-                long long ss = 0;
-                for (int j = 0; j < 8; ++j) {
-                    const short p = kv2[qsb[j]];
-                    ss += (long long) (signed char) (p & 0xFF) * xg[j];
-                    ss += (long long) (signed char) (p >> 8)   * xg[8 + j];
-                }
-                acc += fp4_ue4m3_to_fp32(blk[s]) * xd[(base + s * 16) / 32] * (float) ss;
-            }
+    // One FP4 block's integer dot (codes -> kvalues via the packed table, x int8).  `nt` = the streaming read.
+    auto blk_mx = [&](long long b, long long& s) {
+        const uint8_t* qs = wrow + b * BLOCK_BYTES + 1;
+        const int8_t* xg = xq + b * ELEMS;
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            const short p = kv2[__builtin_nontemporal_load(qs + j)];
+            s += (long long) (signed char) (p & 0xFF) * xg[j];
+            s += (long long) (signed char) (p >> 8)   * xg[16 + j];
         }
+    };
+    auto blk_nv = [&](long long b, float& a) {
+        const uint8_t* blk = wrow + b * BLOCK_BYTES;
+        const uint8_t* qs = blk + 4;
+        const long long base = b * ELEMS;
+#pragma unroll
+        for (int s = 0; s < 4; ++s) {
+            const uint8_t* qsb = qs + s * 8;
+            long long ss = 0;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const short p = kv2[__builtin_nontemporal_load(qsb + j)];
+                ss += (long long) (signed char) (p & 0xFF) * xq[base + s * 16 + j];
+                ss += (long long) (signed char) (p >> 8)   * xq[base + s * 16 + 8 + j];
+            }
+            a += fp4_ue4m3_to_fp32(__builtin_nontemporal_load(blk + s)) * xd[(base + s * 16) / 32] * (float) ss;
+        }
+    };
+
+    float acc = 0.0f;
+    long long b = lane;
+    if (mxfp4) {
+        // Each block carries its OWN scale, so two blocks in flight means two float accumulators (not one int).
+        float a0 = 0.0f, a1 = 0.0f;
+        for (; b + 32 < blocks_per_row; b += 64) {
+            long long s0 = 0, s1 = 0;
+            blk_mx(b, s0);
+            blk_mx(b + 32, s1);
+            a0 += fp4_e8m0_to_fp32(__builtin_nontemporal_load(wrow + b * BLOCK_BYTES)) * xd[b] * (float) s0;
+            a1 += fp4_e8m0_to_fp32(__builtin_nontemporal_load(wrow + (b + 32) * BLOCK_BYTES)) * xd[b + 32] * (float) s1;
+        }
+        for (; b < blocks_per_row; b += 32) {        // odd tail
+            long long s = 0;
+            blk_mx(b, s);
+            a0 += fp4_e8m0_to_fp32(__builtin_nontemporal_load(wrow + b * BLOCK_BYTES)) * xd[b] * (float) s;
+        }
+        acc = a0 + a1;
+    } else {
+        for (; b < blocks_per_row; b += 32) blk_nv(b, acc);
     }
     // warp reduce
     for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffffffffffull, acc, o);
