@@ -9,6 +9,7 @@
 // compared to another kernel that shares its decode proves nothing.
 #include "strata/artifact/dequant.hpp"
 #include "strata/kernels/fp4_gemv.hpp"
+#include "strata/kernels/iq_kernels.hpp"
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -280,6 +281,40 @@ void run_q8(bool mxfp4) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    const bool benchmoe = argc > 1 && std::strcmp(argv[1], "--benchmoe") == 0;
+    if (benchmoe) {
+        // The engine's own Q4_K MoE matvec (iq_mmvq type 12) on the SAME shape as the FP4 bench, so the FP4
+        // number can be read against "our other MoE".  Values are irrelevant for timing; buffers are sized right.
+        const long long n_in = argc > 2 ? std::atoll(argv[2]) : 4096;
+        const long long n_out = argc > 3 ? std::atoll(argv[3]) : 32768;
+        const int reps = argc > 4 ? std::atoi(argv[4]) : 50;
+        const size_t rb = strata::kernels::iq_row_bytes(12, n_in);     // Q4_K row bytes
+        const size_t xb = (size_t)(n_in / 32) * 36;                    // block_q8_1 per column (36 B each)
+        std::vector<uint8_t> w(rb * (size_t) n_out, 0x11);
+        std::vector<uint8_t> x(xb, 0x01);
+        uint8_t *d_w=nullptr, *d_x=nullptr; float* d_y=nullptr;
+        check(hipMalloc(&d_w, w.size()), "moe w"); check(hipMalloc(&d_x, x.size()), "moe x");
+        check(hipMalloc(&d_y, (size_t) n_out*4), "moe y");
+        check(hipMemcpy(d_w, w.data(), w.size(), hipMemcpyHostToDevice), "moe cw");
+        check(hipMemcpy(d_x, x.data(), x.size(), hipMemcpyHostToDevice), "moe cx");
+        auto tm = [&]{
+            hipEvent_t s,e; (void)hipEventCreate(&s); (void)hipEventCreate(&e);
+            (void)hipEventRecord(s);
+            strata::kernels::iq_mmvq(12, d_w, d_x, d_y, (int)n_in, (int)n_out, 1, nullptr);
+            (void)hipEventRecord(e); (void)hipEventSynchronize(e);
+            float ms=0; (void)hipEventElapsedTime(&ms,s,e); (void)hipEventDestroy(s); (void)hipEventDestroy(e); return ms;
+        };
+        tm();
+        double t=0; for (int i=0;i<reps;++i) t += tm(); t /= reps;
+        const double ops = (double)n_in * (double)n_out;
+        std::printf("MOE Q4_K iq_mmvq(12)  n_in=%lld n_out=%lld reps=%d  row_bytes=%zu\n",
+                    (long long)n_in,(long long)n_out,reps,rb);
+        std::printf("  %.4f ms  %.3f TOPS  (%.1f GB/s weight stream)\n",
+                    t, ops/1e12/(t/1e3), (double)rb*n_out/1e9/(t/1e3));
+        auto hFree = [](void* p){ (void)hipFree(p); };
+        hFree(d_w); hFree(d_x); hFree(d_y);
+        return 0;
+    }
     const bool bench = argc > 1 && std::strcmp(argv[1], "--bench") == 0;
     const long long n_in = bench && argc > 2 ? std::atoll(argv[2]) : 0;
     const long long n_out = bench && argc > 3 ? std::atoll(argv[3]) : 0;

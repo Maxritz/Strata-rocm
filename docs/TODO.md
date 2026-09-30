@@ -70,16 +70,19 @@ Decision basis for the FP4 matmul kernel, from `hipcc --offload-arch` probes + `
    and x-vectorizing (0.99x, item 2) bought nothing.  Deeper wins need fewer instructions per weight:
    the remaining ~3 instr/element are table-load + fp16->fp32 cvt + FMA.  A shared FLOAT codebook was tried and
    REGRESSED (bank conflicts, 0.363->0.395 ms); a single `__half22float2` per element-pair is the next candidate.
-4. **FP4 int8-activation path (MoE-shaped, Path C) — DONE, parity-green, 3.24x (tied with B++).**
-   `fp4_gemv_q8.cu`: activation quantized to int8 per 32-group, warp-per-row lane-strided (coalesced), integer
-   MAC, warp-shuffle reduce — the exact shape of `iq_kernels.cu`'s `vec_dot_q4_K_q8_1` + `row_dot` +
-   `mmvq_kernel`.  **Measured gfx1201 4096x32768: 0.350 ms / 0.384 TOPS = 3.24x naive; parity green (worst
-   4.5e-5 vs a reference that models the same int8 activation quantization, tol 1e-4).**
-   Honest finding: int MAC ~= fp32 FMA here (3.24x vs 3.19x) — the cost is the DECODE (nibble extract +
-   codebook lookup), not the MAC type, so int8 does not buy the expected win.  Both paths sit ~1.9x over the
-   0.186 ms memory floor (383 GB/s memprobe); decode and memory are NOT overlapping (0.17 + 0.19 ~= 0.35 ms,
-   additive).  The next real lever is overlap/occupancy, not arithmetic.  No FP4 tensor core exists on gfx1201,
-   so ~0.4 TOPS is the practical ceiling for this decode-bound GEMV without a different algorithm.
+4. **FP4 int8-activation path (MoE-shaped) — DONE, 4.01x, parity-green.** `fp4_gemv_q8.cu`: activation
+   quantized to int8 per 32-group, warp-per-row lane-strided (coalesced), integer MAC, warp-shuffle reduce -
+   the shape of `iq_kernels.cu`'s `row_dot` + `mmvq_kernel`.  The decisive optimization was a PACKED 256-entry
+   byte->(two int8 codes) table in shared memory: ONE lookup per byte (two FP4 codes) instead of one divergent
+   lookup per nibble.  **Measured gfx1201 4096x32768: 0.283 ms / 0.475 TOPS = 4.01x naive; parity green (worst
+   4.5e-5 vs a reference that models the same int8 activation quantization).**
+   TARGET COMPARISON (same shape, measured): the engine's own Q4_K MoE matvec `iq_mmvq(12)` runs **1.018 TOPS /
+   572.6 GB/s** - near peak.  FP4 is 2.1x behind, and the reason is structural: Q4_K codes are LINEAR so its
+   inner loop is `shift/and + int MAC` with NO table lookup, while the FP4 E2M1 codebook is NONLINEAR
+   (0,1,2,3,4,6,8,12,...) and needs a (now packed) lookup.  No FP4 tensor core exists on gfx1201.
+   Next lever if pursued: the activation-quantizer kernel is currently inside each `fp4_gemv_q8` call; hoisting
+   it (quantize once per layer/token) and overlapping decode with memory (currently additive: 0.17 + 0.19 ms)
+   are the remaining ~2x.
 
 
 1. **Verify-window nondeterminism (`--spec`).** The native path requires `--spec ≥ 2`, and that window

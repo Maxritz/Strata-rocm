@@ -59,10 +59,20 @@ __global__ void fp4_gemv_q8_kernel(const int8_t* __restrict__ xq, const float* _
     const int BLOCK_BYTES = mxfp4 ? 17 : 36;
     const long long blocks_per_row = n_in / ELEMS;
     const long long row = (long long) blockIdx.x * kQ8Warps + (threadIdx.x >> 5);
-    if (row >= n_out) return;
     const int lane = threadIdx.x & 31;
-    const uint8_t* wrow = w + row * blocks_per_row * BLOCK_BYTES;
     const int8_t* kv = fp4_codebook();
+
+    // Packed 256-entry byte table: kv2[b] = (int8 kv[b>>4] << 8) | (int8 kv[b & 0xF] & 0xFF).  One shared
+    // lookup per BYTE (two FP4 codes) instead of one per nibble - the per-element divergent codebook load was
+    // the cost that put FP4 at 200 GB/s while the linear-code Q4_K MoE kernel reaches 572 GB/s.
+    __shared__ short kv2[256];
+    for (int b = threadIdx.x; b < 256; b += (int) blockDim.x) {
+        kv2[b] = (short) (((int) kv[b >> 4] << 8) | (kv[b & 0x0F] & 0xFF));
+    }
+    __syncthreads();
+    if (row >= n_out) return;
+
+    const uint8_t* wrow = w + row * blocks_per_row * BLOCK_BYTES;
 
     float acc = 0.0f;
     for (long long b = lane; b < blocks_per_row; b += 32) {
@@ -74,9 +84,9 @@ __global__ void fp4_gemv_q8_kernel(const int8_t* __restrict__ xq, const float* _
             const uint8_t* qs = blk + 1;
             const int8_t* xg = xq + base;
             for (int j = 0; j < 16; ++j) {
-                const uint8_t byte = qs[j];
-                sumi += (long long) kv[byte & 0x0Fu]    * xg[j];
-                sumi += (long long) kv[(byte >> 4) & 0x0Fu] * xg[16 + j];
+                const short p = kv2[qs[j]];
+                sumi += (long long) (signed char) (p & 0xFF)   * xg[j];
+                sumi += (long long) (signed char) (p >> 8)     * xg[16 + j];
             }
             acc += fp4_e8m0_to_fp32(blk[0]) * xd[base / 32] * (float) sumi;
         } else {
@@ -87,9 +97,9 @@ __global__ void fp4_gemv_q8_kernel(const int8_t* __restrict__ xq, const float* _
                 const uint8_t* qsb = qs + s * 8;
                 long long ss = 0;
                 for (int j = 0; j < 8; ++j) {
-                    const uint8_t byte = qsb[j];
-                    ss += (long long) kv[byte & 0x0Fu]      * xg[j];
-                    ss += (long long) kv[(byte >> 4) & 0x0Fu] * xg[8 + j];
+                    const short p = kv2[qsb[j]];
+                    ss += (long long) (signed char) (p & 0xFF) * xg[j];
+                    ss += (long long) (signed char) (p >> 8)   * xg[8 + j];
                 }
                 acc += fp4_ue4m3_to_fp32(blk[s]) * xd[(base + s * 16) / 32] * (float) ss;
             }
