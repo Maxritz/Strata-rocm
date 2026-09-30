@@ -340,6 +340,42 @@ struct QsaBuffers {
 uint64_t qsa_buffers_bytes(const ModelGeometry& g, int64_t max_cells);
 uint64_t qsa_buffers_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaBuffers& b);
 
+// ================================ MLA (deepseek2 / GLM-4.7-Flash) ================================
+//
+// The compressed-KV attention of deepseek2/GLM (docs/DEEPSEEK.md §5, verified from llama.cpp).  Kept SEPARATE
+// from QsaState: MLA keeps a `n_lora_kv`-wide latent plus a `n_rot`-wide rope tail per cell (576 for GLM), not
+// two kv heads of 256; and q comes through the q_a/q_b low-rank pair.  The per-cell cache is the latent, so a
+// cell costs `(n_lora_kv + n_rot)` fp16, not `2 * n_head_kv * head_dim`.
+
+struct MlaState {
+    float* rope = nullptr;     ///< max_cells * (n_rot/2) * 2 (cos | sin), f32
+    uint16_t* kv = nullptr;    ///< max_cells * (n_lora_kv + n_rot) fp16: the compressed KV (latent | rope tail)
+    uint16_t* v = nullptr;     ///< max_cells * n_lora_kv fp16: the value latent (the latent half of `kv`)
+    int64_t max_cells = 0;
+    int64_t n_lora_kv = 0;
+    int64_t n_rot = 0;
+};
+
+uint64_t mla_state_bytes(const ModelGeometry& g, int64_t max_cells);
+uint64_t mla_state_init(const ModelGeometry& g, int64_t max_cells, void* base, MlaState& st);
+void mla_state_zero(const MlaState& st, void* stream);
+
+/// Scratch for one MLA layer.  Every buffer is overwritten by every token.
+struct MlaBuffers {
+    uint8_t* x_q8k = nullptr;    ///< n_embd, block_q8_K - the K-quant projections
+    uint16_t* x_f16 = nullptr;   ///< n_embd - the fp16-activation projections
+    float* q_a = nullptr;        ///< n_lora_q: the `wq_a` output, before `attn_q_a_norm`
+    float* q = nullptr;          ///< n_head * head_dim: q_nope | q_pe per head
+    float* kv_a = nullptr;       ///< n_lora_kv + n_rot: the `wkv_a_mqa` output (latent | rope tail)
+    float* kcur = nullptr;       ///< n_head * (n_lora_kv + n_rot): the materialized k (naive path)
+    float* vcur = nullptr;       ///< n_head * head_dim: the materialized v (naive path)
+    float* attn = nullptr;       ///< n_head * head_dim: the attention output before `wo`
+    uint8_t* attn_q8k = nullptr; ///< the `wo` projection's Q8_K activation
+};
+
+uint64_t mla_buffers_bytes(const ModelGeometry& g, int64_t max_cells);
+uint64_t mla_buffers_init(const ModelGeometry& g, int64_t max_cells, void* base, MlaBuffers& b);
+
 /// `x` (n_embd f32) through one QSA layer to `out` (n_embd f32) at sequence position `pos`.
 ///
 /// `pos_base` is the sequence's FIRST cell's position, which the indexer needs and cannot derive - equating a

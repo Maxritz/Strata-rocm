@@ -711,6 +711,61 @@ n += strata::kernels::qsa_decode_attn_scratch_floats(cap, s) * 4 + 16;
 // attn_scratch
 return align_up16(n) + 256;}
 uint64_t qsa_buffers_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaBuffers& b) {    const QsaShapes s = qsa_shapes(g);    const int64_t cap = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);    Cursor c{(uint8_t*) base};    b.x_q8k = c.take_bytes(q8k_bytes(g.n_embd));    b.x_q8_0 = c.take_bytes((uint64_t) (g.n_embd / 32) * 34);    b.x_bf16 = c.take<uint16_t>((uint64_t) g.n_embd);    b.q_full = c.take<float>((uint64_t) g.n_head * 2 * g.head_dim);    b.qcur = c.take<float>((uint64_t) g.n_head * g.head_dim);    b.kcur = c.take<float>((uint64_t) g.n_head_kv * g.head_dim);    b.vcur = c.take<float>((uint64_t) g.n_head_kv * g.head_dim);    b.idx_raw = c.take<float>((uint64_t) g.idx_key_dim);    b.q_idx = c.take<float>((uint64_t) g.idx_q_heads * g.idx_key_dim);    b.cell_scores = c.take<float>((uint64_t) max_cells);    b.ids = c.take<int32_t>((uint64_t) cap);    b.k_scratch = c.take<uint16_t>((uint64_t) cap * g.n_head_kv * g.head_dim);    b.v_scratch = c.take<uint16_t>((uint64_t) cap * g.n_head_kv * g.head_dim);    b.attn = c.take<float>((uint64_t) g.n_head * g.head_dim);    b.attn16 = c.take<uint16_t>((uint64_t) g.n_head * g.head_dim);    b.attn32 = c.take<float>((uint64_t) g.n_head * g.head_dim);    b.attn_q8k = c.take_bytes(q8k_bytes(g.n_head * g.head_dim));    b.attn_scratch = c.take<float>(strata::kernels::qsa_decode_attn_scratch_floats(cap, s));    return c.used;}
+// ================================ MLA (deepseek2 / GLM-4.7-Flash) ================================
+// The compressed-KV attention of deepseek2 (docs/DEEPSEEK.md §5).  The per-cell cache is the LATENT (n_lora_kv)
+// plus the rope tail (n_rot), so a cell is 576 fp16 for GLM, not 2 kv heads of 256.
+uint64_t mla_state_bytes(const ModelGeometry& g, int64_t max_cells) {
+    uint64_t n = 0;
+    n += (uint64_t) max_cells * (uint64_t) (g.n_rot / 2) * 2 * 4;                  // rope cos/sin f32
+    n += (uint64_t) max_cells * (uint64_t) (g.n_lora_kv + g.n_rot) * 2;            // kv (latent | rope) fp16
+    n += (uint64_t) max_cells * (uint64_t) g.n_lora_kv * 2;                        // v latent fp16
+    return align_up16(n) + 256;
+}
+uint64_t mla_state_init(const ModelGeometry& g, int64_t max_cells, void* base, MlaState& st) {
+    Cursor c{(uint8_t*) base};
+    st.rope = c.take<float>((uint64_t) max_cells * (uint64_t) (g.n_rot / 2) * 2);
+    st.kv = c.take<uint16_t>((uint64_t) max_cells * (uint64_t) (g.n_lora_kv + g.n_rot));
+    st.v = c.take<uint16_t>((uint64_t) max_cells * (uint64_t) g.n_lora_kv);
+    st.max_cells = max_cells;
+    st.n_lora_kv = g.n_lora_kv;
+    st.n_rot = g.n_rot;
+    return c.used;
+}
+void mla_state_zero(const MlaState& st, void* stream) {
+    if (st.kv != nullptr)
+        (void) hipMemsetAsync(st.kv, 0, (size_t) st.max_cells * (size_t) (st.n_lora_kv + st.n_rot) * 2,
+                              (hipStream_t) stream);
+    if (st.v != nullptr)
+        (void) hipMemsetAsync(st.v, 0, (size_t) st.max_cells * (size_t) st.n_lora_kv * 2, (hipStream_t) stream);
+}
+uint64_t mla_buffers_bytes(const ModelGeometry& g, int64_t max_cells) {
+    (void) max_cells;
+    uint64_t n = 0;
+    n += (uint64_t) q8k_bytes(g.n_embd);
+    n += (uint64_t) g.n_embd * 2;
+    n += (uint64_t) g.n_lora_q * 4;
+    n += (uint64_t) g.n_head * (uint64_t) g.head_dim * 4;
+    n += (uint64_t) (g.n_lora_kv + g.n_rot) * 4;
+    n += (uint64_t) g.n_head * (uint64_t) (g.n_lora_kv + g.n_rot) * 4;
+    n += (uint64_t) g.n_head * (uint64_t) g.head_dim * 4;
+    n += (uint64_t) g.n_head * (uint64_t) g.head_dim * 4;
+    n += (uint64_t) q8k_bytes(g.n_head * g.head_dim);
+    return align_up16(n) + 256;
+}
+uint64_t mla_buffers_init(const ModelGeometry& g, int64_t max_cells, void* base, MlaBuffers& b) {
+    (void) max_cells;
+    Cursor c{(uint8_t*) base};
+    b.x_q8k = c.take_bytes(q8k_bytes(g.n_embd));
+    b.x_f16 = c.take<uint16_t>((uint64_t) g.n_embd);
+    b.q_a = c.take<float>((uint64_t) g.n_lora_q);
+    b.q = c.take<float>((uint64_t) g.n_head * (uint64_t) g.head_dim);
+    b.kv_a = c.take<float>((uint64_t) (g.n_lora_kv + g.n_rot));
+    b.kcur = c.take<float>((uint64_t) g.n_head * (uint64_t) (g.n_lora_kv + g.n_rot));
+    b.vcur = c.take<float>((uint64_t) g.n_head * (uint64_t) g.head_dim);
+    b.attn = c.take<float>((uint64_t) g.n_head * (uint64_t) g.head_dim);
+    b.attn_q8k = c.take_bytes(q8k_bytes(g.n_head * g.head_dim));
+    return c.used;
+}
 // ================================ PER-STAGE TIMING, DEBUG ONLY ================================
 //
 // **THE ENGINE SPENDS 1.047 ms PER LAYER WITH THE EXPERTS OFF, AND EVERY COST MODEL IN `bench/` PREDICTS LESS
