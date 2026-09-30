@@ -1395,22 +1395,31 @@ int main(int argc, char** argv) {
         // authority on its own geometry.  Read every field the prompt path needs.
         try {
             strata::GgufFile model_gguf(o.native_preset);
-            const auto u = [&](const char* k, int64_t dflt) -> int64_t {
-                const strata::MetaValue* v = model_gguf.get(k);
-                return v ? (int64_t) v->u : dflt;
+            // **THE MODEL'S OWN ARCHITECTURE PREFIX.**  Every family spells the same keys under its own
+            // `general.architecture` (qwen4exp, qwen35moe, deepseek2, k2-horizon, ...); read it first and prefix
+            // with it.  A missing key still returns the default, so an unsupported geometry is refused by the
+            // guard below rather than run with a wrong number (docs/TODO.md P1 #12).
+            std::string arch = "qwen4exp";
+            if (const strata::MetaValue* a = model_gguf.get("general.architecture");
+                a != nullptr && a->type == strata::MetaType::STRING) {
+                arch = a->s;
+            }
+            const auto u = [&](const char* key, int64_t dflt) -> int64_t {
+                const strata::MetaValue* v = model_gguf.get((arch + "." + key).c_str());
+                return v != nullptr && v->is_num() ? (int64_t) v->u : dflt;
             };
-            g.n_expert = u("qwen4exp.expert_count", g.n_expert);
-            K = u("qwen4exp.expert_used_count", K);
-            g.n_layers = u("qwen4exp.block_count", g.n_layers);
-            g.n_embd = u("qwen4exp.embedding_length", g.n_embd);
-            g.n_head = u("qwen4exp.attention.head_count", g.n_head);
-            g.n_head_kv = u("qwen4exp.attention.head_count_kv", g.n_head_kv);
-            g.head_dim = u("qwen4exp.attention.key_length", g.head_dim);
-            g.n_ff = u("qwen4exp.expert_feed_forward_length", g.n_ff);
-            g.qsa_interval = u("qwen4exp.full_attention_interval", g.qsa_interval);
-            g.hc = u("qwen4exp.hyper_connection.count", g.hc);
-            g.hc_lr = u("qwen4exp.hyper_connection.low_rank", g.hc_lr);
-            g.ssm_state_size = u("qwen4exp.ssm.state_size", g.ssm_state_size);
+            g.n_expert = u("expert_count", g.n_expert);
+            K = u("expert_used_count", K);
+            g.n_layers = u("block_count", g.n_layers);
+            g.n_embd = u("embedding_length", g.n_embd);
+            g.n_head = u("attention.head_count", g.n_head);
+            g.n_head_kv = u("attention.head_count_kv", g.n_head_kv);
+            g.head_dim = u("attention.key_length", g.head_dim);
+            g.n_ff = u("expert_feed_forward_length", g.n_ff);
+            g.qsa_interval = u("full_attention_interval", g.qsa_interval);
+            g.hc = u("hyper_connection.count", g.hc);
+            g.hc_lr = u("hyper_connection.low_rank", g.hc_lr);
+            g.ssm_state_size = u("ssm.state_size", g.ssm_state_size);
         } catch (const std::exception& e) {
             std::fprintf(stderr, "strata generate: reading the model's geometry from %s: %s\n",
                          o.native_preset.c_str(), e.what());
@@ -1668,10 +1677,6 @@ int main(int argc, char** argv) {
                      arena_src.load_gib_per_second());
         srcp = &arena_src;
     }
-    // The ring is transient (its slots are reused); disable the async MMQ prefill gather against it, which would
-    // read a slot the ring already reused - "gather_native: unspecified launch failure" (the docs section 15.5
-    // step 2 release is not wired yet).  A persistent source (arena/mmap) is unaffected.
-    strata::prefill::Prefill::set_source_transient(srcp != nullptr && srcp->transient());
     // Plan v0.3 P6: the MTP draft layer, loaded before the VRAM expert tier is sized from what is left.
     strata::core::MtpDrafter mtp;
     if (!o.mtp.empty()) {
