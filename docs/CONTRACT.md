@@ -52,6 +52,11 @@ ck_tile's `amdgcn_mma` layout (`G:\ROCM10RT-gfx1201\include\ck_tile\core\arch\mm
 - **Acceptance:** (a) `wmma_iu4_parity` green vs a scalar int4 reference on a 16×16×16 tile and a tiled 128×128;
   (b) measured **≥ 40 T-MAC/s** on a realistic tiled GEMM at the expert shape; (c) wired into prefill's MMQ slot
   with G-COH re-run green.
+- **K1a DONE (2026-10-01, `eeba8e7`):** 16×16×16 fragment layout (RDNA4 ISA §7.12.2) + signed-int4 MMA —
+  parity PASS 0/256.  The fragment-layout risk is retired.
+- **K1b OPEN:** tiled GEMM parity PASS (0 wrong) but **7.5–11 T-MAC/s** unstaged (`f76d5a2`) / 5.9–7.0 LDS-staged.
+  Both are latency/sync-bound (2 MMAs per `__syncthreads`), not compute-bound; bank-padding regressed.  Needs the
+  standard GEMM engineering: double-buffered LDS, ≥8 MMAs per barrier, vectorized 128-bit loads, higher tile.
 - **Owner-clause:** do not enable until (a) and (b) pass.
 
 ### K2 — MXFP4 / NVFP4 tensor-core path  *(TODO §6: the RDNA4 FP4 path and WMMA are the SAME project)*
