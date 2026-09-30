@@ -253,7 +253,8 @@ struct Options {
     /// this probability under the draft layer; 0 = always --spec-1 drafts.
     double spec_min_p = 0.0;
     /// Stop when the model emits an end-of-turn token (<|endoftext|> 248044, <|im_end|> 248046, or --eos-ids).
-    bool stop_eos = false;
+    /// On by default: a text generator must stop at the turn boundary or it degenerates after a correct answer.
+    bool stop_eos = true;
     std::vector<int64_t> eos_ids = {248044, 248046};
     bool spec_split = false;   ///< opt-in split verify window (the overlap study: exact, ~7% slower)
     /// Plan v0.3 P8: stay resident and take requests on stdin (see the --serve block in main).
