@@ -360,21 +360,54 @@ uint64_t mla_state_bytes(const ModelGeometry& g, int64_t max_cells);
 uint64_t mla_state_init(const ModelGeometry& g, int64_t max_cells, void* base, MlaState& st);
 void mla_state_zero(const MlaState& st, void* stream);
 
-/// Scratch for one MLA layer.  Every buffer is overwritten by every token.
+/// Scratch for one MLA layer.  Every buffer is overwritten by every token.  `head_dim` is the MLA head width
+/// (`attention.key_length_mla`, 256 for GLM): `nope = head_dim - n_rot`.
 struct MlaBuffers {
-    uint8_t* x_q8k = nullptr;    ///< n_embd, block_q8_K - the K-quant projections
-    uint16_t* x_f16 = nullptr;   ///< n_embd - the fp16-activation projections
+    uint8_t* x_q8k = nullptr;    ///< n_embd, block_q8_K - reserved; the native projections quantize the FP32 x
     float* q_a = nullptr;        ///< n_lora_q: the `wq_a` output, before `attn_q_a_norm`
-    float* q = nullptr;          ///< n_head * head_dim: q_nope | q_pe per head
+    float* q = nullptr;          ///< n_head * head_dim: the `wq_b` output, nope | pe per head
+    float* q_nope = nullptr;     ///< n_head * nope: the split nope half
+    float* q_pe = nullptr;       ///< n_head * n_rot: the split pe half, rotated in place
+    float* q_abs = nullptr;      ///< n_head * n_lora_kv: the absorbed q_nope (`wk_b` applied per head)
     float* kv_a = nullptr;       ///< n_lora_kv + n_rot: the `wkv_a_mqa` output (latent | rope tail)
-    float* kcur = nullptr;       ///< n_head * (n_lora_kv + n_rot): the materialized k (naive path)
-    float* vcur = nullptr;       ///< n_head * head_dim: the materialized v (naive path)
-    float* attn = nullptr;       ///< n_head * head_dim: the attention output before `wo`
+    float* attn_latent = nullptr;///< n_head * n_lora_kv: the attention output over the absorbed latent
+    float* attn = nullptr;       ///< n_head * head_dim: the attention output after the `wv_b` up-projection
+    float* scores = nullptr;     ///< max_cells: the attention's per-head cell scores scratch
     uint8_t* attn_q8k = nullptr; ///< the `wo` projection's Q8_K activation
+    int32_t* pos = nullptr;      ///< 1 device int32: the token's sequence position
 };
 
 uint64_t mla_buffers_bytes(const ModelGeometry& g, int64_t max_cells);
 uint64_t mla_buffers_init(const ModelGeometry& g, int64_t max_cells, void* base, MlaBuffers& b);
+
+/// The native GGUF projections of one MLA layer (docs/DEEPSEEK.md §6): every pointer is a device address into
+/// the raw GGUF blocks and every `*_type` is the ggml type id `native_mmvq` dispatches on.  `wk_b`/`wv_b` are
+/// 3-D and head-major: `mla_layer` steps `native_mmvq_weight_bytes(type, ne0, ne1)` per head.
+struct MlaWeights {
+    const void* wq_a = nullptr;
+    int wq_a_type = -1;
+    const void* wq_b = nullptr;
+    int wq_b_type = -1;
+    const void* wkv_a_mqa = nullptr;
+    int wkv_a_type = -1;
+    const void* wk_b = nullptr;   ///< [nope, n_lora_kv, n_head]
+    int wk_b_type = -1;
+    const void* wv_b = nullptr;   ///< [n_lora_kv, head_dim, n_head]
+    int wv_b_type = -1;
+    const void* wo = nullptr;
+    int wo_type = -1;
+    const float* q_a_norm = nullptr;    ///< attn_q_a_norm.weight, [n_lora_q]
+    const float* kv_a_norm = nullptr;   ///< attn_kv_a_norm.weight, [n_lora_kv]
+    void* q8_1 = nullptr;               ///< native_q8_1_bytes(max contraction), shared by one ordered stream
+    float norm_eps = 1e-5f;
+    float rope_freq_base = 1000000.0f;  ///< `rope.freq_base`
+};
+
+/// `x` (n_embd f32) through one MLA layer to `out` (n_embd f32) at sequence position `pos`.  The current cell is
+/// appended to `st.kv`/`st.v` (fp16) and attention runs over cells `[0, pos]`.  Returns false and fills `err` on a
+/// missing pointer, an unsupported type or a shape the geometry does not admit.
+bool mla_layer(const ModelGeometry& g, const MlaWeights& w, const MlaState& st, const MlaBuffers& b, const float* x,
+               float* out, int32_t pos, void* stream, std::string& err);
 
 /// `x` (n_embd f32) through one QSA layer to `out` (n_embd f32) at sequence position `pos`.
 ///

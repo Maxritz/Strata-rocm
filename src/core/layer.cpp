@@ -25,6 +25,7 @@
 #include "strata/kernels/native_qsa_indexer.hpp"
 #include "strata/kernels/native_rope.hpp"
 #include "strata/kernels/native_flash_attn.hpp"
+#include "strata/kernels/mla.hpp"
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/kernels/cvec.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
@@ -739,32 +740,109 @@ void mla_state_zero(const MlaState& st, void* stream) {
         (void) hipMemsetAsync(st.v, 0, (size_t) st.max_cells * (size_t) st.n_lora_kv * 2, (hipStream_t) stream);
 }
 uint64_t mla_buffers_bytes(const ModelGeometry& g, int64_t max_cells) {
-    (void) max_cells;
+    const int64_t nope = g.head_dim - g.n_rot;
     uint64_t n = 0;
     n += (uint64_t) q8k_bytes(g.n_embd);
-    n += (uint64_t) g.n_embd * 2;
     n += (uint64_t) g.n_lora_q * 4;
     n += (uint64_t) g.n_head * (uint64_t) g.head_dim * 4;
+    n += (uint64_t) g.n_head * (uint64_t) nope * 4;
+    n += (uint64_t) g.n_head * (uint64_t) g.n_rot * 4;
+    n += (uint64_t) g.n_head * (uint64_t) g.n_lora_kv * 4;
     n += (uint64_t) (g.n_lora_kv + g.n_rot) * 4;
-    n += (uint64_t) g.n_head * (uint64_t) (g.n_lora_kv + g.n_rot) * 4;
+    n += (uint64_t) g.n_head * (uint64_t) g.n_lora_kv * 4;
     n += (uint64_t) g.n_head * (uint64_t) g.head_dim * 4;
-    n += (uint64_t) g.n_head * (uint64_t) g.head_dim * 4;
+    n += (uint64_t) max_cells * 4;
     n += (uint64_t) q8k_bytes(g.n_head * g.head_dim);
+    n += 4;
     return align_up16(n) + 256;
 }
 uint64_t mla_buffers_init(const ModelGeometry& g, int64_t max_cells, void* base, MlaBuffers& b) {
-    (void) max_cells;
+    const int64_t nope = g.head_dim - g.n_rot;
     Cursor c{(uint8_t*) base};
     b.x_q8k = c.take_bytes(q8k_bytes(g.n_embd));
-    b.x_f16 = c.take<uint16_t>((uint64_t) g.n_embd);
     b.q_a = c.take<float>((uint64_t) g.n_lora_q);
     b.q = c.take<float>((uint64_t) g.n_head * (uint64_t) g.head_dim);
+    b.q_nope = c.take<float>((uint64_t) g.n_head * (uint64_t) nope);
+    b.q_pe = c.take<float>((uint64_t) g.n_head * (uint64_t) g.n_rot);
+    b.q_abs = c.take<float>((uint64_t) g.n_head * (uint64_t) g.n_lora_kv);
     b.kv_a = c.take<float>((uint64_t) (g.n_lora_kv + g.n_rot));
-    b.kcur = c.take<float>((uint64_t) g.n_head * (uint64_t) (g.n_lora_kv + g.n_rot));
-    b.vcur = c.take<float>((uint64_t) g.n_head * (uint64_t) g.head_dim);
+    b.attn_latent = c.take<float>((uint64_t) g.n_head * (uint64_t) g.n_lora_kv);
     b.attn = c.take<float>((uint64_t) g.n_head * (uint64_t) g.head_dim);
+    b.scores = c.take<float>((uint64_t) max_cells);
     b.attn_q8k = c.take_bytes(q8k_bytes(g.n_head * g.head_dim));
+    b.pos = c.take<int32_t>(1);
     return c.used;
+}
+// The MLA forward of docs/DEEPSEEK.md section 5, in its ABSORBED form (the only one the raw GGUF packing admits:
+// `attn_k_b` is `[nope, kv_lora, n_head]` with nope contiguous, so `native_mmvq` can contract it in the
+// `nope -> kv_lora` direction and no other).  Every projection is `native_mmvq`; the norms are
+// `rms_norm_weighted`; the rotation is `mla_rope`; the softmax attention is `mla_attention`.
+bool mla_layer(const ModelGeometry& g, const MlaWeights& w, const MlaState& st, const MlaBuffers& b, const float* x,
+               float* out, int32_t pos, void* stream, std::string& err) {
+    using namespace strata::kernels;
+    const int64_t nope = g.head_dim - g.n_rot;
+    if (nope <= 0 || g.n_lora_q <= 0 || g.n_lora_kv <= 0 || g.n_head <= 0 || g.n_rot <= 0 || g.n_rot % 2 != 0) {
+        err = "mla_layer: the MLA geometry is not a positive shape";
+        return false;
+    }
+    if (pos < 0 || pos >= st.max_cells) {
+        err = "mla_layer: position " + std::to_string(pos) + " is outside the KV state's " +
+              std::to_string(st.max_cells) + " cells";
+        return false;
+    }
+    if (!w.wq_a || !w.wq_b || !w.wkv_a_mqa || !w.wk_b || !w.wv_b || !w.wo || !w.q_a_norm || !w.kv_a_norm ||
+        !w.q8_1 || !b.q_a || !b.q || !b.q_nope || !b.q_pe || !b.q_abs || !b.kv_a || !b.attn_latent || !b.attn ||
+        !b.scores || !b.pos || !st.kv || !st.v || !x || !out || !stream) {
+        err = "mla_layer: a required weight, buffer or stream is null";
+        return false;
+    }
+    const int types[] = {w.wq_a_type, w.wq_b_type, w.wkv_a_type, w.wk_b_type, w.wv_b_type, w.wo_type};
+    for (int t : types) {
+        if (!native_mmvq_supported(t)) {
+            err = "mla_layer: projection type " + std::to_string(t) + " has no native MMVQ";
+            return false;
+        }
+    }
+    try {
+        native_quantize_q8_1(x, w.q8_1, (int) g.n_embd, 1, stream);
+        native_mmvq(w.wq_a_type, w.wq_a, w.q8_1, b.q_a, (int) g.n_embd, (int) g.n_lora_q, 1, stream);
+        native_mmvq(w.wkv_a_type, w.wkv_a_mqa, w.q8_1, b.kv_a, (int) g.n_embd, (int) (g.n_lora_kv + g.n_rot), 1,
+                    stream);
+        rms_norm_weighted(b.q_a, w.q_a_norm, 1, g.n_lora_q, w.norm_eps, stream);
+        rms_norm_weighted(b.kv_a, w.kv_a_norm, 1, g.n_lora_kv, w.norm_eps, stream);
+        native_quantize_q8_1(b.q_a, w.q8_1, (int) g.n_lora_q, 1, stream);
+        native_mmvq(w.wq_b_type, w.wq_b, w.q8_1, b.q, (int) g.n_lora_q, (int) (g.n_head * g.head_dim), 1, stream);
+        mla_split_q(b.q, b.q_nope, b.q_pe, g.n_head, nope, g.n_rot, stream);
+        if (hipMemcpyAsync(b.pos, &pos, sizeof(int32_t), hipMemcpyHostToDevice, (hipStream_t) stream) != hipSuccess) {
+            err = "mla_layer: the position upload failed";
+            return false;
+        }
+        mla_rope(b.q_pe, b.q_pe, g.n_head, g.n_rot, w.rope_freq_base, b.pos, stream);
+        mla_rope(b.kv_a + g.n_lora_kv, b.kv_a + g.n_lora_kv, 1, g.n_rot, w.rope_freq_base, b.pos, stream);
+        mla_write_kv(st.kv, st.v, b.kv_a, b.kv_a + g.n_lora_kv, pos, g.n_lora_kv, g.n_rot, stream);
+        const size_t wk_stride = native_mmvq_weight_bytes(w.wk_b_type, (int) nope, (int) g.n_lora_kv);
+        for (int64_t h = 0; h < g.n_head; ++h) {
+            native_quantize_q8_1(b.q_nope + h * nope, w.q8_1, (int) nope, 1, stream);
+            native_mmvq(w.wk_b_type, (const uint8_t*) w.wk_b + h * wk_stride, w.q8_1,
+                        b.q_abs + h * g.n_lora_kv, (int) nope, (int) g.n_lora_kv, 1, stream);
+        }
+        const float scale = 1.0f / std::sqrt((float) g.head_dim);
+        mla_attention(b.q_abs, b.q_pe, st.kv, st.v, pos + 1, g.n_head, g.n_lora_kv, g.n_rot, scale, b.scores,
+                      b.attn_latent, stream);
+        const size_t wv_stride = native_mmvq_weight_bytes(w.wv_b_type, (int) g.n_lora_kv, (int) g.head_dim);
+        for (int64_t h = 0; h < g.n_head; ++h) {
+            native_quantize_q8_1(b.attn_latent + h * g.n_lora_kv, w.q8_1, (int) g.n_lora_kv, 1, stream);
+            native_mmvq(w.wv_b_type, (const uint8_t*) w.wv_b + h * wv_stride, w.q8_1, b.attn + h * g.head_dim,
+                        (int) g.n_lora_kv, (int) g.head_dim, 1, stream);
+        }
+        const int64_t attn_in = g.n_head * g.head_dim;
+        native_quantize_q8_1(b.attn, w.q8_1, (int) attn_in, 1, stream);
+        native_mmvq(w.wo_type, w.wo, w.q8_1, out, (int) attn_in, (int) g.n_embd, 1, stream);
+    } catch (const std::exception& error) {
+        err = std::string("mla_layer: ") + error.what();
+        return false;
+    }
+    return true;
 }
 // ================================ PER-STAGE TIMING, DEBUG ONLY ================================
 //

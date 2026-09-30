@@ -120,5 +120,25 @@ n_out rows, which matches the projection shapes in §5.
 The same holds for every new family's K-quant projections (M1 qwen35moe Q4_K, M3 k2-horizon Q4_K, laguna
 IQ4_XS): no canonicalization pass is required.
 
+---
+
+## 7. Progress
+
+- **M2 step 4 — the MLA forward is implemented and parity-green (2026-10-01).**  `mla_layer`
+  (`src/core/layer.cpp`, declared in `include/strata/core/layer.hpp`) composes the §5 ABSORBED forward from
+  `native_mmvq`, `rms_norm_weighted` and three new core kernels (`src/kernels/cuda/mla.cu`:
+  `mla_split_q`/`mla_rope`/`mla_write_kv`/`mla_attention`).  The ABSORBED form is the only one the packed
+  weights admit: `attn_k_b` is stored `[nope, kv_lora, n_head]` with `nope` contiguous, so `native_mmvq` can
+  contract it in the `nope -> kv_lora` direction and no other; the unabsorbed `k = latent @ wk_b` would need a
+  transpose the raw GGUF blocks do not admit without a canonicalization pass (§6 rules that out).
+- **Evidence.**  `build_gfx1201\mla_parity.exe --selftest` (gfx1201): core kernels bit-exact for the split and
+  the KV write, `mla_rope` 3.9e-6 and `mla_attention` 2.7e-7 (both vs a double reference, term-relative); the
+  WHOLE `mla_layer` over 3 positions vs a double reference that models the Q8_0 weights and the Q8_1 activation
+  quantization: **worst L1 8.6e-4** (the contract's G-COH bar is 1e-3).  The residual is the chained projections
+  each re-quantizing their own input, not the core math.
+- **Still OPEN for M2:** the deepseek2 MoE variant (sigmoid gating + `exp_probs_b` selection bias, top-4,
+  weights-norm + scale 1.8, the ungated shared expert), the dense layer-0 FFN, native serving of the 3-D
+  `attn_k_b`/`attn_v_b`, and the decode/prefill wiring from `generate.cpp`/`session.cpp`.
+
 
 
