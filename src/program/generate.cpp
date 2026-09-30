@@ -1420,6 +1420,12 @@ int main(int argc, char** argv) {
             g.hc = u("hyper_connection.count", g.hc);
             g.hc_lr = u("hyper_connection.low_rank", g.hc_lr);
             g.ssm_state_size = u("ssm.state_size", g.ssm_state_size);
+            // MLA (deepseek2/deepseek4): selected by architecture, with the low-rank widths and the rotated
+            // head dims from the GGUF (docs/DEEPSEEK.md §5).  The qwen4exp path leaves these at 0.
+            g.mla = (arch == "deepseek2" || arch == "deepseek4") ? 1 : 0;
+            g.n_lora_q = u("attention.q_lora_rank", g.n_lora_q);
+            g.n_lora_kv = u("attention.kv_lora_rank", g.n_lora_kv);
+            g.n_rot = u("rope.dimension_count", g.n_rot);
         } catch (const std::exception& e) {
             std::fprintf(stderr, "strata generate: reading the model's geometry from %s: %s\n",
                          o.native_preset.c_str(), e.what());

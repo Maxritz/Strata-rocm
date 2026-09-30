@@ -44,6 +44,14 @@ struct ModelGeometry {
     int64_t idx_q_heads = 4;
     int64_t idx_key_dim = 128;
 
+    // MLA attention (deepseek2 / GLM-4.7-Flash).  `mla == 1` selects the compressed-KV path: q/kv are produced
+    // through low-rank projections, `n_rot` of each head is rotated, and the rest is the "nope" half.  See
+    // docs/DEEPSEEK.md §5 for the verified forward (from the vendored llama.cpp `deepseek2.cpp`).
+    int64_t mla = 0;             ///< 1 = every layer is MLA attention (no GDN/QSA mix)
+    int64_t n_lora_q = 0;        ///< q low-rank width (768 for GLM-4.7-Flash)
+    int64_t n_lora_kv = 0;       ///< kv latent width (512)
+    int64_t n_rot = 64;          ///< rotated dims of head_dim (rope applied to q and to the kv rope tail)
+
     // gated residual, on every layer
     int64_t hc = 4;
     int64_t hc_lr = 320;
