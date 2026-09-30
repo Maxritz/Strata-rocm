@@ -75,6 +75,12 @@ Qwen3.5-35B-A3B / qwen-agentworld-nvfp4 / gpt-oss-120b.
 Requirement: repack the MXFP4 17-byte block to a 16-byte-aligned layout so `raw_buffer_load_lds` and 128-bit
 loads vectorize (the 17-byte stride currently defeats them).
 - **Acceptance:** `fp4_gemv_q8` ≥ previous 1.140 TOPS AND the repack is a lossless relayout (byte-parity test).
+- **DONE (2026-10-01):** `include/strata/kernels/fp4_repack.hpp` splits each tensor into a SCALE array and a
+  **16-byte-aligned DATA array** (SoA) — MXFP4 1+16 B, NVFP4 4+32 B per block, copied verbatim.  `fp4_gemv_q8`
+  is untouched (still 1.140 TOPS, contract method).  `bench/micro/fp4_repack_parity.cu` decodes the ggml layout
+  and the repacked layout on the device and requires bit-identical floats:
+  `fp4_repack_parity.exe 1048576` → **0 wrong values, data 16B-aligned yes, PASS**.
+  Follow-on (K2/K4): make the batched kernel read the aligned DATA array with `uint4` loads.
 
 ### K4 — fuse gate/up/down into one expert kernel (Mega-MoE)
 - **Acceptance:** parity vs the 3-kernel path; fewer launches; measured end-to-end gain.
