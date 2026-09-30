@@ -179,7 +179,10 @@ __global__ void __launch_bounds__(THREADS) gr_norm_multi_kernel(GrMulti m) {
     for (int i = t; i < D; i += THREADS) xn[i] *= s_rs[i / N];
 }
 
-constexpr int TILE = 2560;             // xn floats per token staged at a time: 320 chunks of 8, 10 per lane
+constexpr int TILE = 1280;             // xn floats per token staged at a time: 160 chunks of 8, 5 per lane.
+                                       // Was 2560, which made window 8 (kFusedGrMaxT) need 80 KB of LDS - over
+                                       // RDNA4's 64 KB opt-in ceiling, so --spec 6 aborted.  TILE must divide
+                                       // D=10240 (1280 -> 8 tiles); smaller tile = smaller T*TILE LDS.
 constexpr int TQ = TILE / 8 / 32;      // uint4 weight chunks per lane per tile
 
 // Step 2 of `gr_down_kernel` for T tokens.  One warp per row (so each lane accumulates the same chunks in the

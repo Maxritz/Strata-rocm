@@ -1730,12 +1730,15 @@ int main(int argc, char** argv) {
         // (with borrowing - the default with a profile - the prompt path lends cache slots instead)
         const bool borrow = !o.no_prefill_borrow && !o.expert_profile.empty();
         const int64_t prefill_mib = (o.prefill_chunk > 0 && !borrow) ? 160 + (o.prefill_chunk * 680) / 1024 : 0;
+        // NOTE: the MTP draft layer's VRAM is allocated in mtp.load() (mtp.cpp:135/144), which runs BEFORE this
+        // sizing, so hipMemGetInfo already excludes it - do NOT reserve it again here (that double-count shrank
+        // the cache for nothing).
         const int64_t reserve = ((int64_t) o.vram_reserve_mib + prefill_mib) << 20;
         int64_t slots = ((int64_t) free_b - reserve) / (int64_t) strata::kernels::cpu::expert_layout().max_blob;
         if (!profile.empty()) slots = std::min<int64_t>(slots, (int64_t) profile.size());
         o.expert_cache = (int) std::max<int64_t>(slots, 0);
         std::fprintf(stderr, "strata generate: expert cache auto: %.2f GiB free, %d MiB reserved -> %d slots\n",
-                     (double) free_b / 1073741824.0, o.vram_reserve_mib, o.expert_cache);
+                     (double) free_b / 1073741824.0, o.vram_reserve_mib + (int) prefill_mib, o.expert_cache);
     }
     // plan v0.3 P6: a native pack's blobs differ per layer, so with a profile its slots are sized per pair: the
     // same VRAM holds ~30% more IQ3_XXS experts than slots of the largest blob would
@@ -2571,6 +2574,7 @@ int main(int argc, char** argv) {
         uint64_t borrow_bytes = 0;
         int32_t lend_first = -1;          // the first slot the prompt path may borrow (its largest chunk)
         int32_t lend_first_now = -1;      // where its buffers are laid out now
+        strata::prefill::Prefill::set_geometry(g, ss);   // size the lend with the real geometry (see the token path)
         // a cache too small to lend the prompt path its buffers would make it allocate them on top - on a card the
         // cache already filled to its reserve, that is the over-subscription the auto sizing avoids - so the
         // prompt chunk is halved until its buffers fit in the lendable slots (a smaller chunk only reads slower)
@@ -3500,6 +3504,9 @@ int main(int argc, char** argv) {
     if (o.prefill_chunk > 0 && n_prompt > 1) {
         void* borrow = nullptr;
         uint64_t borrow_bytes = 0;
+        // Size the chunk buffers with the REAL geometry before the lend (plan_lend -> bytes_needed).  Without
+        // this the lend uses the prefill globals' stale/zero defaults and comes out short of what carve() needs.
+        strata::prefill::Prefill::set_geometry(g, ss);
         if (!o.no_prefill_borrow && !host_res.empty() && d_res != nullptr) {
             int64_t chunk = o.prefill_chunk;
             int64_t k = plan_lend(chunk);             // auto: the largest chunk that fits; fixed: halved to fit
@@ -3528,6 +3535,13 @@ int main(int argc, char** argv) {
                                                      : (uint64_t) k * (uint64_t) blob;
                 std::fprintf(stderr, "strata generate: prompt path borrows %lld cache slots (%.2f GiB)\n", (long long) k,
                              (double) borrow_bytes / 1073741824.0);
+                // P0 probe: the lend is derived from bytes_needed, so borrow_bytes must cover it.  If it does not,
+                // the count path and the take path disagree - print the delta before prefill.init can fail.
+                const uint64_t need = strata::prefill::Prefill::bytes_needed(g, ss, o.prefill_chunk);
+                if (borrow_bytes < need)
+                    std::fprintf(stderr, "strata generate: PROBE lend short: borrow_bytes=%llu need=%llu (delta=%lld)\n",
+                                 (unsigned long long) borrow_bytes, (unsigned long long) need,
+                                 (long long) need - (long long) borrow_bytes);
             }
         }
         if (borrow == nullptr)

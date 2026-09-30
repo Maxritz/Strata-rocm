@@ -61,6 +61,11 @@ public:
     /// Device bytes `init` needs for a chunk of `chunk` tokens (what a borrowed region must hold).
     static uint64_t bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk);
 
+    /// Set the process-wide geometry the chunk buffers (and `bytes_needed`) are sized from.  `init` calls it,
+    /// but a caller that sizes a borrow (plan_lend -> bytes_needed) BEFORE init must call it first too, or the
+    /// lend is sized with stale/zero N/HC/D/LR/K/FF/NE and comes out short.
+    static void set_geometry(const core::ModelGeometry& g, const core::SessionState& ss);
+
     /// Positions [pos0, pos0 + n) holding `tokens`; `ss.ple_prev` must be the two tokens before pos0 (oldest
     /// first, -1 for none) and is advanced to the last two of these.
     bool run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);

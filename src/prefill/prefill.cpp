@@ -465,16 +465,20 @@ uint64_t moe_set_bytes(size_t T) {
 }
 }
 
+void Prefill::set_geometry(const core::ModelGeometry& g, const core::SessionState& ss) {
+    NE = g.n_expert;   // the artifact's expert count drives the ring, the routing tables and the residency map
+    // docs/MODEL_SUPPORT.md Family A: the geometry comes from the header, not a compiled constant, so any
+    // qwen4exp shape (the 2560 original, the Whittle 2048 / ff 512 / 8-of-180) flows through the same path.
+    N = g.n_embd; HC = g.hc; D = N * HC; LR = g.hc_lr; K = ss.k; FF = g.n_ff; C = D;
+}
+
 bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, core::SessionState& ss,
                    core::ExpertSource* src, const core::ExpertCache* cache, const int32_t* host_res, int64_t chunk,
                    void* stream, std::string& err, void* borrow, uint64_t borrow_bytes) {
     Impl& m = *impl_;
     m.wt = &wt; m.g = &g; m.ss = &ss; m.src = src; m.cache = cache; m.host_res = host_res;
     m.T = chunk; m.cs = (hipStream_t) stream; m.stats = &stats_;
-    NE = g.n_expert;   // the artifact's expert count drives the ring, the routing tables and the residency map
-    // docs/MODEL_SUPPORT.md Family A: the geometry comes from the header, not a compiled constant, so any
-    // qwen4exp shape (the 2560 original, the Whittle 2048 / ff 512 / 8-of-180) flows through the same path.
-    N = g.n_embd; HC = g.hc; D = N * HC; LR = g.hc_lr; K = ss.k; FF = g.n_ff; C = D;
+    set_geometry(g, ss);   // the caller also calls this BEFORE plan_lend, so a lend is sized with the real geometry
     if (N <= 0 || HC <= 0 || D <= 0 || LR <= 0 || K <= 0 || FF <= 0 || NE <= 0) {
         err = "prefill: the model geometry is incomplete"; return false;
     }
