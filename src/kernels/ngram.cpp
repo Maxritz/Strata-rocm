@@ -42,10 +42,24 @@ PleConsts ple_artifact_consts() {
     const uint64_t offset[PLE_N_HEADS] = {
         0,        20000003, 40000026, 60000059, 80000106, 100000165, 120000228, 140000297,
         160000374, 180000455, 200000548, 220000655, 240000802, 260000955, 280001114, 300001275};
-    for (int i = 0; i < PLE_N_HEADS; ++i) {
-        c.vocab[i] = vocab[i];
-        c.offset[i] = offset[i];
-    }
+    c.vocab.assign(vocab, vocab + PLE_N_HEADS);
+    c.offset.assign(offset, offset + PLE_N_HEADS);
+    c.geom = PleGeom{};   // the 2560-wide defaults, so this is the compiled path byte-for-byte
+    return c;
+}
+
+PleConsts ple_consts_from_meta(uint64_t n_heads, uint64_t head_dim, int heads_per_ngram, int ngram_size,
+                               const std::vector<uint64_t>& layer_mult, const std::vector<uint64_t>& vocab,
+                               const std::vector<uint64_t>& offset) {
+    PleConsts c;
+    for (size_t i = 0; i < layer_mult.size() && i < (size_t) NGRAM_SIZE; ++i) c.mult[i] = layer_mult[i];
+    c.vocab = vocab;
+    c.offset = offset;
+    c.geom.n_heads = (int) n_heads;
+    c.geom.head_dim = (int) head_dim;
+    c.geom.heads_per_ngram = heads_per_ngram;
+    c.geom.ngram_size = ngram_size;
+    c.geom.n_embd = (int) (n_heads * head_dim);      // the invariant: heads x head_dim == n_embd
     return c;
 }
 
@@ -59,12 +73,19 @@ uint64_t ngram_mixed(const int64_t* ctx, const uint64_t* mult, int n) {
 }
 
 void ngram_rows(const int32_t* tokens, const int32_t* prev, int n_tokens, const PleConsts& c, uint32_t* out) {
-    const int n_prev = NGRAM_SIZE - 1;
+    // Runtime geometry (a default PleGeom is exactly the compiled 2560 path).  `ctx` is sized for NGRAM_SIZE and
+    // every qwen4exp artifact seen has ngram_size 3, so `ng <= NGRAM_SIZE` holds; a larger window would need a
+    // bigger array and is refused by the model loader rather than read past the end here.
+    const int ng = c.geom.ngram_size;
+    const int n_prev = ng - 1;
+    const int heads_per_ngram = c.geom.heads_per_ngram;
+    const int n_heads = c.geom.n_heads;
+    const int32_t eos = c.geom.eos;
     for (int i = 0; i < n_tokens; ++i) {
         int64_t ctx[NGRAM_SIZE];
         ctx[0] = tokens[i];
         bool cut = false;
-        for (int s = 1; s < NGRAM_SIZE; ++s) {
+        for (int s = 1; s < ng; ++s) {
             // `prev` is OLDEST FIRST, so predecessor `s` positions back is entry (n_prev - s): s=1 reads the
             // NEWEST.  Reading index (s-1) instead walks the window backwards, which still produces indices
             // in range and so cannot be caught by a range check - only by an oracle.
@@ -72,15 +93,15 @@ void ngram_rows(const int32_t* tokens, const int32_t* prev, int n_tokens, const 
             // The cut is evaluated BEFORE the value is stored, so the position whose predecessor was EOS is
             // itself EOS.  Storing first and then cutting would leave position s holding the real token while
             // position s+1 became EOS - one token of history too much.
-            cut = cut || t < 0 || t == PLE_EOS_TOKEN_ID;
-            ctx[s] = cut ? PLE_EOS_TOKEN_ID : t;
+            cut = cut || t < 0 || t == eos;
+            ctx[s] = cut ? eos : t;
         }
-        for (int n = 2; n <= NGRAM_SIZE; ++n) {
+        for (int n = 2; n <= ng; ++n) {
             const uint64_t mixed = ngram_mixed(ctx, c.mult, n);
-            const int base = (n - 2) * HEADS_PER_NGRAM;
-            for (int g = 0; g < HEADS_PER_NGRAM; ++g) {
+            const int base = (n - 2) * heads_per_ngram;
+            for (int g = 0; g < heads_per_ngram; ++g) {
                 const int h = base + g;
-                out[i * PLE_N_HEADS + h] = (uint32_t) (mixed % c.vocab[h] + c.offset[h]);
+                out[(size_t) i * (size_t) n_heads + (size_t) h] = (uint32_t) (mixed % c.vocab[h] + c.offset[h]);
             }
         }
     }

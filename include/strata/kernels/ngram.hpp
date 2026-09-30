@@ -24,6 +24,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace strata::kernels {
 
@@ -58,12 +59,44 @@ inline constexpr int PLE_ROW_BYTES_MAX = (PLE_HEAD_DIM / 32) * 22;       // 110 
 /// differences are 20, 10, ...).  A selftest is free to use whatever constants it likes, but a PARITY test
 /// against the artifact must use these, and the difference is recorded because it is exactly the kind of
 /// thing that gets copied from the reference into an engine.
+/// The n-gram table's row quantization.  `IQ4NL` is the canonical Flash-Next table (`[160, 320001536]`, 90-byte
+/// rows); `Q5_0` is a plain Q4_K_M packing of the same 160-wide head (110-byte rows); `Q4K` is a **Q4_K_M
+/// n-gram table** - the Whittle family, `[256, 39040000]`, one 144-byte super-block per 256-wide head.
+enum class PleFmt { IQ4NL, Q5_0, Q4K };
+
+/// **THE PLE GEOMETRY, NOW RUNTIME (docs/MODEL_SUPPORT.md "Whittle").**  Every field defaults to the 2560-wide
+/// artifact, so a default-constructed `PleGeom` reproduces the compiled constants byte-for-byte and the three
+/// working models are unaffected.  A model fills it from its own GGUF - Whittle (2048 embd) needs `n_embd 2048`,
+/// `head_dim 256`, `n_heads 8`, `heads_per_ngram 4`, a Q4_K table of 39,040,000 rows and its own vocab/offsets.
+/// The invariant that ties it to the model is `n_heads * head_dim == n_embd`.
+struct PleGeom {
+    int n_embd = NG_N_EMBD;                        // 2560
+    int head_dim = PLE_HEAD_DIM;                   // 160
+    int n_heads = PLE_N_HEADS;                     // 16
+    int heads_per_ngram = HEADS_PER_NGRAM;         // 8
+    int ngram_size = NGRAM_SIZE;                   // 3
+    int conv_kernel = PLE_CONV_KERNEL;             // 4
+    int hc = NG_HC;                                // 4
+    int32_t eos = PLE_EOS_TOKEN_ID;                // 248044
+    uint64_t table_rows = PLE_TABLE_ROWS;          // 320001536
+    PleFmt fmt = PleFmt::IQ4NL;
+    int row_bytes = PLE_ROW_BYTES;                 // 90
+    int64_t hc_dim() const { return (int64_t) hc * n_embd; }
+    int64_t hist() const { return (int64_t) (conv_kernel - 1) * ngram_size; }
+};
+
 struct PleConsts {
-    uint64_t mult[NGRAM_SIZE];
-    uint64_t vocab[PLE_N_HEADS];
-    uint64_t offset[PLE_N_HEADS];
+    uint64_t mult[NGRAM_SIZE] = {};                // ngram_size is 3 in every qwen4exp artifact
+    std::vector<uint64_t> vocab;
+    std::vector<uint64_t> offset;
+    PleGeom geom;
 };
 PleConsts ple_artifact_consts();
+/// The same four arrays, read from a GGUF's `qwen4exp.ple.*` (falls back to the compiled constants when the
+/// keys are absent).  `n_heads`/`head_dim`/`fmt`/`table_rows` come from the metadata + the tensor, not here.
+PleConsts ple_consts_from_meta(uint64_t n_heads, uint64_t head_dim, int heads_per_ngram, int ngram_size,
+                               const std::vector<uint64_t>& layer_mult, const std::vector<uint64_t>& vocab,
+                               const std::vector<uint64_t>& offset);
 
 /// `mixed_n = (ctx[0]*m[0]) ^ (ctx[1]*m[1]) ^ ... ^ (ctx[n-1]*m[n-1])` in uint64.
 ///
@@ -104,11 +137,6 @@ void iq4nl_dequant_row(const uint8_t* row, float* out160);
 /// NEVER KEEP THE SHARD MAPPED WHILE READING IT DIRECT: a live section on the same file serializes the unbuffered
 /// reads (311 -> 1,575 us per token, bench/results/2026-09-23-p2-ssd-direct). Direct mode drops its own mapping
 /// after the header parse; nothing else in the process may hold one.
-/// The n-gram table's row quantization.  `IQ4NL` is the canonical Flash-Next table (`[160, 320001536]`, 90-byte
-/// rows); `Q5_0` is a plain Q4_K_M packing of the same 160-wide head (110-byte rows); `Q4K` is a **Q4_K_M
-/// n-gram table** - the Whittle family, `[256, 39040000]`, one 144-byte super-block per 256-wide head.
-enum class PleFmt { IQ4NL, Q5_0, Q4K };
-
 /// One Q4_K row (`head_dim` values, a multiple of 256) -> floats.  `ple_dequant_row_fmt` dispatches on the row
 /// format; the two existing dequantizers (`iq4nl_dequant_row` / `q5_0_dequant_row`) keep their 160-wide bodies.
 void q4_K_dequant_row(const uint8_t* row, float* out, int head_dim);
