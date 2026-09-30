@@ -8,6 +8,8 @@
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/kernels/ngram.hpp"
+#include "strata/kernels/native_gr_norm.hpp"
+#include "strata/kernels/shared_expert.hpp"
 
 #include <hip/hip_runtime.h>
 
@@ -42,6 +44,19 @@ uint64_t gdn_state_floats(const ModelGeometry& g) {
            (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
 }
 
+/// The device arena one deepseek2 token needs: a compressed-KV cache PER LAYER, one shared MLA scratch, the MoE
+/// buffers, the four n_embd intermediates, and the (k, n_embd) expert-output buffer.  The pinned host staging
+/// for the pool is allocated by `session_init` (it is host memory, not arena).  Only reached when `g.mla != 0`.
+uint64_t ds2_state_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k) {
+    uint64_t n = 0;
+    n += (uint64_t) g.n_layers * mla_state_bytes(g, max_cells);
+    n += mla_buffers_bytes(g, max_cells);
+    n += moe_buffers_bytes(g, k);
+    n += (uint64_t) g.n_embd * 4 * 4;      // ds2_x, ds2_xn, ds2_attn, ds2_ffn
+    n += (uint64_t) k * (uint64_t) g.n_embd * 4;   // ds2_parts
+    return align_up(n, SESSION_STATE_ALIGN) + 4096;
+}
+
 }  // namespace
 
 /// `NG_HIST` rows of `hc_dim` floats: the PLE conv's history, which is the ONLY PLE state that lives in the
@@ -52,6 +67,7 @@ static uint64_t ple_hist_bytes(const ModelGeometry& g) {
 }
 
 uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k) {
+    if (g.mla != 0) return ds2_state_bytes(g, max_cells, k);
     uint64_t n = 0;
     n += gdn_buffers_bytes(g);
     n += (uint64_t) g.n_gdn_layers() * gdn_state_floats(g) * 4;
@@ -76,6 +92,36 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
 
     s.max_cells = max_cells;
     s.k = k;
+
+    // deepseek2: one compressed-KV cache per layer, the shared MLA scratch, the MoE buffers, the four n_embd
+    // intermediates and the expert-output buffer.  Pinned host staging for the pool is allocated here too.
+    if (g.mla != 0) {
+        s.mla_states = new MlaState[(size_t) g.n_layers];
+        const uint64_t one = mla_state_bytes(g, max_cells);
+        s.mla_state_arena = take((uint64_t) g.n_layers * one);
+        uint8_t* mp = (uint8_t*) s.mla_state_arena;
+        for (int64_t l = 0; l < g.n_layers; ++l) mla_state_init(g, max_cells, mp + (size_t) l * one, s.mla_states[l]);
+        s.mla_buf_arena = take(mla_buffers_bytes(g, max_cells));
+        mla_buffers_init(g, max_cells, s.mla_buf_arena, s.mla_bufs);
+        s.moe_arena = take(moe_buffers_bytes(g, k));
+        moe_buffers_init(g, k, s.moe_arena, s.moe);
+        s.ds2_x = (float*) take((uint64_t) g.n_embd * 4);
+        s.ds2_xn = (float*) take((uint64_t) g.n_embd * 4);
+        s.ds2_attn = (float*) take((uint64_t) g.n_embd * 4);
+        s.ds2_ffn = (float*) take((uint64_t) g.n_embd * 4);
+        s.ds2_parts = (float*) take((uint64_t) k * (uint64_t) g.n_embd * 4);
+        s.R = s.ds2_x;
+        if (hipHostAlloc((void**) &s.ds2_x_host, (size_t) g.n_embd * 4,
+                         hipHostMallocMapped | hipHostMallocPortable) != hipSuccess ||
+            hipHostAlloc((void**) &s.ds2_ids_host, (size_t) k * 4,
+                         hipHostMallocMapped | hipHostMallocPortable) != hipSuccess ||
+            hipHostAlloc((void**) &s.ds2_w_host, (size_t) k * 4,
+                         hipHostMallocMapped | hipHostMallocPortable) != hipSuccess ||
+            hipHostAlloc((void**) &s.ds2_parts_host, (size_t) k * (uint64_t) g.n_embd * 4,
+                         hipHostMallocMapped | hipHostMallocPortable) != hipSuccess)
+            return 0;
+        return used;
+    }
 
     gdn_buffers_init(g, take(gdn_buffers_bytes(g)), s.gdn);
     s.gdn_state = (float*) take((uint64_t) g.n_gdn_layers() * gdn_state_floats(g) * 4);
@@ -110,6 +156,15 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
 
 void session_zero(SessionState& s, const ModelGeometry& g, const float* R_init, void* stream) {
     hipStream_t cs = (hipStream_t) stream;
+    if (g.mla != 0) {
+        // The MLA cache is the only deepseek2 state; `ds2_x` is overwritten with the token's embedding anyway,
+        // and `R_init` seeds it for the first token.  The residual is NOT reset to `hc` copies: a deepseek2
+        // token's residual IS its embedding, one stream.
+        if (R_init != nullptr && s.ds2_x != nullptr)
+            hipMemcpyAsync(s.ds2_x, R_init, (size_t) g.n_embd * 4, hipMemcpyDeviceToDevice, cs);
+        for (int64_t l = 0; l < g.n_layers; ++l) mla_state_zero(s.mla_states[l], stream);
+        return;
+    }
     // the residual: `hc` copies of the one vector a caller hands in.  A real sequence's first token is the
     // embedding broadcast to every stream, which is the reference's own initial condition.
     if (R_init != nullptr) {
@@ -788,6 +843,92 @@ bool session_token(const WeightTable& tables, const ModelGeometry& g, int64_t po
                 return false;
             }
         }
+    }
+    return true;
+}
+
+// ================================ deepseek2 / MLA, ONE TOKEN ================================
+//
+// The qwen4exp block (GR + GDN/QSA + PLE) has nothing in common with this, so it is a separate function rather
+// than a branch inside `session_token`: a deepseek2 layer is `x += MLA(rms(x))`, `x += FFN(rms(x))` and the only
+// state that outlives the token is the per-layer compressed KV.  The reference is the vendored llama.cpp
+// `deepseek2.cpp` graph (docs/DEEPSEEK.md §5).
+bool ds2_token(const WeightTable& tables, const ModelGeometry& g, int64_t pos, SessionState& s, PoolFnLayer pool,
+               void* user, void* stream, std::string& err) {
+    using namespace strata::kernels;
+    if (g.mla == 0 || s.ds2_x == nullptr || s.ds2_xn == nullptr || s.ds2_attn == nullptr || s.ds2_ffn == nullptr ||
+        s.mla_states == nullptr || s.ds2_parts == nullptr) {
+        err = "ds2_token: the session was not initialised for a deepseek2 model";
+        return false;
+    }
+    if (pos < 0 || pos >= s.max_cells) {
+        err = "ds2_token: position " + std::to_string(pos) + " is outside the " + std::to_string(s.max_cells) +
+              " cells";
+        return false;
+    }
+    hipStream_t cs = (hipStream_t) stream;
+    const int64_t k = s.k;
+    float* x = s.ds2_x;
+    float* xn = s.ds2_xn;
+    for (int64_t l = 0; l < g.n_layers; ++l) {
+        const LayerView v(tables, l);
+        const WeightRef* wan = v.get("attn_norm.weight");
+        const WeightRef* wfn = v.get("ffn_norm.weight");
+        if (wan == nullptr || wfn == nullptr) {
+            err = v.name("attn_norm.weight/ffn_norm.weight") + " is missing";
+            return false;
+        }
+        if (wan->kind != WeightKind::F32 || wfn->kind != WeightKind::F32) {
+            err = v.name("attn_norm.weight") + " is not an F32 norm";
+            return false;
+        }
+        // attention half: xn = rms_norm(x, attn_norm); x += MLA(xn)
+        native_gr_rms_norm_weighted(x, (const float*) wan->data, xn, (int) g.n_embd, 1, s.ds2_norm_eps, cs);
+        MlaWeights w;
+        if (!mla_layer_weights(tables, g, l, s.ds2_norm_eps, s.ds2_rope_base, w, err)) return false;
+        if (!mla_layer(g, w, s.mla_states[l], s.mla_bufs, xn, s.ds2_attn, (int32_t) pos, cs, err)) return false;
+
+        add_inplace(x, s.ds2_attn, g.n_embd, cs);
+
+        // ffn half: xn = rms_norm(x, ffn_norm); x += ffn(xn)
+        native_gr_rms_norm_weighted(x, (const float*) wfn->data, xn, (int) g.n_embd, 1, s.ds2_norm_eps, cs);
+        if (l < s.ds2_dense_lead) {
+            if (s.ds2_dense_scratch == nullptr) {
+                err = "ds2_token: the leading dense layer needs its FFN scratch";
+                return false;
+            }
+            if (!dense_ffn_ds2(tables, g, l, s.ds2_dense_scratch, xn, s.ds2_ffn, cs, err)) return false;
+        } else {
+            if (!moe_route_ds2(tables, g, l, k, s.moe, xn, s.ds2_expert_scale, s.ds2_expert_norm, cs, err))
+                return false;
+            if (pool != nullptr) {
+                // The router's selection is produced on the device; the CPU pool needs it on the host.  This is
+                // the SYNCHRONOUS (token-at-a-time) handoff: no doorbell, no overlap, because a deepseek2 decode
+                // is the uncaptured path until a batched prefill exists.
+                if (hipMemcpyAsync(s.ds2_x_host, xn, (size_t) g.n_embd * 4, hipMemcpyDeviceToHost, cs) != hipSuccess ||
+                    hipMemcpyAsync(s.ds2_ids_host, s.moe.ids, (size_t) k * 4, hipMemcpyDeviceToHost, cs) != hipSuccess ||
+                    hipMemcpyAsync(s.ds2_w_host, s.moe.weights, (size_t) k * 4, hipMemcpyDeviceToHost, cs) != hipSuccess ||
+                    hipStreamSynchronize(cs) != hipSuccess) {
+                    err = "ds2_token: the router staging copy failed";
+                    return false;
+                }
+                pool(user, l, s.ds2_x_host, s.ds2_ids_host, s.ds2_w_host, g.n_embd, k, s.ds2_parts_host);
+                if (hipMemcpyAsync(s.ds2_parts, s.ds2_parts_host, (size_t) k * g.n_embd * 4, hipMemcpyHostToDevice,
+                                   cs) != hipSuccess) {
+                    err = "ds2_token: the expert-output upload failed";
+                    return false;
+                }
+            } else {
+                if (hipMemsetAsync(s.ds2_parts, 0, (size_t) k * g.n_embd * 4, cs) != hipSuccess) {
+                    err = "ds2_token: zeroing the expert outputs failed";
+                    return false;
+                }
+            }
+            if (!moe_finish_ds2(tables, g, l, k, s.moe, xn, s.ds2_parts, s.ds2_ffn, cs, err)) return false;
+        }
+
+        add_inplace(x, s.ds2_ffn, g.n_embd, cs);
+
     }
     return true;
 }

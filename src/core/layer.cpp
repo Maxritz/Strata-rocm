@@ -925,6 +925,49 @@ bool mla_layer(const ModelGeometry& g, const MlaWeights& w, const MlaState& st, 
     }
     return true;
 }
+// Resolve the six raw-GGUF MLA projections and the two norms of ONE layer from the loaded table.  Every pointer
+// is the device address `NativeDense` attached to the canonical `WeightRef`; the types are the ggml ids
+// `native_mmvq` dispatches on.  `wk_b`/`wv_b` are 3-D and head-major (`mla_layer` steps
+// `native_mmvq_weight_bytes(type, ne0, ne1)` per head), so only the base pointer is needed here.
+bool mla_layer_weights(const WeightTable& tables, const ModelGeometry& g, int64_t layer, float eps, float rope_base,
+                       MlaWeights& w, std::string& err) {
+    const LayerView v(tables, layer);
+    const WeightRef* wa = v.get("attn_q_a.weight");
+    const WeightRef* wb = v.get("attn_q_b.weight");
+    const WeightRef* wkv = v.get("attn_kv_a_mqa.weight");
+    const WeightRef* wkb = v.get("attn_k_b.weight");
+    const WeightRef* wvb = v.get("attn_v_b.weight");
+    const WeightRef* wo = v.get("attn_output.weight");
+    const WeightRef* wqan = v.get("attn_q_a_norm.weight");
+    const WeightRef* wkvan = v.get("attn_kv_a_norm.weight");
+    const char* missing = !wa ? "attn_q_a.weight" : !wb ? "attn_q_b.weight" : !wkv ? "attn_kv_a_mqa.weight"
+                          : !wkb ? "attn_k_b.weight" : !wvb ? "attn_v_b.weight" : !wo ? "attn_output.weight"
+                          : !wqan ? "attn_q_a_norm.weight" : !wkvan ? "attn_kv_a_norm.weight" : nullptr;
+    if (missing != nullptr) { err = v.name(missing) + " is missing"; return false; }
+    const WeightRef* all[6] = {wa, wb, wkv, wkb, wvb, wo};
+    for (const WeightRef* r : all)
+        if (r->native_data == nullptr || !strata::kernels::native_mmvq_supported(r->native_type)) {
+            err = v.name("attn_*") + ": the MLA projection is not served as a native MMVQ block";
+            return false;
+        }
+    w.wq_a = wa->native_data;         w.wq_a_type = wa->native_type;
+    w.wq_b = wb->native_data;         w.wq_b_type = wb->native_type;
+    w.wkv_a_mqa = wkv->native_data;   w.wkv_a_type = wkv->native_type;
+    w.wk_b = wkb->native_data;        w.wk_b_type = wkb->native_type;
+    w.wv_b = wvb->native_data;        w.wv_b_type = wvb->native_type;
+    w.wo = wo->native_data;           w.wo_type = wo->native_type;
+    w.q_a_norm = (const float*) wqan->data;
+    w.kv_a_norm = (const float*) wkvan->data;
+    w.q8_1 = wa->native_q8_1;
+    w.norm_eps = eps;
+    w.rope_freq_base = rope_base;
+    if (w.q_a_norm == nullptr || w.kv_a_norm == nullptr || w.q8_1 == nullptr) {
+        err = v.name("attn_q_a_norm/attn_kv_a_norm/scratch") + " is missing";
+        return false;
+    }
+    return true;
+}
+
 // ================================ PER-STAGE TIMING, DEBUG ONLY ================================
 //
 // **THE ENGINE SPENDS 1.047 ms PER LAYER WITH THE EXPERTS OFF, AND EVERY COST MODEL IN `bench/` PREDICTS LESS

@@ -427,6 +427,13 @@ struct MlaWeights {
 bool mla_layer(const ModelGeometry& g, const MlaWeights& w, const MlaState& st, const MlaBuffers& b, const float* x,
                float* out, int32_t pos, void* stream, std::string& err);
 
+/// The raw-GGUF projections of one MLA layer, resolved by NAME from the loaded table and attached by
+/// `NativeDense` (`attn_q_a/q_b`, `attn_kv_a_mqa`, `attn_k_b`, `attn_v_b`, `attn_output`).  `eps` and
+/// `rope_base` are the model's `attention.layer_norm_rms_epsilon` and `rope.freq_base`.  Every projection must
+/// be native-served; a missing pointer or an unsupported type is REFUSED with the tensor name, not run.
+bool mla_layer_weights(const WeightTable& tables, const ModelGeometry& g, int64_t layer, float eps, float rope_base,
+                       MlaWeights& w, std::string& err);
+
 /// `x` (n_embd f32) through one QSA layer to `out` (n_embd f32) at sequence position `pos`.
 ///
 /// `pos_base` is the sequence's FIRST cell's position, which the indexer needs and cannot derive - equating a

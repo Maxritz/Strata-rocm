@@ -272,6 +272,61 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
     d.experts += k;
 }
 
+void native_expert_pool_dispatch(void* user, int64_t layer, const float* x_f, const int32_t* ids, int64_t n_embd,
+                                 int64_t k, float* out) {
+    using namespace strata::kernels::cpu;
+    ExpertDispatch& d = *(ExpertDispatch*) user;
+    if (d.failed) return;
+    const ExpertLayout& lay = expert_layout();
+    if (!lay.native || layer < 0 || layer >= lay.n_layers) {
+        d.failed = true;
+        d.fail = "native dispatch: the expert layout has no native format for this layer";
+        d.fail_layer = layer;
+        return;
+    }
+    const NativeFmt& f = lay.fmt[(size_t) layer];
+    if (n_embd != f.n_embd) {
+        d.failed = true;
+        d.fail = "native dispatch: the activation width does not match the layer's expert geometry";
+        d.fail_layer = layer;
+        return;
+    }
+    d.layers = layer;
+    d.src->begin_layer(layer, ids, k);
+    if (d.jobs_multi.size() < (size_t) k) d.jobs_multi.resize((size_t) k);
+    if (d.nact_multi.size() < (size_t) kNativeActBytes) d.nact_multi.resize((size_t) kNativeActBytes);
+    // ONE activation for the whole layer, exactly as the single-token path shares its ActQ.
+    native_quant_act(f, x_f, d.nact_multi.data());
+    int njobs = 0;
+    for (int64_t i = 0; i < k; ++i) {
+        const int64_t e = ids[i];
+        if (e < 0 || e >= d.n_expert) {
+            d.failed = true;
+            d.fail = "a routed expert id is out of range";
+            d.fail_layer = layer;
+            d.fail_expert = e;
+            return;
+        }
+        const uint8_t* b = d.src->blob(layer, e);
+        if (b == nullptr) {
+            d.failed = true;
+            d.fail = "the expert source could not produce a blob";
+            d.fail_layer = layer;
+            d.fail_expert = e;
+            ++d.missing;
+            return;
+        }
+        ExpertJobMulti& jb = d.jobs_multi[(size_t) njobs++];
+        jb.blob = b;
+        jb.nt = 1;
+        jb.act[0] = nullptr;
+        jb.nact[0] = d.nact_multi.data();
+        jb.out[0] = out + (size_t) i * (size_t) n_embd;
+    }
+    d.pool->run_split_multi_native(f, d.jobs_multi.data(), njobs);
+    d.experts += k;
+}
+
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
                                 float* out) {
     using namespace strata::kernels::cpu;

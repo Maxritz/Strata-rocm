@@ -35,6 +35,7 @@
 #include "strata/kernels/native_qsa.hpp"
 #include "strata/kernels/native_qsa_indexer.hpp"
 #include "strata/kernels/native_rope.hpp"
+#include "strata/kernels/native_gr_norm.hpp"
 #include "strata/kernels/mrope.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/qsa.hpp"
@@ -527,6 +528,349 @@ void drive_pool_multi(void* user, const float* x_f, const int32_t* ids, int64_t 
             }
         }
     }
+}
+
+/// The pool callback for `ds2_token`: `PoolFn` plus the LAYER INDEX.  A deepseek2 model is dense at layer 0 and
+/// MoE afterwards, so the adapter's implicit per-layer counter (which assumes a pool call on EVERY layer) would
+/// read the wrong expert blob.  This sets `d.layers` to the layer the router actually ran for.
+void drive_pool_layer(void* user, int64_t layer, const float* x_f, const int32_t* ids, const float* weights,
+                      int64_t n_embd, int64_t k, float* out) {
+    Drive* t = (Drive*) user;
+    t->d.layers = layer;
+    const Clock::time_point a = Clock::now();
+    // A native (GGUF-quantized) pack - which is what a deepseek2 model is - needs the layer's own geometry;
+    // the Q2_0 single-token path refuses it.
+    if (strata::kernels::cpu::expert_layout().native)
+        strata::core::native_expert_pool_dispatch(&t->d, layer, x_f, ids, n_embd, k, out);
+    else
+        strata::core::expert_pool_dispatch(&t->d, x_f, ids, weights, n_embd, k, out);
+    t->cpu_ms += std::chrono::duration<double, std::milli>(Clock::now() - a).count();
+    ++t->calls;
+    if (t->routing != nullptr && layer >= 0 && layer < 48) {
+        const int32_t rec[2] = {(int32_t) layer, (int32_t) k};
+        std::fwrite(rec, sizeof rec, 1, t->routing);
+        std::fwrite(ids, sizeof(int32_t), (size_t) k, t->routing);
+        std::fwrite(weights, sizeof(float), (size_t) k, t->routing);
+    }
+}
+
+// ================================ deepseek2 / GLM, TOKEN AT A TIME ================================
+//
+// The engine's main path is the qwen4exp block (GR + GDN/QSA + PLE + a captured per-layer graph).  A deepseek2
+// model shares none of it: no hyper-connections, no GDN/QSA recurrence, no PLE, no gated-residual stack, and
+// (yet) no batched prefill.  Bending the qwen4exp path to admit it would violate the contract's "keep qwen4exp
+// unchanged", so this is a SEPARATE runner that loads the same pack + GGUF through the same components
+// (`WeightTable`, `NativeDense`, `NativeEmbed`, `NativeHead`, the expert arena + CPU pool) and drives
+// `ds2_token` once per token.  The per-layer MLA compressed KV is the only sequence state.
+//
+// It is the UNCAPPED, correct one-token-at-a-time path.  The prompt goes through it too - see the report.
+int run_deepseek2(Options& o) {
+    std::string err;
+    if (o.native_preset.empty()) {
+        std::fprintf(stderr, "strata generate: a deepseek2 model needs --native <model.gguf>\n");
+        return 2;
+    }
+    strata::core::ModelGeometry g;
+    int64_t K = 4, dense_lead = 0, dense_ff = 0, n_vocab = 0;
+    double expert_scale = 1.0, eps = 1e-5, rope_base = 1000000.0;
+    bool expert_norm = false;
+    try {
+        strata::GgufFile f(o.native_preset);
+        const auto num = [&](const char* key, double dflt) -> double {
+            const strata::MetaValue* v = f.get(key);
+            return v != nullptr && v->is_num() ? v->num() : dflt;
+        };
+        const auto i64 = [&](const char* key, int64_t dflt) -> int64_t {
+            return (int64_t) num(key, (double) dflt);
+        };
+        g.n_layers = i64("deepseek2.block_count", 0);
+        g.n_embd = i64("deepseek2.embedding_length", 0);
+        g.n_head = i64("deepseek2.attention.head_count", 0);
+        g.n_head_kv = i64("deepseek2.attention.head_count_kv", 1);
+        g.head_dim = i64("deepseek2.attention.key_length_mla", 0);
+        g.n_rot = i64("deepseek2.rope.dimension_count", 64);
+        g.n_lora_q = i64("deepseek2.attention.q_lora_rank", 0);
+        g.n_lora_kv = i64("deepseek2.attention.kv_lora_rank", 0);
+        g.n_expert = i64("deepseek2.expert_count", 0);
+        g.n_ff = i64("deepseek2.expert_feed_forward_length", 0);
+        K = i64("deepseek2.expert_used_count", 4);
+        dense_lead = i64("deepseek2.leading_dense_block_count", 0);
+        dense_ff = i64("deepseek2.feed_forward_length", g.n_ff);
+        expert_scale = num("deepseek2.expert_weights_scale", 1.0);
+        if (const strata::MetaValue* v = f.get("deepseek2.expert_weights_norm")) expert_norm = v->u != 0;
+        eps = num("deepseek2.attention.layer_norm_rms_epsilon", 1e-5);
+        rope_base = num("deepseek2.rope.freq_base", 1000000.0);
+        n_vocab = i64("deepseek2.vocab_size", 0);
+        g.qsa_interval = g.n_layers + 1;   // n_qsa_layers() == 0: the MLA path, not GDN/QSA
+        g.mla = 1;
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "strata generate: reading the deepseek2 geometry from %s: %s\n",
+                     o.native_preset.c_str(), e.what());
+        return 1;
+    }
+    if (g.n_layers <= 0 || g.n_embd <= 0 || g.n_head <= 0 || g.n_lora_q <= 0 || g.n_lora_kv <= 0 ||
+        g.n_rot <= 0 || g.n_rot >= g.head_dim || g.n_expert <= 0 || K <= 0 || g.n_ff <= 0 || n_vocab <= 0) {
+        std::fprintf(stderr, "strata generate: the deepseek2 geometry is not runnable (layers %lld, embd %lld, "
+                             "heads %lld, q_lora %lld, kv_lora %lld, head %lld, rot %lld, experts %lld x %lld, "
+                             "ff %lld, vocab %lld)\n", (long long) g.n_layers, (long long) g.n_embd,
+                     (long long) g.n_head, (long long) g.n_lora_q, (long long) g.n_lora_kv,
+                     (long long) g.head_dim, (long long) g.n_rot, (long long) g.n_expert, (long long) K,
+                     (long long) g.n_ff, (long long) n_vocab);
+        return 2;
+    }
+    if (o.max_context < (int64_t) o.tokens.size() + o.max_new) {
+        std::fprintf(stderr, "strata generate: --max-context %lld cannot hold %zu prompt + %lld new tokens\n",
+                     (long long) o.max_context, o.tokens.size(), (long long) o.max_new);
+        return 2;
+    }
+    if (!strata::kernels::cpu::expert_layout_load(o.pack, g.n_layers, g.n_expert, err)) {
+        std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+        return 1;
+    }
+    g.n_expert = strata::kernels::cpu::expert_layout().n_expert;   // the artifact is authoritative
+    std::fprintf(stderr,
+                 "strata generate: deepseek2 %lld layers, embd %lld, MLA %lld heads x %lld (nope %lld + rot %lld), "
+                 "q_lora %lld, kv_lora %lld; MoE %lld of %lld x %lld (dense lead %lld, dense ff %lld)\n",
+                 (long long) g.n_layers, (long long) g.n_embd, (long long) g.n_head, (long long) g.head_dim,
+                 (long long) (g.head_dim - g.n_rot), (long long) g.n_rot, (long long) g.n_lora_q,
+                 (long long) g.n_lora_kv, (long long) K, (long long) g.n_expert, (long long) g.n_ff,
+                 (long long) dense_lead, (long long) dense_ff);
+    std::fprintf(stderr, "strata generate: deepseek2 prefill is TOKEN-AT-A-TIME (no batched prefill path yet)\n");
+
+    // The embedding and the head come from the GGUF directly, as for a qwen4exp native pack.
+    strata::core::NativeEmbed native_embed;
+    if (!native_embed.load(o.native_preset, g.n_embd, n_vocab, err)) {
+        std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+        return 1;
+    }
+    strata::core::set_native_embed(&native_embed);
+
+    std::set<std::string> skip;
+    if (!strata::core::NativeDense::served_names({o.native_preset}, false, skip, err)) {
+        std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+        return 1;
+    }
+    skip.insert("token_embd.weight");
+    skip.insert("output.weight");
+    uint64_t pool_bytes = 0;
+    if (!strata::core::WeightTable::pool_bytes(o.pack, pool_bytes, err, &skip)) {
+        std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+        return 1;
+    }
+    void* arena = nullptr;
+    if (hipMalloc(&arena, pool_bytes) != hipSuccess) {
+        std::fprintf(stderr, "strata generate: the weight arena (%llu B) failed\n", (unsigned long long) pool_bytes);
+        return 1;
+    }
+    strata::core::WeightTable wt;
+    if (!wt.load(o.pack, arena, pool_bytes, err, &skip)) {
+        std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+        return 1;
+    }
+    strata::core::NativeDense nd;
+    if (!nd.load({o.native_preset}, wt, err)) {
+        std::fprintf(stderr, "strata generate: native dense projections: %s\n", err.c_str());
+        return 1;
+    }
+    strata::core::NativeHead native_head;
+    if (!native_head.load(o.native_preset, g.n_embd, n_vocab, err)) {
+        std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+        return 1;
+    }
+    const strata::core::WeightRef* won = wt.find("output_norm.weight");
+    if (won == nullptr || won->kind != strata::core::WeightKind::F32) {
+        std::fprintf(stderr, "strata generate: output_norm.weight is missing or not F32\n");
+        return 1;
+    }
+    std::fprintf(stderr, "strata generate: %zu native projections (%.1f MiB) + a native head\n",
+                 nd.tensor_count(), (double) nd.weight_bytes() / 1048576.0);
+
+    // The expert arena and the CPU pool.
+    strata::core::FileExpertSource src;
+    strata::core::ArenaExpertSource arena_src;
+    strata::core::RingExpertSource ring_src;
+    strata::core::ExpertSource* srcp = nullptr;
+    if (o.expert_ram_gb > 0 && o.mmap_experts) {
+        std::fprintf(stderr, "strata generate: --expert-ram-gb and --mmap-experts are mutually exclusive\n");
+        return 1;
+    }
+    if (o.expert_ram_gb > 0) {
+        const uint64_t ram = (uint64_t) o.expert_ram_gb * 1024ull * 1024ull * 1024ull;
+        ring_src.set_gguf(o.native_preset);
+        if (!ring_src.open(o.pack, g.n_layers, g.n_expert, ram, err)) {
+            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+            return 1;
+        }
+        srcp = &ring_src;
+    } else if (o.mmap_experts) {
+        if (!src.open(o.pack, g.n_layers, g.n_expert, err)) {
+            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+            return 1;
+        }
+        srcp = &src;
+    } else {
+        arena_src.set_gguf(o.native_preset);
+        if (!arena_src.open(o.pack, g.n_layers, g.n_expert, /*threads=*/6, err)) {
+            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "strata generate: expert arena: %s\n", arena_src.note().c_str());
+        std::fprintf(stderr, "strata generate: loaded %.2f GiB at %.2f GiB/s\n",
+                     (double) strata::kernels::cpu::expert_layout().total / (1024.0 * 1024 * 1024),
+                     arena_src.load_gib_per_second());
+        srcp = &arena_src;
+    }
+    strata::kernels::cpu::ExpertPool pool(o.pool_workers, /*pin=*/true, /*host_works=*/!o.no_host_worker);
+    Drive drive;
+    drive.d.pool = &pool;
+    drive.d.src = srcp;
+    drive.d.n_expert = g.n_expert;
+    drive.d.split_rows = !o.no_split_rows;
+    drive.d.jobs.resize((size_t) K);
+    if (!o.dump_routing.empty()) {
+        drive.routing = std::fopen(o.dump_routing.c_str(), "wb");
+        if (drive.routing == nullptr) {
+            std::fprintf(stderr, "strata generate: cannot write %s\n", o.dump_routing.c_str());
+            return 1;
+        }
+    }
+    strata::core::PoolFnLayer pool_fn = o.no_pool ? nullptr : &drive_pool_layer;
+
+    void* sbuf = nullptr;
+    if (hipMalloc(&sbuf, strata::core::session_bytes(g, o.max_context, K)) != hipSuccess) {
+        std::fprintf(stderr, "strata generate: session state allocation failed\n");
+        return 1;
+    }
+    strata::core::SessionState ss;
+    if (strata::core::session_init(g, o.max_context, K, sbuf, ss) == 0) {
+        std::fprintf(stderr, "strata generate: session_init failed\n");
+        return 1;
+    }
+    ss.ds2_norm_eps = (float) eps;
+    ss.ds2_rope_base = (float) rope_base;
+    ss.ds2_expert_scale = (float) expert_scale;
+    ss.ds2_expert_norm = expert_norm;
+    ss.ds2_dense_lead = dense_lead;
+    ss.ds2_dense_ff = dense_ff;
+    if (dense_lead > 0 &&
+        hipMalloc((void**) &ss.ds2_dense_scratch, strata::kernels::shared_expert_scratch_bytes(dense_ff)) != hipSuccess) {
+        std::fprintf(stderr, "strata generate: the dense FFN scratch failed\n");
+        return 1;
+    }
+    hipStream_t stream = nullptr;
+    if (hipStreamCreateWithFlags(&stream, hipStreamNonBlocking) != hipSuccess) {
+        std::fprintf(stderr, "strata generate: cannot create the stream\n");
+        return 1;
+    }
+    float* d_emb = nullptr;
+    float* d_logits = nullptr;
+    int* d_next = nullptr;
+    if (hipMalloc((void**) &d_emb, (size_t) g.n_embd * 4) != hipSuccess ||
+        hipMalloc((void**) &d_logits, (size_t) n_vocab * 4) != hipSuccess ||
+        hipMalloc((void**) &d_next, sizeof(int)) != hipSuccess) {
+        std::fprintf(stderr, "strata generate: the embedding/logits/sampler buffers failed\n");
+        return 1;
+    }
+    std::vector<float> logits((size_t) n_vocab);
+    strata::kernels::SamplerParams sp;
+    sp.greedy = o.greedy;
+    sp.seed = o.seed;
+    sp.top_k = o.top_k;
+    sp.top_p = o.top_p;
+    sp.temperature = o.temperature;
+
+    const int64_t n_prompt = (int64_t) o.tokens.size();
+    std::vector<int64_t> produced;
+    int64_t next = -1;
+    double prefill_ms = 0, decode_ms = 0;
+    int64_t decoded = 0;
+    const int64_t total = n_prompt + o.max_new;
+    for (int64_t pos = 0; pos < total; ++pos) {
+        const int64_t tok = pos < n_prompt ? o.tokens[(size_t) pos] : next;
+        if (tok < 0 || tok >= n_vocab) {
+            std::fprintf(stderr, "strata generate: token %lld at position %lld is outside the vocabulary\n",
+                         (long long) tok, (long long) pos);
+            return 1;
+        }
+        const Clock::time_point t0 = Clock::now();
+        native_embed.gather_one(tok, d_emb, (void*) stream);
+        if (hipMemcpyAsync(ss.ds2_x, d_emb, (size_t) g.n_embd * 4, hipMemcpyDeviceToDevice, stream) != hipSuccess) {
+            std::fprintf(stderr, "strata generate: the embedding copy failed\n");
+            return 1;
+        }
+        if (pos == 0) strata::core::session_zero(ss, g, nullptr, (void*) stream);
+        err.clear();
+        if (!strata::core::ds2_token(wt, g, pos, ss, pool_fn, &drive, (void*) stream, err)) {
+            std::fprintf(stderr, "strata generate: ds2_token at position %lld: %s\n", (long long) pos, err.c_str());
+            return 1;
+        }
+        if (drive.d.failed) {
+            std::fprintf(stderr, "strata generate: the expert pool failed at layer %lld expert %lld: %s\n",
+                         (long long) drive.d.fail_layer, (long long) drive.d.fail_expert,
+                         drive.d.fail ? drive.d.fail : "(no message)");
+            return 1;
+        }
+        if (pos >= n_prompt - 1) {
+            strata::kernels::native_gr_rms_norm_weighted(ss.ds2_x, (const float*) won->data, ss.ds2_xn,
+                                                         (int) g.n_embd, 1, (float) eps, (void*) stream);
+            if (!native_head.run(ss.ds2_xn, d_logits, (void*) stream, err)) {
+                std::fprintf(stderr, "strata generate: lm_head: %s\n", err.c_str());
+                return 1;
+            }
+            if (hipMemcpyAsync(logits.data(), d_logits, (size_t) n_vocab * 4, hipMemcpyDeviceToHost, stream) != hipSuccess ||
+                hipStreamSynchronize(stream) != hipSuccess) {
+                std::fprintf(stderr, "strata generate: the logits readback failed\n");
+                return 1;
+            }
+            int bad = 0;
+            for (float v : logits) if (!std::isfinite(v)) ++bad;
+            if (bad != 0) {
+                std::fprintf(stderr, "strata generate: %d of %lld logits are not finite at position %lld\n", bad,
+                             (long long) n_vocab, (long long) pos);
+                return 1;
+            }
+            sp.counter = (uint64_t) produced.size();
+            strata::kernels::sample_tokens(d_logits, 1, (int) n_vocab, nullptr, 0, sp, d_next, (void*) stream);
+            int next32 = 0;
+            if (hipMemcpyAsync(&next32, d_next, sizeof(int), hipMemcpyDeviceToHost, stream) != hipSuccess ||
+                hipStreamSynchronize(stream) != hipSuccess) {
+                std::fprintf(stderr, "strata generate: reading the sampled token failed\n");
+                return 1;
+            }
+            next = next32;
+            if (next < 0 || next >= n_vocab) {
+                std::fprintf(stderr, "strata generate: the sampler returned %lld, outside 0..%lld\n",
+                             (long long) next, (long long) (n_vocab - 1));
+                return 1;
+            }
+            produced.push_back(next);
+            ++decoded;
+            decode_ms += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+            if ((int64_t) produced.size() >= o.max_new) break;
+            if (o.stop_eos && std::find(o.eos_ids.begin(), o.eos_ids.end(), next) != o.eos_ids.end()) break;
+        } else {
+            prefill_ms += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+        }
+        if ((pos & 255) == 0)
+            std::fprintf(stderr, "strata generate: position %lld, token %lld%s\n", (long long) pos, (long long) tok,
+                         pos < n_prompt ? " (prompt)" : "");
+    }
+    if (drive.routing != nullptr) {
+        std::fclose(drive.routing);
+        drive.routing = nullptr;
+    }
+    std::printf("prompt  :");
+    for (int64_t t : o.tokens) std::printf(" %lld", (long long) t);
+    std::printf("\noutput  :");
+    for (int64_t t : produced) std::printf(" %lld", (long long) t);
+    std::printf("\n");
+    std::printf("%-24s %lld tokens in %.1f ms  ->  %.2f tok/s\n", "decode", (long long) decoded, decode_ms,
+                decode_ms > 0 ? 1000.0 * (double) decoded / decode_ms : 0.0);
+    if (n_prompt > 1)
+        std::printf("%-24s %lld tokens in %.1f ms  ->  %.2f tok/s\n", "prefill (token-at-a-time)",
+                    (long long) (n_prompt - 1), prefill_ms,
+                    prefill_ms > 0 ? 1000.0 * (double) (n_prompt - 1) / prefill_ms : 0.0);
+    return 0;
 }
 
 // ---- issue #31: what the watchdog prints before it stops a stalled engine
@@ -1107,10 +1451,28 @@ int main(int argc, char** argv) {
                             "structurally a sibling of qwen4exp; the reuse map and port plan are in "
                             "docs/MODEL_SUPPORT.md section 3b)\n");
             } else if (arch == "deepseek2") {
-                std::printf("  embd %lld  layers %lld  experts %lldx%lld\n",
+                // **RUNNABLE.**  The MLA decoder and the sigmoid MoE are wired (`ds2_token`, docs/DEEPSEEK.md §5);
+                // this is the same geometry the runner reads.  `key_length_mla` is the MLA head width, not the
+                // 576-wide compressed-KV row.
+                std::printf("  embd %lld  layers %lld  heads %lld/%lld  MLA head %lld (rot %lld)  q_lora %lld  "
+                            "kv_lora %lld\n",
                             u("deepseek2.embedding_length"), u("deepseek2.block_count"),
-                            u("deepseek2.expert_used_count"), u("deepseek2.expert_count"));
-                std::printf("support: RECOGNISED, not yet runnable (deepseek2 / GLM MoE; no decoder in this build)\n");
+                            u("deepseek2.attention.head_count"), u("deepseek2.attention.head_count_kv"),
+                            u("deepseek2.attention.key_length_mla"), u("deepseek2.rope.dimension_count"),
+                            u("deepseek2.attention.q_lora_rank"), u("deepseek2.attention.kv_lora_rank"));
+                std::printf("  MoE %lldx%lld (used %lld, shared %lld, ff %lld)  dense lead %lld\n",
+                            u("deepseek2.expert_used_count"), u("deepseek2.expert_count"),
+                            u("deepseek2.expert_used_count"), u("deepseek2.expert_shared_count"),
+                            u("deepseek2.expert_feed_forward_length"), u("deepseek2.leading_dense_block_count"));
+                const long long e = u("deepseek2.embedding_length"), qlr = u("deepseek2.attention.q_lora_rank"),
+                                  kvr = u("deepseek2.attention.kv_lora_rank"),
+                                  hd = u("deepseek2.attention.key_length_mla"),
+                                  rot = u("deepseek2.rope.dimension_count"), ne = u("deepseek2.expert_count"),
+                                  kk = u("deepseek2.expert_used_count");
+                const bool ok = e > 0 && qlr > 0 && kvr > 0 && hd > 0 && rot > 0 && rot < hd && ne > 0 && kk > 0;
+                std::printf("support: %s\n",
+                            ok ? "SUPPORTED (deepseek2/GLM MLA; runs token-at-a-time)"
+                               : "NOT runnable: the MLA geometry is not a positive shape");
             } else if (arch == "llama" || arch == "qwen2" || arch == "qwen3" || arch == "qwen3moe" ||
                        arch == "qwen3vl" || arch == "gemma3" || arch == "gemma4" || arch == "phi3" ||
                        arch == "mistral3" || arch == "starcoder2" || arch == "olmoe" || arch == "gpt-oss" ||
@@ -1134,6 +1496,24 @@ int main(int argc, char** argv) {
                              "header of src/program/generate.cpp)\n");
         usage();
         return 2;
+    }
+    // **A deepseek2 MODEL RUNS ITS OWN PATH.**  The qwen4exp block (GR + GDN/QSA + PLE + captured graphs) shares
+    // nothing with the MLA decoder, and the checks below - the PLE requirement above all - would refuse a GLM
+    // pack for a module it does not have.  The architecture is read from the model file and, when it is
+    // `deepseek2`, the dedicated runner takes over before any qwen4exp-only validation.
+    if (!o.native_preset.empty()) {
+        std::string arch;
+        try {
+            strata::GgufFile mf(o.native_preset);
+            if (const strata::MetaValue* a = mf.get("general.architecture");
+                a != nullptr && a->type == strata::MetaType::STRING)
+                arch = a->s;
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "strata generate: reading the architecture from %s: %s\n", o.native_preset.c_str(),
+                         e.what());
+            return 1;
+        }
+        if (arch == "deepseek2") return run_deepseek2(o);
     }
     if ((o.ple_io != "direct" && o.ple_io != "mmap") || o.ple_row_cache < 0 || o.ple_inflight < 1 ||
         o.ple_inflight > 1024 || !(o.ple_delay_us >= 0)) {
@@ -1408,24 +1788,40 @@ int main(int argc, char** argv) {
                 const strata::MetaValue* v = model_gguf.get((arch + "." + key).c_str());
                 return v != nullptr && v->is_num() ? (int64_t) v->u : dflt;
             };
+            const bool ds2 = (arch == "deepseek2");
             g.n_expert = u("expert_count", g.n_expert);
             K = u("expert_used_count", K);
             g.n_layers = u("block_count", g.n_layers);
             g.n_embd = u("embedding_length", g.n_embd);
             g.n_head = u("attention.head_count", g.n_head);
             g.n_head_kv = u("attention.head_count_kv", g.n_head_kv);
-            g.head_dim = u("attention.key_length", g.head_dim);
             g.n_ff = u("expert_feed_forward_length", g.n_ff);
-            g.qsa_interval = u("full_attention_interval", g.qsa_interval);
-            g.hc = u("hyper_connection.count", g.hc);
-            g.hc_lr = u("hyper_connection.low_rank", g.hc_lr);
-            g.ssm_state_size = u("ssm.state_size", g.ssm_state_size);
-            // MLA (deepseek2/deepseek4): selected by architecture, with the low-rank widths and the rotated
-            // head dims from the GGUF (docs/DEEPSEEK.md §5).  The qwen4exp path leaves these at 0.
-            g.mla = (arch == "deepseek2" || arch == "deepseek4") ? 1 : 0;
-            g.n_lora_q = u("attention.q_lora_rank", g.n_lora_q);
-            g.n_lora_kv = u("attention.kv_lora_rank", g.n_lora_kv);
-            g.n_rot = u("rope.dimension_count", g.n_rot);
+            if (ds2) {
+                // **THE deepseek2 GEOMETRY IS READ UNDER ITS OWN PREFIX AND WITH ITS OWN KEYS.**  The MLA head
+                // width is `attention.key_length_mla` (256), NOT the 576-wide compressed-KV row that
+                // `attention.key_length` names; there is no hyper-connection block and no SSM, so `qsa_interval`
+                // is set past the last layer (n_qsa_layers() == 0) and hc/hc_lr are 1 (never read).
+                g.head_dim = u("attention.key_length_mla", g.head_dim);
+                g.n_lora_q = u("attention.q_lora_rank", g.n_lora_q);
+                g.n_lora_kv = u("attention.kv_lora_rank", g.n_lora_kv);
+                g.n_rot = u("rope.dimension_count", g.n_rot);
+                g.mla = 1;
+                g.qsa_interval = g.n_layers + 1;
+                g.hc = 1;
+                g.hc_lr = 1;
+            } else {
+                g.head_dim = u("attention.key_length", g.head_dim);
+                g.qsa_interval = u("full_attention_interval", g.qsa_interval);
+                g.hc = u("hyper_connection.count", g.hc);
+                g.hc_lr = u("hyper_connection.low_rank", g.hc_lr);
+                g.ssm_state_size = u("ssm.state_size", g.ssm_state_size);
+                // MLA (deepseek4): selected by architecture, with the low-rank widths and the rotated head dims
+                // from the GGUF.  The qwen4exp path leaves these at 0.
+                g.mla = (arch == "deepseek4") ? 1 : 0;
+                g.n_lora_q = u("attention.q_lora_rank", g.n_lora_q);
+                g.n_lora_kv = u("attention.kv_lora_rank", g.n_lora_kv);
+                g.n_rot = u("rope.dimension_count", g.n_rot);
+            }
         } catch (const std::exception& e) {
             std::fprintf(stderr, "strata generate: reading the model's geometry from %s: %s\n",
                          o.native_preset.c_str(), e.what());
@@ -1437,9 +1833,20 @@ int main(int argc, char** argv) {
         // into the router's ids (0x464C457F, the ELF magic) and HUNG THE GPU.  Until that is fixed, a native
         // pack must carry an expert count the prompt path has been verified on (288 reap / 512 canonical);
         // 180 is refused loudly here rather than crashing the card (docs/TODO.md P0).
+        //
+        // **deepseek2 IS RELAXED, AND ONLY deepseek2.**  It has no SSM and no hyper-connections, its expert count
+        // is 64, and its own `run_deepseek2` path owns it; the qwen4exp guard below is unchanged for every other
+        // architecture.
         const bool tested_experts = g.n_expert == 288 || g.n_expert == 512;
-        if (g.n_embd <= 0 || g.hc <= 0 || g.hc_lr <= 0 || g.n_ff <= 0 || g.ssm_state_size != 128 ||
-            (native_pack && !tested_experts)) {
+        const bool ds2_arch = g.mla != 0 && g.qsa_interval == g.n_layers + 1;
+        if (ds2_arch) {
+            if (g.n_embd <= 0 || g.n_ff <= 0 || g.n_head <= 0 || g.n_lora_q <= 0 || g.n_lora_kv <= 0 ||
+                g.n_rot <= 0 || g.head_dim <= g.n_rot || g.n_expert <= 0 || K <= 0) {
+                std::fprintf(stderr, "strata generate: the deepseek2 geometry is not a positive shape\n");
+                return 2;
+            }
+        } else if (g.n_embd <= 0 || g.hc <= 0 || g.hc_lr <= 0 || g.n_ff <= 0 || g.ssm_state_size != 128 ||
+                   (native_pack && !tested_experts)) {
             std::fprintf(stderr,
                          "strata generate: %s geometry (n_embd %lld, hc %lld, hc_lr %lld, n_ff %lld, qsa_interval "
                          "%lld, ssm %lld, experts %lld) is not runnable by this build yet (needs ssm 128 and "

@@ -13,10 +13,17 @@
 
 namespace strata::kernels::cpu {
 
-/// Bytes of the largest quantized activation any native layer uses (2560 values as Q8_K: 10 x 292).
+/// Bytes of the largest quantized activation any native layer uses (2560 values as Q8_K: 10 x 292; GLM's
+/// 2048-wide gate/up as Q8_K is 8 x 292).  These only size the pool's staging buffers - every kernel indexes
+/// with `NativeFmt::act_bytes`/`h_bytes`, not with these - so a value larger than the strict maximum is safe.
 inline constexpr size_t kNativeActBytes = 4096;
-/// Bytes of the largest quantized down activation (640 values as Q8_0: 20 x 34, or Q8_K 3 x 292).
-inline constexpr size_t kNativeHBytes = 1024;
+/// Bytes of the largest quantized down activation (640 values as Q8_0: 20 x 34; GLM's 1536-wide Q6_K down as
+/// Q8_K is 6 x 292 = 1752, which the old 1024 refused).
+inline constexpr size_t kNativeHBytes = 4096;
+/// The widest expert intermediate the pool's per-expert scratch holds.  The pool's compile-time `FF` (640) is the
+/// Q2_0 artifact's width and is baked into the pack's blob offsets, so it cannot be raised; a native pack
+/// (deepseek2's `n_ff 1536`) stages its gate/up rows here instead.  Only sizing - a kernel never indexes with it.
+inline constexpr int kNativeMaxFF = 4096;
 
 /// One layer's native expert geometry.
 struct NativeFmt {

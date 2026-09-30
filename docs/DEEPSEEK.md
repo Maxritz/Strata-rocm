@@ -148,8 +148,27 @@ IQ4_XS): no canonicalization pass is required.
   `native_quantize_q8_1`.  Evidence: `build_gfx1201\ds2_moe_parity.exe --selftest` -> **PASS**; ids exact and
   weights exact over 8 seeds (scale 1.0/1.8, norm on/off), the bias is shown to reorder the selection, the
   weight is the unbiased sigmoid, and `swiglu_mul` matches.
-- **Still OPEN for M2:** the decode/prefill wiring from `generate.cpp`/`session.cpp` (the engine still runs only
-  `qwen4exp`; the MLA/MoE functions are not yet called from a session), and the geometry guard.
+- **M2 step 7 — the deepseek2 model RUNS (2026-10-01).**  `ds2_token` (`src/core/session.cpp`) composes one
+  token's `x += MLA(rms(x))` / `x += FFN(rms(x))` over all 47 layers; `session_bytes`/`session_init`/
+  `session_zero` allocate the per-layer `MlaState` compressed-KV caches (plus the MLA scratch, the MoE buffers and
+  four n_embd intermediates) behind `g.mla != 0`, so the qwen4exp path is byte-for-byte unchanged.
+  `mla_layer_weights` (layer.cpp) resolves the six native projections by name; the MoE half is the layer-0 dense
+  FFN (`dense_ffn_ds2`) or the routed+shared sigmoid MoE (`moe_route_ds2`/`moe_shared_ds2`/`moe_finish_ds2`).
+  `generate.cpp` reads the geometry under `deepseek2.*` (`key_length_mla`, `q/kv_lora_rank`, `rope.dimension_count`,
+  `expert_weights_norm/scale`, `leading_dense_block_count`) and dispatches to a dedicated `run_deepseek2` before
+  any qwen4exp-only validation; the qwen4exp guard is relaxed only for deepseek2.
+  The CPU expert pool gained a native single-token dispatch (`native_expert_pool_dispatch`) that uses the layer's
+  own `n_embd`/`n_ff` instead of the Q2_0 artifact's 2560/640 (GLM is 2048/1536; the pool's hard-coded `H`/`FF`
+  refused it).
+  **Evidence (gfx1201), command:**
+  `build_gfx1201\strata.exe --pack H:\OLLAMA-Models\strata-pack-glm --native H:\OLLAMA-Models\GGUF\GLM-4.7-Flash-APEX-I-Quality.gguf --tokens "..." --max-new 6 --max-context 1024`
+  - `The capital of France is` (785,6722,315,9621,374) -> `12089 13 ...` = **" Paris."**
+  - `The capital of Germany is` (785,6722,315,9851,374) -> `19808 13 ...` = **" Berlin."**
+  - `2+2=` (17,10,17,28) -> `19 ...` = **"4"**
+  - decode **12.9-13.0 tok/s**, prefill (token-at-a-time) **~12.1-12.4 tok/s**; expert arena 16.09 GiB.
+- **Still OPEN for M2:** a BATCHED prefill for deepseek2 (the prompt currently runs one token at a time through
+  `ds2_token`), and the formal G-COH gate vs a CPU/llama.cpp reference (the greedy continuations above are
+  coherent but were not yet scored L1 <= 1e-3 against a reference), plus decode-60 / prefill-5000 tuning.
 
 
 

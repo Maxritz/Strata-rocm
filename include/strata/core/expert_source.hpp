@@ -248,6 +248,14 @@ struct ExpertDispatch {
 void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, const float* weights, int64_t n_embd,
                           int64_t k, float* out);
 
+/// **THE deepseek2 / NATIVE single-token dispatch.**  `expert_pool_dispatch` refuses a native (GGUF-quantized)
+/// pack and bakes in the Q2_0 artifact's 2560/640 widths; a deepseek2 model is native, dense at layer 0, and has
+/// its own `n_embd`/`n_ff` (2048/1536 for GLM).  This takes the layer's own `NativeFmt` and runs the ggml-cpu
+/// arithmetic through the pool's multi-expert path with one token per expert.  `layer` is explicit because of
+/// the dense leading layers.  `out` is (k, n_embd) host memory; `weights` are applied later by the combine.
+void native_expert_pool_dispatch(void* user, int64_t layer, const float* x_f, const int32_t* ids, int64_t n_embd,
+                                 int64_t k, float* out);
+
 /// Plan v0.3 P6: the pool for a verify window of `n_tok` tokens.  `x_f` is (n_tok, n_embd), `ids` (n_tok, k) and
 /// `out` (n_tok * k, n_embd).  Each distinct missed expert is computed once for all the tokens routed to it;
 /// resident experts' rows are zeroed (the GPU adds them).  Requires `host_res` (the token-graph residency).

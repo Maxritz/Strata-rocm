@@ -100,6 +100,15 @@ Each is DONE only when it passes G-COH and reports decode/prefill on gfx1201.
 | M5 | **nemotron_h_moe, qwen3moe, olmoe** | own decoders | recognised only |
 | M6 | **ROCmFPX** (Ornith-1.0-9B) | AMD FP4/FP6/FP8 native on gfx1201 | = K2 |
 
+- **M2 MILESTONE (2026-10-01, NOT the gate): deepseek2/GLM-4.7-Flash RUNS.**  The MLA decoder + sigmoid MoE are
+  now wired into a session (`ds2_token`) and dispatched from `generate.cpp` (`run_deepseek2`), token-at-a-time
+  (no batched prefill).  gfx1201, `strata.exe` on `strata-pack-glm` + the GLM GGUF: decode **12.9-13.0 tok/s**,
+  prefill **~12.1-12.4 tok/s**; greedy continuations are coherent ("The capital of France is" -> " Paris.",
+  "The capital of Germany is" -> " Berlin.", "2+2=" -> "4").  `qsa_parity`/`gdn_parity`/`gr_parity`/
+  `native_expert_parity`/`mla_parity`/`ds2_moe_parity` all green after the change.  **The gate is still OPEN**:
+  G-COH (L1 <= 1e-3 vs a CPU/llama.cpp reference) has not been measured, prefill is one-token-at-a-time, and
+  decode/prefill are far below G-PERF.  Details in `docs/DEEPSEEK.md` §7 (M2 step 7).
+
 ---
 
 ## 5. PENDING — ENGINE (the G-PERF / N-RAM path)

@@ -71,6 +71,34 @@ struct SessionState {
     /// `session_capture`/`session_loop`/`session_token` need no new parameter to reach it.  A `PleRun` whose
     /// `ready()` is false is skipped, which is what every caller had before LEDGER L123.
     PleRun ple;
+
+    // ================================ deepseek2 / MLA (the g.mla != 0 path) ================================
+    //
+    // A deepseek2 model does NOT use the qwen4exp block: no hyper-connections, no GDN/QSA mix, no PLE, no
+    // gated-residual stack.  One token is `x = emb; for l: x += MLA(norm(x)); x += FFN(norm(x))` with the
+    // per-cell compressed KV carried in `mla_states[l]`.  These fields are allocated ONLY when `g.mla != 0`, so
+    // the qwen4exp path is byte-for-byte unchanged.  `ds2_x` is both the token's residual and the vector the
+    // head reads; the other three are the per-layer intermediates.
+    MlaState* mla_states = nullptr;      ///< one per layer (the per-layer compressed-KV cache)
+    void* mla_state_arena = nullptr;     ///< the arena the MlaStates are carved from
+    MlaBuffers mla_bufs;                 ///< scratch, shared across layers (they never run concurrently)
+    void* mla_buf_arena = nullptr;
+    float* ds2_x = nullptr;              ///< n_embd: the token's residual, and the head's input
+    float* ds2_xn = nullptr;             ///< n_embd: the normed activation (never aliases ds2_x)
+    float* ds2_attn = nullptr;           ///< n_embd: the MLA output for this layer
+    float* ds2_ffn = nullptr;            ///< n_embd: the FFN/MoE output for this layer
+    float* ds2_dense_scratch = nullptr;  ///< `shared_expert_scratch_bytes(dense_ff)` for the layer-0 dense FFN
+    float* ds2_parts = nullptr;          ///< (k, n_embd) device: the routed experts' outputs
+    float* ds2_x_host = nullptr;         ///< (n_embd,) pinned: the pool's activation staging
+    int32_t* ds2_ids_host = nullptr;     ///< (k,) pinned
+    float* ds2_w_host = nullptr;         ///< (k,) pinned
+    float* ds2_parts_host = nullptr;     ///< (k, n_embd) pinned: the pool's answer
+    float ds2_norm_eps = 1e-5f;          ///< `deepseek2.attention.layer_norm_rms_epsilon`
+    float ds2_rope_base = 1000000.0f;    ///< `deepseek2.rope.freq_base`
+    float ds2_expert_scale = 1.0f;       ///< `deepseek2.expert_weights_scale`
+    bool ds2_expert_norm = false;        ///< `deepseek2.expert_weights_norm`
+    int64_t ds2_dense_lead = 0;          ///< `deepseek2.leading_dense_block_count`
+    int64_t ds2_dense_ff = 0;            ///< the leading dense FFN's width (layer 0)
 };
 
 /// Bytes for a whole session at `max_cells` of context.  Every layer's state is sized at once, because P2.T10
@@ -97,6 +125,25 @@ void session_zero(SessionState& s, const ModelGeometry& g, const float* R_init, 
 bool session_token(const WeightTable& tables, const ModelGeometry& g, int64_t pos, int32_t pos_base,
                    SessionState& s, const float* parts, void* stream, bool sync_every_layer,
                    std::string& err);
+
+/// The CPU-pool callback for the deepseek2 path.  It is `PoolFn` plus the LAYER INDEX, because a deepseek2
+/// model is dense at layer 0 and MoE afterwards: the generic `PoolFn` has no way to tell the pool which layer's
+/// expert blob to read, and the adapter's own counter assumes a pool call on every layer.  `out` is (k, n_embd)
+/// host memory.  `layer` is the CURRENT layer.
+using PoolFnLayer = void (*)(void* user, int64_t layer, const float* x_f, const int32_t* ids, const float* weights,
+                             int64_t n_embd, int64_t k, float* out);
+
+/// **ONE TOKEN THROUGH A deepseek2 / MLA MODEL.**  `s.ds2_x` must already hold the token's embedding; this runs
+/// every layer in order - `x += mla_layer(norm_attn(x))`, then the layer-0 dense FFN or the routed/shared MoE on
+/// `norm_ffn(x)` - and leaves the final residual in `s.ds2_x` for the caller's head.  The per-layer compressed
+/// KV is appended to `s.mla_states[layer]` at `pos`, so the cache is the ONLY state that survives a token.
+///
+/// `pool` receives the router's layer, activation, ids and weights and must write the k expert outputs into
+/// `out`.  A null `pool` leaves the routed experts at zero (the GPU-only floor), exactly as `--no-pool` does for
+/// qwen4exp.  This is the TOKEN-AT-A-TIME path: there is no batched prefill for deepseek2 yet, and a caller that
+/// needs a prompt runs this once per prompt token (docs/DEEPSEEK.md §7).
+bool ds2_token(const WeightTable& tables, const ModelGeometry& g, int64_t pos, SessionState& s, PoolFnLayer pool,
+               void* user, void* stream, std::string& err);
 
 // ================================ the captured form ================================
 
