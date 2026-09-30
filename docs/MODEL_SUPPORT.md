@@ -183,13 +183,32 @@ embd 2048, 40L, `full_attention_interval 4`, ssm state 128 / conv 4 / inner 4096
 kernel** — standard **GQA** (16 heads / 2 kv, key/value 256) with **partial RoPE** (64 dims, sections
 `[11,11,10,0]`, base 1e7); and skip the hyper-connection block. Everything else is the engine.
 
-## 6d. Whittle — DEFERRED (future work)
+## 6d. Whittle — PARKED (2026-09-30, owner decision; GGUF deleted)
 
-Whittle-Qwen-3.8-35B-A3B is `qwen4exp` and its foundation is done (`PleFmt`/`q4_K_dequant_row` `7196897`;
-runtime `PleGeom` + `ple_consts_from_meta` `4967fb8`, both byte-identical on the working path). What remains
-is mechanical but not started: `PleTable::open` taking `head_dim`/format from the tensor, the loader calling
-`ple_consts_from_meta`, the caller-side `NG_N_EMBD`/`NG_HC_DIM`/`PLE_N_HEADS` → `ss.ple.consts.geom`, and a
-pack. **Deferred by request** in favour of the larger `qwen35moe` shelf; the commits stay valid.
+Whittle-Qwen-3.8-35B-A3B is `qwen4exp` at a **different shape** from the working Swift model, and the port got
+further than this section used to claim. **Done and still valid:** `PleFmt`/`q4_K_dequant_row` (`7196897`),
+runtime `PleGeom` + `ple_consts_from_meta` (`4967fb8`, byte-identical on the working path), pack v4 with
+`n_embd`/`n_ff`/table-derived layer count, quantised QSA indexer projections, metadata-driven architecture
+recognition, and a built pack (`180` experts, 13.7 GB experts + 865 MB dense + tokenizer). **It loads fully and
+reaches the prefill.** Then it hung the GPU; the router returned `0x464C457F`. Cause unknown — see `TODO.md`
+P0 #2 for the disproved theories and the full evidence.
+
+**What is actually left, and why it is not mechanical:**
+
+1. **The PLE GPU block is compile-time Swift.** `src/kernels/cuda/ple.cu:235-236` pins `n_embd`/`hc`/`hc_dim`
+   to the compiled constants behind `static_assert(NG_N_EMBD == 2560 && NG_HC_DIM == 10240)`, so a 2048-wide
+   model silently computes the PLE at the wrong widths. The *reader* is generic; the *compute* is not. This is
+   the real remaining port, and it needs `src/kernels/ple_parity.cpp` re-run against **both** shapes.
+2. **The n-gram tables are a different shape, not a resize.** Read from both GGUFs: Swift
+   `[160, 320001536]` IQ4_NL / `heads_per_ngram 8`; Whittle `[256, 39040000]` Q4_K / `heads_per_ngram 4`,
+   with `embedding_length` 2560 → **2048**. Upstream grafts its table from Qwen's ("8 of 16 heads, 25% of the
+   rows, into dims [0, 640) of each 1024-wide order block"), so the geometry genuinely differs.
+3. **QSA geometry** — `head_count` 16 (not the hardcoded 24) and `indexer.top_k` 262144 (never propagated by
+   `qsa_shapes`), plus the `T*512`/`T*12288` buffers at runtime.
+4. **A prefill watchdog** before any GPU run — the verify window has a 20 s timeout, the prefill has none.
+
+The safety guard in `generate.cpp` stays: it is what turned a hang into a refusal. `--model-info` still
+recognises the family.
 
 ## 7. Priority
 
@@ -201,6 +220,7 @@ Current order (set 2026-09-30):
    current work, in progress.**
 2. **`deepseek4`** (MLA + sparse attention) — designed (§14), ds4's `rocm/*.cuh` is the reference. Largest.
 3. **`laguna`, `muse-glimmer`, `k2-horizon`, `nemotron_h_moe`, …** — each its own decoder; after the above.
-4. **Whittle (`qwen4exp` 2048)** — foundation done, **deferred** (§6d); ~1 session to finish when wanted.
+4. **Whittle (`qwen4exp` 2048)** — **parked** (§6d); the packs and reader commits stay valid, but `ple_block`
+   must be generalised to runtime geometry before any GPU run. Revisit when the shelf is exhausted.
 5. **The verify-window bug** — bites the *native* path only; a **canonical pack avoids it** (deterministic
    token path). Treat as a speed item for most models, a correctness item for `--native`.

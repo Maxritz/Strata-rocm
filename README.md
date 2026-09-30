@@ -63,7 +63,7 @@ ssm 128 / top-10):
 | `Qwen3.8-Flash-Next-ngram-embeddings-Q4_0.gguf` | 10 × 512 | **runs** |
 | `Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-*.gguf` | 10 × 512 | **runs** |
 | `DeepSeek-V4-Flash-…` | 6 × 256 | recognised, plan in [`docs/ROCM_PORTING.md`](docs/ROCM_PORTING.md) §14 |
-| `Whittle-Qwen-3.8-35B-A3B-…` | 8 × 180 | `qwen4exp`, geometry needs generalising |
+| `Whittle-Qwen-3.8-35B-A3B-…` | 8 × 180 | `qwen4exp` — **parked**, loads but hangs prefill; `ple_block` is compiled for the 2560 shape |
 | Qwen3.5-35B-A3B, Tiel-Coder-35B, ornith-35B, … (`qwen35moe`) | 8 × … | new architecture — see [`docs/MODEL_SUPPORT.md`](docs/MODEL_SUPPORT.md) |
 
 `strata --model-info <file.gguf>` reports a file's architecture, geometry and whether this build runs it.
