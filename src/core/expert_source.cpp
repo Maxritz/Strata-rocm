@@ -32,6 +32,11 @@
 
 namespace strata::core {
 
+// docs §7.4: how many layers back the decode-path release lags.  The verify window can still hold layer `l-1`'s
+// plan aliases in flight while layer `l` dispatches, so releasing `l-1` was one layer too eager - the source of
+// the bounded ring's nondeterminism.  Two layers of lag gave the window room; the pool is sized far above it.
+static constexpr int64_t LAG_DECODE = 4;
+
 // ================================ THE FILE-BACKED SOURCE ================================
 
 FileExpertSource::~FileExpertSource() { close(); }
@@ -194,6 +199,12 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
     }
     if (k > (int64_t) d.jobs.size()) d.jobs.resize((size_t) k);
 
+    // docs §7.4: gate the PREVIOUS layer's source slots on an event recorded here - `cache_stream` already holds
+    // `post[l-1]` (which reads the plan's aliases) and `pre[l]`, so its completion is a rigorous release point.
+    if (d.cache_stream != nullptr && d.release_ev != nullptr && d.layers > LAG_DECODE) {
+        hipEventRecord((hipEvent_t) d.release_ev, (hipStream_t) d.cache_stream);
+        d.src->release_layer(d.layers - LAG_DECODE, d.release_ev);
+    }
     d.src->begin_layer(d.layers, ids, k);
 
     // Clause 1: rebuilt from `x_f` on EVERY call.  `x_f` is mapped pinned memory whose address never changes,
@@ -283,6 +294,10 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     };
     const auto c0 = std::chrono::steady_clock::now();
     pt("begin");
+    if (d.cache_stream != nullptr && d.release_ev != nullptr && d.layers > LAG_DECODE) {
+        hipEventRecord((hipEvent_t) d.release_ev, (hipStream_t) d.cache_stream);
+        d.src->release_layer(d.layers - LAG_DECODE, d.release_ev);
+    }
     d.src->begin_layer(d.layers, ids, n_tok * k);
     pt("begun");
     if (!d.usage.empty())
@@ -933,14 +948,15 @@ int64_t RingExpertSource::acquire(int64_t layer, int64_t expert) {
     ++misses_;
     int64_t s = reusable_slot();
     if (s < 0) {
-        // No free slot: the pool is smaller than the live working set.  Wait for the oldest gate, then take it.
-        // This is the one path that blocks the host, and it is counted: a nonzero `thrash` means the pool is
-        // undersized for the request, which is the number an `--expert-ram-gb` sweep is reading.
+        // **NO SLOT HAS A COMPLETED GATE: THE POOL IS SMALLER THAN THE LIVE WORKING SET.**  Overwriting one here
+        // would be the race this class exists to prevent, so the device is quiesced first - after that every
+        // consumer of every slot has finished and the reuse is unconditionally safe.  It is the one path that
+        // blocks the host; a nonzero `thrash` is the number an `--expert-ram-gb` sweep is reading.
         ++thrash_;
+        (void) hipDeviceSynchronize();
         s = lru_.front();
-        Slot& v = slot_[(size_t) s];
-        if (v.gate != nullptr) { hipEventSynchronize((hipEvent_t) v.gate); v.gate = nullptr; }
-        v.held = false;
+        slot_[(size_t) s].gate = nullptr;
+        slot_[(size_t) s].held = false;
     }
     Slot& v = slot_[(size_t) s];
     if (v.layer >= 0) {
@@ -977,8 +993,7 @@ const uint8_t* RingExpertSource::blob(int64_t layer, int64_t expert) {
 bool RingExpertSource::pinned(int64_t layer, int64_t expert) const {
     (void) layer;
     (void) expert;
-    // The ring is registered as a whole.  Every caller pairs this with a `blob()`/`device_alias()` that has
-    // already made the slot resident, so "registered" is the honest answer here.
+    // The pool is registered as a whole, so a copy can DMA straight out of a slot.
     return dev_ != nullptr;
 }
 
@@ -989,16 +1004,10 @@ const uint8_t* RingExpertSource::device_alias(int64_t layer, int64_t expert) con
 }
 
 void RingExpertSource::begin_layer(int64_t layer, const int32_t* ids, int64_t k) {
-    // **A NEW LAYER'S DISPATCH.**  On the decode path the session loop cannot reach this call for layer `l+1`
-    // until layer `l`'s `post` has run (its doorbell requires `pre[l+1]`, which is stream-ordered after
-    // `post[l]`), so every consumer of layer `l`'s slots is complete and un-protecting them is safe.  The
-    // **prefill** path does NOT call this - its host legitimately runs ahead - so it uses `release_layer` with
-    // an event instead (docs EXPERT_RESIDENCY_FINDINGS §4/§7.4).
-    if (layer != cur_layer_) {
-        for (Slot& s : slot_) s.held = false;
-        layer_slots_.clear();
-        cur_layer_ = layer;
-    }
+    // docs §7.4: the RELEASE is explicit and gated on a stream event (`release_layer`), so this only warms the
+    // layer's experts.  A blind un-hold here WAS a race - the decode plan's aliases are read by `post[l]`, which
+    // is enqueued AFTER this call, so un-protecting here let a slot be overwritten while still in flight (the
+    // nondeterminism that made the ring pass on some runs and fail on others).
     if (ids != nullptr) {
         for (int64_t i = 0; i < k; ++i)
             if (ids[i] >= 0 && ids[i] < n_expert_) (void) acquire(layer, ids[i]);

@@ -132,6 +132,10 @@ struct ExpertDispatch {
     int64_t cache_admitted = 0;  ///< lookups that took a slot
     int64_t cache_refused = 0;   ///< lookups with no slot free (the cache is full)
     void* cache_stream = nullptr;
+    /// docs §7.4: the event that gates the PREVIOUS layer's source slots on the decode path.  Recorded on
+    /// `cache_stream` at the top of each layer's dispatch - after `post[l-1]` (which reads the plan's aliases) and
+    /// `pre[l]` are enqueued - so its completion is a rigorous release point, not a timing assumption.
+    void* release_ev = nullptr;
     const char* cache_fail = nullptr;
 
     // ================================ R4.2c: THE HITS GO TO THE GPU ================================

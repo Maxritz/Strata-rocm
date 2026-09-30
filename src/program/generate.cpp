@@ -1054,9 +1054,9 @@ int main(int argc, char** argv) {
                                   q = u("qwen4exp.full_attention_interval"), sm = u("qwen4exp.ssm.state_size");
                 std::printf("  embd %lld  hc %lld  hc_lr %lld  n_ff %lld  qsa_interval %lld  ssm %lld  experts %lldx%lld\n",
                             e, hc, lr, ff, q, sm, u("qwen4exp.expert_used_count"), u("qwen4exp.expert_count"));
-                std::printf("support: %s\n", (e == 2560 && hc == 4 && lr == 320 && ff == 640 && q == 4 && sm == 128)
-                                                  ? "SUPPORTED (matches the compiled prompt path)"
-                                                  : "NOT runnable: geometry differs from the compiled prompt path");
+                const bool ok = e > 0 && hc > 0 && lr > 0 && ff > 0 && sm == 128;
+                std::printf("support: %s\n", ok ? "SUPPORTED (qwen4exp; geometry read from the header)"
+                                                : "NOT runnable: needs ssm 128 and positive widths");
             } else if (arch == "deepseek4") {
                 std::printf("  MLA: heads %lld kv %lld key/value %lld  q_lora %lld  out_lora %lld x%lld  layers %lld embd %lld\n",
                             u("deepseek4.attention.head_count"), u("deepseek4.attention.head_count_kv"),
@@ -1383,14 +1383,14 @@ int main(int argc, char** argv) {
                          o.native_preset.c_str(), e.what());
             return 1;
         }
-        // The prompt path (src/prefill/prefill.cpp) is compiled for ONE geometry.  A model that differs from it is
-        // refused LOUDLY here rather than silently mis-run.  Making N / n_ff / hc / K runtime is the next step.
-        if (g.n_embd != 2560 || g.hc != 4 || g.hc_lr != 320 || g.n_ff != 640 || g.qsa_interval != 4 ||
-            g.ssm_state_size != 128) {
+        // docs/MODEL_SUPPORT.md Family A: the prompt path now takes its geometry (N / HC / LR / K / n_ff) from the
+        // header, so any qwen4exp shape runs - the 2560 original and the Whittle 2048 / ff 512 / 8-of-180 alike.
+        // What is still refused is a geometry the kernels cannot serve (the SSM path is compiled for 128).
+        if (g.n_embd <= 0 || g.hc <= 0 || g.hc_lr <= 0 || g.n_ff <= 0 || g.ssm_state_size != 128) {
             std::fprintf(stderr,
                          "strata generate: %s geometry (n_embd %lld, hc %lld, hc_lr %lld, n_ff %lld, qsa_interval "
-                         "%lld, ssm %lld) is not the compiled prompt path (2560/4/320/640/4/128); this build can only "
-                         "run the Qwen3.8-Flash-Next shape\n",
+                         "%lld, ssm %lld) is not runnable by this build (needs ssm 128 and positive "
+                         "embedding/hyper-connection/feed-forward widths)\n",
                          o.native_preset.c_str(), (long long) g.n_embd, (long long) g.hc, (long long) g.hc_lr,
                          (long long) g.n_ff, (long long) g.qsa_interval, (long long) g.ssm_state_size);
             return 2;
@@ -1599,8 +1599,12 @@ int main(int argc, char** argv) {
                      (double) ((uint64_t) ring_src.slots() * (uint64_t) ring_src.slot_bytes()) /
                          (1024.0 * 1024.0 * 1024.0),
                      o.expert_ram_gb);
-        std::fprintf(stderr, "strata generate: ring slots are released per layer on a recorded event "
-                             "(docs §15.4/§7.4); prefill and decode re-verified against the arena\n");
+        std::fprintf(stderr,
+                     "strata generate: WARNING -- the bounded ring's EVICTION path is still nondeterministic "
+                     "(the release is not yet per-consumer across the verify window); a pool that holds every "
+                     "expert (--expert-ram-gb 34) is byte-identical to the arena, an evicting one diverges on "
+                     "some runs.  Do not use it for correctness-critical output yet (docs/"
+                     "EXPERT_RESIDENCY_FINDINGS.md section 10c).\n");
         srcp = &ring_src;
     } else if (o.mmap_experts) {
         if (!src.open(o.pack, g.n_layers, g.n_expert, err)) {
@@ -1842,6 +1846,13 @@ int main(int argc, char** argv) {
         }
         drive.d.cache = &xcache;
         drive.d.cache_stream = main_cs;
+        // docs §7.4: the ring's decode-path release gate.  Without it a slot could be overwritten while `post[l]`
+        // was still reading its alias, which made the bounded ring nondeterministic.
+        if (drive.d.release_ev == nullptr) {
+            hipEvent_t rev = nullptr;
+            if (hipEventCreateWithFlags(&rev, hipEventDisableTiming) == hipSuccess) drive.d.release_ev = rev;
+            else (void) hipGetLastError();
+        }
         drive.d.cache_base = (const uint8_t*) xcache.device_slot(0);
         drive.d.cache_blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
         drive.d.cache_slot_off = xcache.slot_offsets();

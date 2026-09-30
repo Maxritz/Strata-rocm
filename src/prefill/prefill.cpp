@@ -63,11 +63,16 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 constexpr float EPS = 1e-6f;
-constexpr int64_t N = 2560, HC = 4, D = N * HC, LR = 320, K = 10;
+// **GEOMETRY, SET FROM THE MODEL IN `init`.**  These were `constexpr` for the one N-wide artifact.  The
+// kernels take their dimensions at runtime (shape structs / parameters), so once the values come from the
+// header any `qwen4exp` shape flows through - the Whittle 35B-A3B (2048 / hc 4 / ff 512 / 8 of 180) included.
+// File-scope `static` exactly like `NE`: a process runs one model, and the token path reads them every chunk.
+static int64_t N = 0, HC = 0, D = 0, LR = 0, K = 0, FF = 0;
 // The expert count is the ONE geometry field a pack may vary (288 for the reap-288 Flash-Next, 512 for the
 // canonical artifact), so it is set from ModelGeometry in Prefill::init below - not frozen at compile time.
 int64_t NE = 512;
-constexpr int64_t C = 10240, ZV = 6144, HV = 48;
+static int64_t C = 0;               // = D, set in init (the residual width, used for buffer sizes only)
+constexpr int64_t ZV = 6144, HV = 48;
 // plan v0.3 P6: staging holds the largest blob of the pack (a native pack's blobs differ per layer)
 inline int64_t MAXBLOB() { return (int64_t) strata::kernels::cpu::expert_layout().max_blob; }
 constexpr int STAGE = 8;           // host->device expert staging ring (chunks below STREAM_ALL_MIN)
@@ -412,7 +417,7 @@ uint64_t qsa_set_bytes(size_t T, int64_t cap, int64_t max_blocks, int64_t sel_ba
 // gate/up and down matrices a group buffer slot holds.  STRATA_PREFILL_MMQ=0: the FP16 path everywhere (the A/B).
 constexpr int MMQ_GROUP = 16;                  // experts per MMQ launch (the gather is per expert, as blobs arrive)
 // MMQ reads up to one 256-value tile past a matrix's last row when the row length is not a multiple of it (the down
-// product: 640 values).  Those bytes meet zero activations, which is harmless only if they decode to finite numbers -
+// product: FF values).  Those bytes meet zero activations, which is harmless only if they decode to finite numbers -
 // llama.cpp zero-pads after every tensor, and so does a group buffer: this many zeroed bytes follow its last expert.
 constexpr size_t MMQ_TAIL = 4096;
 struct MmqPlan {
@@ -434,8 +439,8 @@ const MmqPlan& mmq_plan() {
             if (!mmq::supported(gt) || !mmq::supported(dt)) { p.fallback = true; continue; }
             p.layer[(size_t) l] = 1;
             p.any = true;
-            p.gu_max = std::max(p.gu_max, mmq::matrix_bytes(gt, 1280, N));
-            p.d_max = std::max(p.d_max, mmq::matrix_bytes(dt, N, 640));
+            p.gu_max = std::max(p.gu_max, mmq::matrix_bytes(gt, (2 * FF), N));
+            p.d_max = std::max(p.d_max, mmq::matrix_bytes(dt, N, FF));
         }
         return p;
     }();
@@ -447,14 +452,14 @@ uint64_t moe_set_bytes(size_t T) {
     a.take<float>(T * NE, ok); a.take<float>(T * K, ok); a.take<int32_t>(T * K, ok); a.take<int32_t>(T * K, ok);
     a.take<int32_t>(T * K, ok);
     if (mp.fallback) a.take<uint16_t>(T * K * N, ok);
-    a.take<float>(T * K * 1280, ok);
-    if (mp.fallback) a.take<uint16_t>(T * K * 640, ok);
-    a.take<float>(T * K * N, ok); a.take<float>(T * 640, ok);
-    a.take<float>(T * 640, ok); a.take<uint16_t>(T * 640, ok); a.take<float>(T * N, ok); a.take<float>(T, ok);
+    a.take<float>(T * K * (2 * FF), ok);
+    if (mp.fallback) a.take<uint16_t>(T * K * FF, ok);
+    a.take<float>(T * K * N, ok); a.take<float>(T * FF, ok);
+    a.take<float>(T * FF, ok); a.take<uint16_t>(T * FF, ok); a.take<float>(T * N, ok); a.take<float>(T, ok);
     if (mp.any) {
         a.take<uint8_t>(mmq::q8_bytes((int64_t) (T * K), N), ok);
-        a.take<float>(T * K * 640, ok);
-        a.take<uint8_t>(mmq::q8_bytes((int64_t) (T * K), 640), ok);
+        a.take<float>(T * K * FF, ok);
+        a.take<uint8_t>(mmq::q8_bytes((int64_t) (T * K), FF), ok);
     }
     return a.used;
 }
@@ -467,8 +472,11 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     m.wt = &wt; m.g = &g; m.ss = &ss; m.src = src; m.cache = cache; m.host_res = host_res;
     m.T = chunk; m.cs = (hipStream_t) stream; m.stats = &stats_;
     NE = g.n_expert;   // the artifact's expert count drives the ring, the routing tables and the residency map
-    if (g.n_embd != N || g.hc != HC || g.hc_lr != LR || g.n_expert != NE || ss.k != K) {
-        err = "prefill: geometry differs from the artifact's"; return false;
+    // docs/MODEL_SUPPORT.md Family A: the geometry comes from the header, not a compiled constant, so any
+    // qwen4exp shape (the 2560 original, the Whittle 2048 / ff 512 / 8-of-180) flows through the same path.
+    N = g.n_embd; HC = g.hc; D = N * HC; LR = g.hc_lr; K = ss.k; FF = g.n_ff; C = D;
+    if (N <= 0 || HC <= 0 || D <= 0 || LR <= 0 || K <= 0 || FF <= 0 || NE <= 0) {
+        err = "prefill: the model geometry is incomplete"; return false;
     }
     if (hipStreamCreateWithFlags(&m.copy, hipStreamNonBlocking) != hipSuccess) { err = "prefill: copy stream"; return false; }
     const size_t T = (size_t) chunk;
@@ -574,19 +582,19 @@ bool Prefill::carve(size_t T, void* alloc) {
         m.slot_dev = c.take<int32_t>(T * K, ok); m.src_dev = c.take<int32_t>(T * K, ok);
         const MmqPlan& mp = mmq_plan();
         m.Xs = mp.fallback ? c.take<uint16_t>(T * K * N, ok) : nullptr;
-        m.GU = c.take<float>(T * K * 1280, ok);
-        m.Hh = mp.fallback ? c.take<uint16_t>(T * K * 640, ok) : nullptr;
+        m.GU = c.take<float>(T * K * (2 * FF), ok);
+        m.Hh = mp.fallback ? c.take<uint16_t>(T * K * FF, ok) : nullptr;
         m.Dm = c.take<float>(T * K * N, ok);
-        m.sgate = c.take<float>(T * 640, ok); m.sup = c.take<float>(T * 640, ok); m.sh_h = c.take<uint16_t>(T * 640, ok);
+        m.sgate = c.take<float>(T * FF, ok); m.sup = c.take<float>(T * FF, ok); m.sh_h = c.take<uint16_t>(T * FF, ok);
         m.shared = c.take<float>(T * N, ok); m.sg = c.take<float>(T, ok);
         if (mp.any) {
             m.Xq = c.take<uint8_t>(mmq::q8_bytes((int64_t) (T * K), N), ok);
-            m.H = c.take<float>(T * K * 640, ok);
-            m.Hq = c.take<uint8_t>(mmq::q8_bytes((int64_t) (T * K), 640), ok);
+            m.H = c.take<float>(T * K * FF, ok);
+            m.Hq = c.take<uint8_t>(mmq::q8_bytes((int64_t) (T * K), FF), ok);
         }
         if (base == nullptr) ok = false;
     }
-    for (int i = 0; i < DQ; ++i) { m.dq_gu[i] = o.take<uint16_t>(1280 * 2560, ok); m.dq_d[i] = o.take<uint16_t>(2560 * 640, ok); }
+    for (int i = 0; i < DQ; ++i) { m.dq_gu[i] = o.take<uint16_t>((2 * FF) * N, ok); m.dq_d[i] = o.take<uint16_t>(N * FF, ok); }
     if (mmq_plan().any) {
         const MmqPlan& mp = mmq_plan();
         m.ids_identity = o.take<int32_t>(T * K, ok);
@@ -657,7 +665,7 @@ uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::Session
     const int64_t max_blocks = ss.qsa_states[0].max_cells / s.idx_block + 2;
     o.take<uint8_t>((size_t) std::max({gdn_set_bytes(T), qsa_set_bytes(T, cap, max_blocks, 256, 32, s),
                                        moe_set_bytes(T)}), ok);
-    for (int i = 0; i < DQ; ++i) { o.take<uint16_t>(1280 * 2560, ok); o.take<uint16_t>(2560 * 640, ok); }
+    for (int i = 0; i < DQ; ++i) { o.take<uint16_t>((2 * FF) * N, ok); o.take<uint16_t>(N * FF, ok); }
     if (mmq_plan().any) {
         const MmqPlan& mp = mmq_plan();
         o.take<int32_t>(T * K, ok);
@@ -1256,8 +1264,8 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     const bool use_mmq = mmq_plan().any && mmq_plan().layer[(size_t) l];
                     const int mmq_gt = lay.native ? lay.fmt[(size_t) l].gu_type : 42;
                     const int mmq_dt = lay.native ? lay.fmt[(size_t) l].d_type : 42;
-                    const size_t mmq_gub = use_mmq ? mmq::matrix_bytes(mmq_gt, 1280, N) : 0;
-                    const size_t mmq_db = use_mmq ? mmq::matrix_bytes(mmq_dt, N, 640) : 0;
+                    const size_t mmq_gub = use_mmq ? mmq::matrix_bytes(mmq_gt, (2 * FF), N) : 0;
+                    const size_t mmq_db = use_mmq ? mmq::matrix_bytes(mmq_dt, N, FF) : 0;
                     pt.mark(kPfGather, cs);
                     if (use_mmq) {
                         // step 2b: the layer's activations as q8_1 rows in expert order, straight from `mixed`
@@ -1354,16 +1362,16 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             hipMemsetAsync(m.grp_gu + (size_t) ngx * mmq_gub, 0, MMQ_TAIL, m.cs);
                             hipMemsetAsync(m.grp_d + (size_t) ngx * mmq_db, 0, MMQ_TAIL, m.cs);
                             mmq::Product gu;
-                            gu.w = m.grp_gu; gu.type = mmq_gt; gu.w_rows = 1280; gu.w_cols = N; gu.expert_bytes = mmq_gub;
+                            gu.w = m.grp_gu; gu.type = mmq_gt; gu.w_rows = (2 * FF); gu.w_cols = N; gu.expert_bytes = mmq_gub;
                             gu.n = ngx; gu.xq = m.Xq; gu.bounds = m.bounds_dev + j0; gu.ids = m.ids_identity;
-                            gu.total_rows = T * K; gu.max_rows = maxr; gu.dst = m.GU; gu.ld_dst = 1280;
+                            gu.total_rows = T * K; gu.max_rows = maxr; gu.dst = m.GU; gu.ld_dst = (2 * FF);
                             m.mmq_ctx->run(gu, m.cs);
                             pt.mark(kPfSwiglu, cs);
-                            mmq::swiglu(m.GU + r0 * 1280, m.H + r0 * 640, nr, 640, !lay.native, m.cs);
+                            mmq::swiglu(m.GU + r0 * (2 * FF), m.H + r0 * FF, nr, FF, !lay.native, m.cs);
                             pt.mark(kPfQuant, cs);
-                            mmq::quantize(m.H + r0 * 640, nullptr, m.Hq, mmq_dt, 640, 640, nr, m.cs);
+                            mmq::quantize(m.H + r0 * FF, nullptr, m.Hq, mmq_dt, FF, FF, nr, m.cs);
                             mmq::Product dn;
-                            dn.w = m.grp_d; dn.type = mmq_dt; dn.w_rows = N; dn.w_cols = 640; dn.expert_bytes = mmq_db;
+                            dn.w = m.grp_d; dn.type = mmq_dt; dn.w_rows = N; dn.w_cols = FF; dn.expert_bytes = mmq_db;
                             dn.n = ngx; dn.xq = m.Hq; dn.bounds = m.bounds_dev + n + 1 + g * (MMQ_GROUP + 1);
                             dn.ids = m.ids_identity; dn.total_rows = nr; dn.max_rows = maxr; dn.dst = m.Dm + r0 * N;
                             dn.ld_dst = N;
@@ -1384,11 +1392,11 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         if (slot >= 0) hipEventRecord(m.used[slot], m.cs);
                         const int64_t o0 = m.off[(size_t) e], ne = m.cnt[(size_t) e];
                         pt.mark(kPfMmqGu, cs);
-                        m.gemm.f16(m.Xs + o0 * N, m.dq_gu[q], m.GU + o0 * 1280, ne, 1280, N);
+                        m.gemm.f16(m.Xs + o0 * N, m.dq_gu[q], m.GU + o0 * (2 * FF), ne, (2 * FF), N);
                         pt.mark(kPfSwiglu, cs);
-                        swiglu_interleaved(m.GU + o0 * 1280, m.Hh + o0 * 640, ne, m.cs);
+                        swiglu_interleaved(m.GU + o0 * (2 * FF), m.Hh + o0 * FF, ne, m.cs);
                         pt.mark(kPfMmqD, cs);
-                        m.gemm.f16(m.Hh + o0 * 640, m.dq_d[q], m.Dm + o0 * N, ne, N, 640);
+                        m.gemm.f16(m.Hh + o0 * FF, m.dq_d[q], m.Dm + o0 * N, ne, N, FF);
                         return true;
                     };
                     if (!stream_all) {
@@ -1454,6 +1462,11 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     // (`m.cs`) - is stream-ordered before this record, so the bounded ring may reuse the layer's
                     // slots once it completes.  A no-op for the arena/mmap (their slots are persistent).
                     if (m.src != nullptr) {
+                        // **THE STAGER'S THREADS READ THE SOURCE TOO.**  They copy each unpinned blob into a
+                        // pinned buffer; if `finish` has not run, a thread can still be reading a slot when it is
+                        // released.  Join them before the release, then gate on `m.cs` for the DMA and the
+                        // (alias-free) compute.
+                        if (!stream_all && m.stager) m.stager->finish();
                         hipEventRecord(m.layer_done, m.cs);
                         m.src->release_layer(l, m.layer_done);
                     }
@@ -1469,8 +1482,8 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             for (float v : h) c += !std::isfinite(v);
                             return c;
                         };
-                        const int64_t bgu = bad(m.GU, T * K * 1280), bdm = bad(m.Dm, T * K * N), bbo = bad(m.bo, T * N);
-                        const int64_t bh = m.H ? bad(m.H, T * K * 640) : -1;
+                        const int64_t bgu = bad(m.GU, T * K * (2 * FF)), bdm = bad(m.Dm, T * K * N), bbo = bad(m.bo, T * N);
+                        const int64_t bh = m.H ? bad(m.H, T * K * FF) : -1;
                         static int64_t reported = -1;
                         if ((bgu || bdm || bbo || bh > 0) && reported != stats_.chunks) {
                             reported = stats_.chunks;
