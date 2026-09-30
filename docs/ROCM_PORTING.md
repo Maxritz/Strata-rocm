@@ -621,6 +621,23 @@ needs retraining, nothing on expert offload; Complete-muE (2605.23893) — train
 2604.07035 — an accuracy-efficiency benchmark with no systems technique; QStore (2505.04081) — lossless
 joint high/low-precision storage, not a speed lever.
 
+**Additional sources (MoE offload on consumer hardware).** `AlexChen31337/gemma4-moe-offload` (and its
+`qwen35-moe-offload` predecessor) implement exactly our problem — a sparse MoE that does not fit VRAM —
+and borrow two papers we can too:
+
+- **Apple "LLM in a Flash" (arXiv:2312.11514):** *windowing* (a DRAM cache of the last-k experts —
+  our expert cache), *bundling* (co-locate `gate`/`up`/`down` of one expert contiguously so a miss is a
+  single sequential read — **exactly LIT-3**), and *async prefetch* (**LIT-4**).
+- **Google TurboQuant (arXiv:2504.19874) / PolarQuant (2502.02617):** KV-cache compression. Practically
+  for us: **`q8_0`/`q4_0` KV** — smaller KV frees VRAM for the expert hot set (the "KV in VRAM" item).
+  Convincing only with a quality check; `q8_0` is near-lossless.
+- Their **autoresearch loop** (karpathy-style: an agent edits the bench, runs, measures, commits if
+  better) is a usable methodology for our gfx1201 tuning sweeps.
+
+The layered takeaway across all sources: on a PCIe-bound box the wins are **fewer bytes over the link**
+(bundling, co-activation layout, mixed precision, cache) and **less VRAM pressure** (KV quant), not
+faster kernels.
+
 ## 12. Optimization backlog (TODO)
 
 Measured baseline on the 39-token and large-chunk Swift prompts (gfx1201, RDNA4): short-chunk prefill
