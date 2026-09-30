@@ -67,6 +67,43 @@ fixed prompt over ≥ 64 tokens (the same coherence recipe as §11.7). **Effort:
 
 ---
 
+## 3b. `qwen35moe` — the structure, read from the GGUF (start here)
+
+`H:\OLLAMA-Models\GGUF\Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf`, `general.architecture = qwen35moe`:
+
+```
+block_count 40   embedding_length 2048   context 262144
+attention  head_count 16   head_count_kv 2   key_length 256   value_length 256
+           full_attention_interval 4        rope.dimension_count 64  sections [11,11,10,0]  base 1e7
+ssm        state_size 128   conv_kernel 4   inner_size 4096   group_count 16   time_step_rank 32
+moe        256 experts   used 8   ff 512   + shared expert (ff 512)   + a shexp router (ffn_gate_inp_shexp)
+```
+
+Per layer (tensor names): layers with **`i % 4 == 3`** are full attention — `attn_q/k/v`, `attn_q_norm`/
+`attn_k_norm`, `attn_output`; every other layer is **SSM/GDN** — `attn_qkv`, `attn_gate`, `ssm_a`,
+`ssm_alpha`, `ssm_beta`, `ssm_conv1d`, `ssm_dt.bias`, `ssm_norm`, `ssm_out`. All 40 layers carry the MoE block
+(`ffn_gate_inp` router, `ffn_gate_exps`/`ffn_up_exps`/`ffn_down_exps`, and the `*_shexp` shared expert).
+
+**Why this is the right first port.** It is the *same shape of model as `qwen4exp`* — a hybrid
+GDN/SSM + periodic-full-attention MoE — so it reuses:
+
+| piece | reuse |
+|---|---|
+| GDN/SSM kernels | `fused_gdn`, `native_gdn*` (state 128, conv 4 — the same) |
+| MoE + router + shared expert | the whole `cpu/expert` + grouped/MMQ path, router_top10 generic |
+| engine (session, prefill, ring, sampler, spec) | unchanged |
+| **new**: standard GQA + partial RoPE | gfx `native_flash_attn` / `rope` — much simpler than qwen4exp's QSA |
+| **new**: plain residual | qwen4exp's hyper-connection block is *skipped* (this model has none) |
+
+**And it is the shelf that fits the target hardware:** Qwen3.5-35B-A3B, ornith-35b, Tiel-Coder-35B-A3B,
+qwable-v1, Unsloth-Ornith-1.5-35B-A3B, Qwen3.8-Distill-35B-A3B all carry this architecture at **17-25 GB** —
+comfortable in 48 GB RAM + 12 GB VRAM, and streamable at 32 GB.
+
+**Plan:** (1) accept the geometry (2048 / 40L / 8-of-256 / ff 512) and build a `qwen35moe` tensor map; (2)
+wire the GDN half from `qwen4exp`'s kernel with the new dims; (3) add the GQA+rope attention; (4) reuse the
+MoE path; (5) gate each stage on **top-1 agreement against llama.cpp** on a fixed prompt (the §11.7 recipe),
+because llama.cpp runs this family natively. **Effort: the most tractable new family — one to two sessions.**
+
 ## 4. Family B — `qwen35moe` (Qwen3.5-35B-A3B and its many derivatives)
 
 This is the bulk of the "large MoE" shelf: `Qwen3.5-35B-A3B`, `Qwen3.8-Distill-35B-A3B-Coder`,
