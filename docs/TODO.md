@@ -58,20 +58,22 @@ Decision basis for the FP4 matmul kernel, from `hipcc --offload-arch` probes + `
    (8 codes per uint32 load via `fp4_codebook()` + broadcasted block scale, fp16 activations two at a time).
    Bit-identical to the baseline.  **Measured 0.99x on 4096x32768** — the decode is register-bound and cheap; the
    kernel is NOT decode-bound.
-3. **FP4 GEMV shared-memory x-tile (Path B+) — DONE, parity-green but 1.04x only.** `fp4_gemv_tiled.cu` loads the
-   single activation vector once per 32-row block into shared memory (the MoE broadcast pattern).  **Measured
-   1.04x (naive 1.138 ms / 0.118 TOPS -> tiled 1.090 ms / 0.123 TOPS), mismatch=0.** Why it's not the win:
-   4096x32768 = 134 M MACs in 1.1 ms = 0.12 TOPS vs ~1.4 TFLOP fp32 peak -> the kernel is **compute-bound in the
-   scalar decode+fp32-FMA path**, NOT bandwidth-bound. L2 (48 MB on gfx1201) already holds the 8 KB `x` reused
-   across all 32768 rows, so the baseline's "redundant" x reads are L2 hits (~1 cycle), and weight traffic is
-   only ~34 MB.  Vectorizing/tile-moving the decode cannot recover the 1000x gap to peak.
-4. **FP4 int8 dot path (Path C) — DEFERRED, needs a numerics sign-off.** The ONLY FP4 speedup available on
-   gfx1201 (no FP4 tensor core) is `V_DOT4_I32_IU8` (`__builtin_amdgcn_sdot4`/`:udot4`, confirmed to compile),
-   which requires the fp16 activation quantized to INT8 per block (symmetric, scale=max/127).  That changes the
-   numerics — the parity test must model the same activation quantization (int8-scaled dot vs the scalar
-   fp32 reference), and the user must accept the resulting error budget.  NOT implemented: it is a separate,
-   separately-parity-tested path behind a numerics sign-off, per the standing "no numerics change without an
-   explicit parity gate" rule.
+3. **FP4 GEMV coalesced + fused decode (Path B++) — DONE, 3.19x, the real fix.** `fp4_gemv_coalesced.cu`:
+   a block stages one row's weights into shared with coalesced `uint4` loads, then decodes INLINE (fused
+   decode+dot, NO `float dec[ELEMS]` array).  The `dec[]` array was the root cause of the slowness: a
+   dynamically-indexed local array spills to LOCAL memory, so every `dec[j]` was a global-latency load.
+   Fusing removes it.  **Measured gfx1201 4096x32768: naive 1.132 ms/0.119 TOPS -> coalesced 0.355 ms/0.378
+   TOPS = 3.19x, weight stream 200.6 GB/s, bit-identical parity (0 mismatch).**
+   Diagnostic (`fp4_memprobe`, same kernel: raw coalesced read, no decode): 0.185 ms / 385 GB/s floor, so
+   decode+dot is now 0.170 ms = 1.9x the memory floor (was 4.6x before the fusion).  The kernel is
+   decode-instruction-bound, not bandwidth-bound: L2 already holds the 8 KB `x`, so x-tiling (1.04x, item 3b)
+   and x-vectorizing (0.99x, item 2) bought nothing.  Deeper wins need fewer instructions per weight:
+   the remaining ~3 instr/element are table-load + fp16->fp32 cvt + FMA.  A shared FLOAT codebook was tried and
+   REGRESSED (bank conflicts, 0.363->0.395 ms); a single `__half22float2` per element-pair is the next candidate.
+4. **FP4 int8 dot path (Path C) — DEFERRED (diminishing).** `V_DOT4_I32_IU8` cuts the MAC from 1/element to
+   1/4, but the decode (unpack + codebook lookup) is unchanged and the activation must be int8-quantized
+   (numerics change), so the projected gain is ~20-30% - not worth the parity/numerics cost now that B++ is
+   3.19x.  Revisit only if the remaining 1.9x-over-floor matters.
 
 
 1. **Verify-window nondeterminism (`--spec`).** The native path requires `--spec ≥ 2`, and that window

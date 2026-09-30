@@ -240,6 +240,7 @@ if(STRATA_ENABLE_HIP)
                           src/kernels/cuda/fp4_gemv.cu
                           src/kernels/cuda/fp4_gemv_fast.cu
                           src/kernels/cuda/fp4_gemv_tiled.cu
+                          src/kernels/cuda/fp4_gemv_coalesced.cu
                           src/kernels/ngram.cpp
                           src/ngram/ple_reader.cpp
                           src/platform/direct_file.cpp)

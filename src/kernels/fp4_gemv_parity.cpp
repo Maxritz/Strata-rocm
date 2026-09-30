@@ -155,9 +155,10 @@ void run(bool mxfp4) {
         };
 
         int allbad = 0;
-        allbad += compare(launch_and_copy(strata::kernels::fp4_gemv,        "baseline"),  "baseline");
-        allbad += compare(launch_and_copy(strata::kernels::fp4_gemv_fast,    "FAST    "), "FAST");
-        allbad += compare(launch_and_copy(strata::kernels::fp4_gemv_tiled,   "TILED   "), "TILED");
+        allbad += compare(launch_and_copy(strata::kernels::fp4_gemv,          "baseline"),  "baseline");
+        allbad += compare(launch_and_copy(strata::kernels::fp4_gemv_fast,     "FAST    "), "FAST");
+        allbad += compare(launch_and_copy(strata::kernels::fp4_gemv_tiled,    "TILED   "), "TILED");
+        allbad += compare(launch_and_copy(strata::kernels::fp4_gemv_coalesced,"COALESCED"), "COALESCED");
         if (allbad) return;
     }
 
@@ -203,9 +204,10 @@ int main(int argc, char** argv) {
                 blk[0] = (uint8_t)(120 + (rng() % 16));
                 for (int i = 1; i < BLOCK_BYTES; ++i) blk[i] = (uint8_t)(rng() & 0xFF);
             }
-        uint16_t* d_x=nullptr; uint8_t* d_w=nullptr; float *d_y1=nullptr, *d_y2=nullptr, *d_y3=nullptr;
+        uint16_t* d_x=nullptr; uint8_t* d_w=nullptr; float *d_y1=nullptr, *d_y2=nullptr, *d_y3=nullptr, *d_y4=nullptr;
         check(hipMalloc(&d_x, x.size()*2), "x"); check(hipMalloc(&d_w, w.size()), "w");
-        check(hipMalloc(&d_y1, n_out*4), "y1"); check(hipMalloc(&d_y2, n_out*4), "y2"); check(hipMalloc(&d_y3, n_out*4), "y3");
+        check(hipMalloc(&d_y1, n_out*4), "y1"); check(hipMalloc(&d_y2, n_out*4), "y2");
+        check(hipMalloc(&d_y3, n_out*4), "y3"); check(hipMalloc(&d_y4, n_out*4), "y4");
         check(hipMemcpy(d_x, x.data(), x.size()*2, hipMemcpyHostToDevice), "cx");
         check(hipMemcpy(d_w, w.data(), w.size(), hipMemcpyHostToDevice), "cw");
         auto tb = [](auto f, auto... a)->double {
@@ -213,33 +215,46 @@ int main(int argc, char** argv) {
             (void)hipEventRecord(s); f(a...); (void)hipEventRecord(e); (void)hipEventSynchronize(e);
             float ms=0; (void)hipEventElapsedTime(&ms,s,e); (void)hipEventDestroy(s); (void)hipEventDestroy(e); return ms;
         };
-        // warmup + tiled-vs-baseline parity on this input
+        // warmup + coalesced-vs-baseline parity on this input
         strata::kernels::fp4_gemv(d_x,d_w,d_y1,n_in,n_out,mxfp4);
         strata::kernels::fp4_gemv_fast(d_x,d_w,d_y2,n_in,n_out,mxfp4);
         strata::kernels::fp4_gemv_tiled(d_x,d_w,d_y3,n_in,n_out,mxfp4);
-        std::vector<float> r1((size_t)n_out), r3((size_t)n_out);
+        strata::kernels::fp4_gemv_coalesced(d_x,d_w,d_y4,n_in,n_out,mxfp4);
+        std::vector<float> r1((size_t)n_out), r4((size_t)n_out);
         check(hipMemcpy(r1.data(), d_y1, n_out*4, hipMemcpyDeviceToHost), "cr1");
-        check(hipMemcpy(r3.data(), d_y3, n_out*4, hipMemcpyDeviceToHost), "cr3");
+        check(hipMemcpy(r4.data(), d_y4, n_out*4, hipMemcpyDeviceToHost), "cr4");
         int mism_t=0;
         for (long long i=0;i<n_out;++i) {
-            double rel=std::fabs((double)r1[i]-(double)r3[i]) /
+            double rel=std::fabs((double)r1[i]-(double)r4[i]) /
                        (std::fabs((double)r1[i])>1e-30 ? std::fabs((double)r1[i]) : 1e-30);
             if (rel>1e-5) ++mism_t;
         }
-        double t0=0,t1=0,t2=0;
+        double t0=0,t1=0,t2=0,t3=0;
         for (int i=0;i<reps;++i){
-            t0 += tb(strata::kernels::fp4_gemv,        d_x,d_w,d_y1,n_in,n_out,mxfp4);
-            t1 += tb(strata::kernels::fp4_gemv_fast,    d_x,d_w,d_y2,n_in,n_out,mxfp4);
-            t2 += tb(strata::kernels::fp4_gemv_tiled,   d_x,d_w,d_y3,n_in,n_out,mxfp4); }
-        const double t0a=t0/reps, t1a=t1/reps, t2a=t2/reps;
+            t0 += tb(strata::kernels::fp4_gemv,          d_x,d_w,d_y1,n_in,n_out,mxfp4);
+            t1 += tb(strata::kernels::fp4_gemv_fast,     d_x,d_w,d_y2,n_in,n_out,mxfp4);
+            t2 += tb(strata::kernels::fp4_gemv_tiled,    d_x,d_w,d_y3,n_in,n_out,mxfp4);
+            t3 += tb(strata::kernels::fp4_gemv_coalesced,d_x,d_w,d_y4,n_in,n_out,mxfp4); }
+        const double t0a=t0/reps, t1a=t1/reps, t2a=t2/reps, t3a=t3/reps;
         const double elems = (double)n_in * (double)n_out;
-        std::printf("bench n_in=%lld n_out=%lld mxfp4=%d reps=%d  tiled_vs_baseline_mismatch=%d\n",
+        const double wbytes = (double)(n_in / (mxfp4 ? 32 : 64)) * (double)n_out * (double)(mxfp4 ? 17 : 36);
+        std::printf("bench n_in=%lld n_out=%lld mxfp4=%d reps=%d  coalesced_vs_baseline_mismatch=%d\n",
                     (long long)n_in,(long long)n_out,(int)mxfp4,reps,mism_t);
-        std::printf("  naive   : %.4f ms  %.3f TOPS\n", t0a, elems/1e12/(t0a/1e3));
-        std::printf("  fast    : %.4f ms  %.3f TOPS  (%.2fx naive)\n", t1a, elems/1e12/(t1a/1e3), t0a/t1a);
-        std::printf("  TILED   : %.4f ms  %.3f TOPS  (%.2fx naive, %.2fx fast)\n", t2a, elems/1e12/(t2a/1e3), t0a/t2a, t1a/t2a);
+        std::printf("  naive    : %.4f ms  %.3f TOPS  (%.1f GB/s)\n", t0a, elems/1e12/(t0a/1e3), wbytes/1e9/(t0a/1e3));
+        std::printf("  fast     : %.4f ms  %.3f TOPS  (%.2fx naive)\n", t1a, elems/1e12/(t1a/1e3), t0a/t1a);
+        std::printf("  tiled    : %.4f ms  %.3f TOPS  (%.2fx naive)\n", t2a, elems/1e12/(t2a/1e3), t0a/t2a);
+        std::printf("  COALESCED: %.4f ms  %.3f TOPS  (%.2fx naive)  %.1f GB/s weight stream\n",
+                    t3a, elems/1e12/(t3a/1e3), t0a/t3a, wbytes/1e9/(t3a/1e3));
+        // memory floor: same bytes, coalesced read, no decode
+        float* d_probeout = nullptr;
+        check(hipMalloc(&d_probeout, 4096*4), "probeout");
+        const double tm = tb(strata::kernels::fp4_memprobe, d_w, d_probeout, (long long)w.size(), 4096);
+        std::printf("  MEMPROBE : %.4f ms  %.1f GB/s (raw coalesced read of the same %.1f MB, no decode)\n",
+                    tm, wbytes/1e9/(tm/1e3), wbytes/1e9);
+        std::printf("  -> decode+dot cost is %.4f ms over the %.4f ms memory floor (%.1fx)\n",
+                    t3a - tm, tm, t3a / (tm > 1e-9 ? tm : 1));
         auto hFree = [](void* p){ (void)hipFree(p); };
-        hFree(d_x); hFree(d_w); hFree(d_y1); hFree(d_y2); hFree(d_y3);
+        hFree(d_x); hFree(d_w); hFree(d_y1); hFree(d_y2); hFree(d_y3); hFree(d_y4); hFree(d_probeout);
         return 0;
     }  // if (bench)
     std::printf("fp4_gemv_parity\n");

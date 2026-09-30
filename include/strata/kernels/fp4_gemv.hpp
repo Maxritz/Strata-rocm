@@ -48,4 +48,14 @@ void fp4_gemv_fast(const uint16_t* x, const uint8_t* w, float* y,
 void fp4_gemv_tiled(const uint16_t* x, const uint8_t* w, float* y,
                     int64_t n_in, int64_t n_out, bool mxfp4);
 
+// Bandwidth-coalesced GEMV: a block stages one row's weights into shared memory with coalesced byte loads,
+// then decodes from shared and block-reduces.  Same contract and numerics as the others (parity-tested
+// against the scalar reference); this is the one that actually uses the VRAM bandwidth.
+void fp4_gemv_coalesced(const uint16_t* x, const uint8_t* w, float* y,
+                        int64_t n_in, int64_t n_out, bool mxfp4);
+
+// Diagnostic only: raw coalesced read of `bytes` of `w` (no decode).  Used by the bench to separate the
+// memory floor from the decode cost.
+void fp4_memprobe(const uint8_t* w, float* out, int64_t bytes, int grid);
+
 }  // namespace strata::kernels
