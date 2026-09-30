@@ -16,10 +16,30 @@ The single list. Priorities: **P0** blocks a shipping milestone, **P1** a family
      (`layer_verify_compatible` refuses). Groundwork committed (`set_layer_dump` + the residency-table
      ordering). *Next:* let the window run unfused when dumping, or dump a fused-valid quantity; then bisect
      the first divergent layer.
-2. **Whittle run to coherence** (qwen4exp 2048). Loads pack/geometry/embedding now; blocked at the
-   **quantized QSA-indexer tensor** (`blk.3.indexer.k_proj/k_proj`), which `iq_pack.py` marks shape-only and
-   `weights.cpp` refuses, while Swift's went to `dense.bin` (it was float in its GGUF). *Done:* the model
-   answers coherently and matches llama.cpp top-1.
+2. **Whittle run to coherence** (qwen4exp 2048). **It LOADS fully now** (pack v4 geometry, PLE from metadata,
+   native dense, embedding, weights) and reaches the prefill. **Currently REFUSED by a safety guard** because
+   running it hung the GPU. **The router's ids came back as `0x464C457F` (the ELF magic).**
+   **The hang's root cause is NOT established — do not re-derive the dead theories below.**
+   *Disproved by a proof, not a guess:* there is **no prefill heap overflow**. `gdn_set_bytes` (prefill.cpp
+   399-404), `qsa_set_bytes` (405-414) and `moe_set_bytes` (449-465) are each line-for-line mirrors of their
+   carve counterparts (568-570 / 573-578 / 581-593), and `region = max(...)` (561-562), so every
+   allocator's `used <= region` **by construction, for any model shape**. `Alloc b`'s sizes are all literals
+   (so identical for Swift, which works), and `cap = qsa_selection_width(kTopkMaxCells=32768)` = 2048+4-1 =
+   **2051 for both models**, so the QSA sizing cannot be model-dependent either. A 3-agent debate converged
+   on "`qsa_set_bytes` omits `m.Qf`" — **false**: line 408 does count it (`T * 12288`).
+   *Confirmed real, but SEMANTIC (wrong math), not memory-safety:* the QSA path hardcodes 24 heads where
+   Whittle has 16 (`rms_rows(m.q, wqn, T * 24, ...)` prefill.cpp:1102, `rope(m.q, T, 24, 256, 6144, ...)`
+   :1103), and `qsa_shapes` (layer.cpp:475) never propagates `indexer.top_k`. Table:
+   | | Swift | Whittle |
+   |---|---|---|
+   | attention head_count | 24 | **16** |
+   | key/value length | 256 | 256 |
+   | indexer heads / key | 4 / 128 | 4 / 128 |
+   | **indexer.top_k** | 2048 | **262144** (whole context) |
+   *Done means:* the QSA geometry (head_count, indexer top_k, and the `T*512`/`T*12288` buffers) is runtime
+   like the prefill's, a **prefill watchdog** bounds a bad shape (the verify window has a 20 s timeout; the
+   prefill does not), the guard is lifted, and the model answers coherently matching llama.cpp top-1.
+   `--model-info` still reports it (recognition is separate from the run guard).
 
 ## P1 — models & families
 
