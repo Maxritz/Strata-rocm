@@ -175,6 +175,16 @@ def is_expert(name: str) -> bool:
     return name.startswith("blk.") and name.endswith(("_exps.weight",))
 
 
+def meta_int(g, suffix: str, dflt: int) -> int:
+    """The first metadata value whose key ends with `suffix`, whatever the architecture prefix is.  Every MoE
+    family (qwen4exp, qwen35moe, deepseek2, k2-horizon, laguna, gemma4, olmoe, gpt-oss) spells the same keys
+    under its own `general.architecture`, so the packer must not hardcode one prefix (TODO P1 #12)."""
+    for k, v in g.metadata.items():
+        if k.endswith(suffix) and isinstance(v, int):
+            return int(v)
+    return dflt
+
+
 def index_standalone(src, out, model: Model) -> int:
     """Every non-expert tensor of the model: floats into dense.bin as stored (exact-BF16 F32 routers as BF16),
     quantized ones native-only."""
@@ -184,8 +194,11 @@ def index_standalone(src, out, model: Model) -> int:
         for name, (g, t, mm, _) in model.where.items():
             if is_expert(t.name) or t.name in NOT_IN_PACK:
                 continue
-            if len(t.shape) > 2:
-                print("tensor %s has %d dimensions; the index holds two" % (t.name, len(t.shape)))
+            if len(t.shape) > 2 and t.type_name in FLOAT:
+                # only a float tensor is INDEXED by (ne0, ne1) in dense.bin; a quantized tensor is served
+                # natively and the engine reads its real shape from the GGUF.  MLA's attn_k_b/attn_v_b are
+                # 3-D (per-head) and quantized, so they must not be rejected here.
+                print("float tensor %s has %d dimensions; the index holds two" % (t.name, len(t.shape)))
                 return 1
             ne0 = int(t.shape[0])
             ne1 = int(t.shape[1]) if len(t.shape) > 1 else 0
@@ -305,8 +318,8 @@ def main() -> int:
 
     g = G.GGUFFile(src)
     global N_EXPERT
-    N_EXPERT = int(g.metadata.get("qwen4exp.expert_count", N_EXPERT))
-    print("experts: %d (qwen4exp.expert_count)" % N_EXPERT)
+    N_EXPERT = meta_int(g, ".expert_count", N_EXPERT)
+    print("experts: %d" % N_EXPERT)
     mm = np.memmap(src, dtype=np.uint8, mode="r")
     model = Model(src)
     T = {n: w[1] for n, w in model.where.items()}
@@ -325,10 +338,15 @@ def main() -> int:
         subprocess.run([sys.executable, str(HERE / "strata_tokenizer.py"), "--gguf", str(src), "--out", str(out)],
                        check=True)   # writes <out>/tokenizer/
 
-    # ---- the experts
-    n_layers = 1 + max(int(n.split(".")[1]) for n in T if n.startswith("blk.") and n.endswith("_exps.weight"))
+    # ---- the experts.  NOT every layer is MoE: deepseek2/GLM is dense at layer 0 and MoE at 1..46, so the
+    # layout follows the layers that actually carry `_exps` tensors, not range(n_layers).
+    expert_layers = sorted({int(n.split(".")[1]) for n in T if n.startswith("blk.") and n.endswith("_exps.weight")})
+    if not expert_layers:
+        print("no expert tensors in this model")
+        return 1
+    n_layers = expert_layers[-1] + 1
     layout, offset = [], 0
-    for l in range(n_layers):
+    for l in expert_layers:
         ts = [T["blk.%d.ffn_%s_exps.weight" % (l, r)] for r in ROLES]
         per = [t.expected_bytes() // N_EXPERT for t in ts]
         if per[0] != per[1] or ts[0].type_name != ts[1].type_name:

@@ -220,6 +220,9 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
     if (max_layer >= 0 && max_layer + 1 < n_layers) { n_layers = max_layer + 1; L.n_layers = n_layers; }
     uint64_t at = 0;
     for (int64_t l = 0; l < n_layers; ++l) {
+        // **A DENSE LAYER CARRIES NO EXPERTS.**  deepseek2/GLM-4.7-Flash is dense at layer 0 and MoE at 1..46;
+        // an absent layer (no line in the table, bytes 0) contributes nothing and is NOT "not contiguous".
+        if (L.bytes[(size_t) l] == 0) continue;
         if (L.offset[(size_t) l] != at) {
             err = "native_experts.txt: layer " + std::to_string(l) + " is missing or not contiguous";
             return false;
