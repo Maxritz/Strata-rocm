@@ -702,6 +702,26 @@ extra      hyper_connection.count 4 (≈ qwen4exp's hyper-connections), nextn_pr
 grouped expert matmul → combine), the sampler, the batching/prefill engine. **New:** everything in the
 attention tower.
 
+**Reference implementation (this changes the plan from "write MLA from scratch" to "port"):**
+[`antirez/ds4`](https://github.com/antirez/ds4) — DwarfStar 4 — is a model-specific DeepSeek-V4-Flash
+runtime, and [`Anemll/ds4-ssd`](https://github.com/Anemll/ds4-ssd) is its SSD-streaming fork. This gives:
+
+- **`ds4_cuda.cu`** (~480 KB) — the DS4 compute (matmul/dequant/embed/MLA/… kernels) **in CUDA**: port to
+  HIP on gfx1201 the same way the `kernels/cuda` tree was ported for Strata (hipify + HANDLE/arch notes).
+- **`tests/test-vectors/`** (`official.vec` + per-prompt `*.official.json`) — the **parity gate**: DS4's
+  own correctness vectors, so a stage is verifiable without hand-building a reference.
+- **`gguf-tools/deepseek4-quantize.c`** (+ `quants.[ch]`) — the DS4 quantizer (q8_0, q8_K, q4_K, q2_K,
+  iq2_xxs); builds the GGUFs we already have in `G:\More-models`.
+- **SSD sidecar / slot-bank** (`docs/SIDECAR.md`, `--moe-slot-bank`, `--ssd-cache`) — the *lazy-load*
+  design (routed experts paged from disk through a bounded resident slot bank) asked for earlier.
+- Upstream also carries **`gguf-tools/qwen4_exp_convert.py`** — a converter to the **`qwen4exp`** schema
+  DS4 loads (MTP as `blk.<n>.nextn.*`), plus `qwen4_iq2.py` (IQ2_XXS+MXFP4+MTP) and the native n-gram
+  packer. That is the tooling for the Q2/IQ2 "more Qwen" variants (LIT-1), independent of DeepSeek.
+
+So stages 2-5 become a **CUDA→HIP port with a test-vector gate**, not new research. Stage 2 is now
+"port `deepseek4-quantize` / build a DS4 pack (or read the existing GGUFs) and pin the test vectors",
+not "invent a pack format".
+
 Stages, each independently testable (parity against a reference before the next):
 
 1. **Architecture selector + metadata schema.** Introduce an `Arch` enum (`qwen4exp`, `deepseek4`,
