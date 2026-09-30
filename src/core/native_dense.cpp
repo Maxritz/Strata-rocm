@@ -17,8 +17,14 @@ namespace {
 bool eligible(const std::string& name, bool include_ple_key) {
     if (name.rfind("blk.", 0) != 0) return false;
     if (include_ple_key && name == "blk.1.ple_key.weight") return true;
+    // A QUANTIZED dense tensor is served natively (MMQ) from the GGUF instead of being materialized into
+    // dense.bin.  `indexer.q_proj/k_proj` are the QSA selection's projections: the 2560 artifact stores them as
+    // float (so they went to dense.bin), but a Q4/Q8 model (Whittle) stores them quantized - without them here
+    // the pack marks them shape-only and `weights.cpp` refuses the load.  Their norms are 1-D F32 and are not
+    // served this way.
     static const char* suffixes[] = {".attn_qkv.weight", ".attn_gate.weight", ".ssm_out.weight",
         ".attn_q.weight", ".attn_k.weight", ".attn_v.weight", ".attn_output.weight",
+        ".indexer.q_proj.weight", ".indexer.k_proj.weight",
         ".ffn_gate_shexp.weight", ".ffn_up_shexp.weight", ".ffn_down_shexp.weight"};
     for (const char* suffix : suffixes) if (name.ends_with(suffix)) return true;
     return false;

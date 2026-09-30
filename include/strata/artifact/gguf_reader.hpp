@@ -454,11 +454,11 @@ private:
 // ---- architecture guard (P1.S2). The engine is specialised to ONE model; anything else must be
 // refused with a precise error rather than silently mis-run.
 struct Qwen4ExpGuard {
-    // `experts == 0` is the sentinel for "any positive expert count": the engine reads the artifact's own
-    // `n_experts_per_layer` (from the pack manifest) or `qwen4exp.expert_count` (from a GGUF) and sizes its
-    // expert ring, arena and residency tables from that.  A non-zero value still enforces an exact count.
-    uint32_t block_count = 48, hidden = 2560, experts = 0, experts_used = 10, head_count = 24,
-             head_count_kv = 2;
+    // **ZERO IS THE SENTINEL FOR "any positive value".**  The engine now takes its geometry from the model
+    // (the prefill N/HC/LR/K/FF, the PLE geom, the expert layout), so a second `qwen4exp` shape is a supported
+    // model, not a mismatch - the Whittle 35B-A3B is 40 layers / hidden 2048 / 8-of-180 experts / 16 heads.  A
+    // non-zero field still enforces an exact value, so a caller that knows the one artifact can pin it.
+    uint32_t block_count = 0, hidden = 0, experts = 0, experts_used = 0, head_count = 0, head_count_kv = 0;
 };
 
 inline std::string check_architecture(const GgufFile& g, const Qwen4ExpGuard& want = {}) {
@@ -470,13 +470,14 @@ inline std::string check_architecture(const GgufFile& g, const Qwen4ExpGuard& wa
         uint64_t want;
         bool exact;
     };
+    // `want == 0` accepts any positive value; a non-zero one enforces exactness (the one-artifact caller).
     const Req reqs[] = {
-        {"qwen4exp.block_count", want.block_count, true},
-        {"qwen4exp.embedding_length", want.hidden, true},
+        {"qwen4exp.block_count", want.block_count, want.block_count != 0},
+        {"qwen4exp.embedding_length", want.hidden, want.hidden != 0},
         {"qwen4exp.expert_count", want.experts, want.experts != 0},
-        {"qwen4exp.expert_used_count", want.experts_used, true},
-        {"qwen4exp.attention.head_count", want.head_count, true},
-        {"qwen4exp.attention.head_count_kv", want.head_count_kv, true},
+        {"qwen4exp.expert_used_count", want.experts_used, want.experts_used != 0},
+        {"qwen4exp.attention.head_count", want.head_count, want.head_count != 0},
+        {"qwen4exp.attention.head_count_kv", want.head_count_kv, want.head_count_kv != 0},
     };
     for (const auto& r : reqs) {
         const MetaValue* v = g.get(r.key);
@@ -485,7 +486,7 @@ inline std::string check_architecture(const GgufFile& g, const Qwen4ExpGuard& wa
             if (v->u != r.want)
                 return std::string(r.key) + " = " + std::to_string(v->u) + ", expected " + std::to_string(r.want);
         } else if (v->u == 0) {
-            return std::string(r.key) + " = 0, expected a positive expert count";
+            return std::string(r.key) + " = 0, expected a positive value";
         }
     }
     return {}; // empty == ok
