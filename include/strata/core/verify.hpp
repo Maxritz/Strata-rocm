@@ -80,6 +80,14 @@ public:
         hist_len_ = history_len;
     }
 
+    /// **THE LAYER DUMP INSIDE THE WINDOW (the C1 bisection).**  `--dump-layers` forced the session host path,
+    /// which killed the device residency table `--spec` needs, so the two could never run together - and the
+    /// verify window's residual exists only inside its captured graph, so the dump must live here.  A device
+    /// buffer of `(n_layers + 1) * max_t * hc * n_embd` floats, filled by a capture-safe D2D copy in each
+    /// layer's `post` and written to `path` after every `run`.  Layout matches the session loop's dump
+    /// (layer-major, then token, then `hc * n_embd`) so the two are directly comparable.
+    void set_layer_dump(const std::string& path) { dump_path_ = path; }
+
     /// Keep the first `n_keep` (1..T) tokens of the last window; advances `ss.ple_prev` by them.
     bool commit(int n_keep, std::string& err);
 
@@ -124,6 +132,9 @@ private:
     bool capture_commit(std::string& err);
     bool record_window(int T, hipStream_t cs, std::string& err);
 
+    std::string dump_path_;              ///< set_layer_dump: the C1 bisection dump inside the window
+    float* dump_dev_ = nullptr;          ///< (n_layers + 1) * max_t * hc * n_embd floats, device
+    std::vector<float> dump_host_;       ///< its host mirror, written after each run
     const WeightTable* wt_ = nullptr;
     const ModelGeometry* g_ = nullptr;
     SessionState* ss_ = nullptr;

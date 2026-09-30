@@ -2393,7 +2393,12 @@ int main(int argc, char** argv) {
     int32_t* d_hit_count = nullptr;
     strata::core::TokenHits thits;
     const bool graph_hits = hit_fn != nullptr && !profile.empty() && !o.no_pool;
-    if (graph_hits && !o.no_capture && !o.no_token_graph && layer_dump == nullptr && half_dump == nullptr) {
+    // `o.spec >= 2` also needs the residency table (the verify window decides hits on the device), and under
+    // `--spec` the layer dump lives in the VERIFIER (`set_layer_dump`), not in the session loop, so the two are
+    // no longer mutually exclusive - which is what made `--spec --dump-layers` impossible to run (and the
+    // verify-window bug impossible to bisect).
+    if (graph_hits && !o.no_capture && !o.no_token_graph && (layer_dump == nullptr || o.spec >= 2) &&
+        half_dump == nullptr) {
         host_res.assign((size_t) (g.n_layers * g.n_expert), strata::core::kNotResident);
         int64_t resident = 0;
         for (int64_t l = 0; l < g.n_layers; ++l)
@@ -3790,6 +3795,8 @@ int main(int argc, char** argv) {
         }
         mem_mark("the head and the prompt path");
         strata::core::Verifier ver;
+        // the spec path dumps the WINDOW's residual (the session loop only reads the prompt), to <path>.win
+        if (!o.dump_layers.empty()) ver.set_layer_dump(o.dump_layers + ".win");
         strata::core::VerifyHits vh;
         vh.d_res = thits.d_res;
         vh.cache_base = thits.cache_base;

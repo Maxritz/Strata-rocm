@@ -150,6 +150,7 @@ Verifier::~Verifier() {
     if (cs_) hipStreamDestroy(cs_);
     if (copy_) { hipStreamSynchronize(copy_); hipStreamDestroy(copy_); }
     if (arena_) hipFree(arena_);
+    if (dump_dev_) { hipFree(dump_dev_); dump_dev_ = nullptr; }
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_,
                      h_flagA_, h_plan_, h_flagB_};
     for (void* h : hosts)
@@ -289,6 +290,19 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     if (hipMalloc(&arena_, count.used) != hipSuccess) {
         err = "verify: the device arena (" + std::to_string(count.used >> 20) + " MiB) does not fit";
         return false;
+    }
+    // THE LAYER DUMP (set_layer_dump): (n_layers + 1) blocks of max_t * hc * n_embd floats, its own allocation
+    // so the arena carve is untouched.  The window fills it with a D2D copy per layer (capture-safe); `run`
+    // writes it after the sync, so `--dump-layers` finally works on the `--spec` path.
+    if (!dump_path_.empty()) {
+        const size_t dn = (size_t) (g.n_layers + 1) * (size_t) max_t_ * (size_t) HC * (size_t) N;
+        if (hipMalloc((void**) &dump_dev_, dn * sizeof(float)) != hipSuccess) {
+            err = "verify: the layer-dump buffer does not fit";
+            return false;
+        }
+        dump_host_.assign(dn, 0.0f);
+        std::fprintf(stderr, "strata verify: layer dump on, %zu MiB, -> %s\n", (dn * sizeof(float)) >> 20,
+                     dump_path_.c_str());
     }
     // THE ARENA CLEAR IS ORDERED WITH `cs_`, ON `cs_`.  A `hipMemset` on the legacy default stream is not
     // ordered against these non-blocking streams: measured on ROCm 10.1 it executed *after the first verify
@@ -648,9 +662,23 @@ bool Verifier::record_window(int T, hipStream_t cs, std::string& err) {
         } else if (cvec().covers(l)) {
             cvec_apply(Rt(tb), l, n, HC * N, bo_ + tb * N, N, inj2_ + tb * HC, HC, true, cs);
         }
+        // the layer dump: this layer's residual per token into block l+1 (block 0 is the input, written before
+        // the layer loop), matching the session loop's (n_layers + 1)-block layout
+        if (dump_dev_ != nullptr) {
+            const size_t nhc = (size_t) HC * N;
+            for (int t = tb; t < te; ++t)
+                hipMemcpyAsync(dump_dev_ + ((size_t) (l + 1) * (size_t) max_t_ + (size_t) t) * nhc, Rt(t),
+                               nhc * sizeof(float), hipMemcpyDeviceToDevice, cs);
+        }
         return true;
     };
 
+    // the layer dump's block 0: the window's INPUT residual (before layer 0), so the dump has n_layers + 1 blocks
+    if (dump_dev_ != nullptr) {
+        const size_t nhc = (size_t) HC * N;
+        for (int t = 0; t < T; ++t)
+            hipMemcpyAsync(dump_dev_ + (size_t) t * nhc, Rt(t), nhc * sizeof(float), hipMemcpyDeviceToDevice, cs);
+    }
     for (int grp = 0; grp < G; ++grp)
         if (!pre(0, grp)) return false;
     for (int64_t l = 0; l < g.n_layers; ++l)
@@ -900,6 +928,18 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     if (se != hipSuccess) { err = std::string("verify: ") + hipGetErrorString(se); return false; }
     progress_at("verify window: waiting for the expert copies", (int64_t) T);
     hipStreamSynchronize(copy_);   // no host function of this window may raise flag B in the next one
+    if (dump_dev_ != nullptr) {    // the layer dump: n_layers + 1 blocks of T * hc * n_embd, appended per window
+        const size_t nhc = (size_t) g.hc * (size_t) g.n_embd;
+        const size_t dn = (size_t) (g.n_layers + 1) * (size_t) max_t_ * nhc;
+        if (hipMemcpy(dump_host_.data(), dump_dev_, dn * sizeof(float), hipMemcpyDeviceToHost) == hipSuccess) {
+            if (std::FILE* f = std::fopen(dump_path_.c_str(), "ab")) {
+                for (int64_t l = 0; l <= g.n_layers; ++l)
+                    std::fwrite(dump_host_.data() + (size_t) l * (size_t) max_t_ * nhc, sizeof(float),
+                                (size_t) T * nhc, f);
+                std::fclose(f);
+            }
+        }
+    }
     // ---- a sampled or penalized request: the head's sampling again, host-side so its parameters are this call's
     // own (a captured kernel would replay the same draws forever).  Row t's draw is Philox(seed, pos0 + t): tied to
     // the POSITION it samples, not to how the text was cut into windows, so a seed replays the same text whatever
