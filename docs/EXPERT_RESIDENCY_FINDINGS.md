@@ -366,6 +366,16 @@ safe there.
 | `--expert-ram-gb 22` | **23.17 GB** | **identical** | 13.91 tok/s |
 | `--expert-ram-gb 20` | **21.16 GB** | **identical** | — |
 
+**Coherence verified end-to-end.** The same prompt (`--tokens "248045,846,..."`, the "add two numbers"
+chat prompt, `--spec 2 --max-new 96`) run on both arms produced the **same 73 tokens** (EOS-stop) and the same
+readable answer:
+
+> `<think>The user wants a simple Python function that adds two numbers. This is straightforward - I'll write a
+> concise function with a clear signature.</think> def add(a, b): return a + b ... print(add(3, 5))  # Output: 8`
+
+so the bounded ring is not merely token-identical to the arena over a fixed window - it produces coherent
+inference.
+
 **Open perf finding (P1).** The ring costs ~27% decode (13.91 vs 19.03). Two suspects, both from the same
 cause — the ring is *registered*, so `pinned()` is true, whereas the 34 GB arena's `hipHostRegister` **fails**
 (you cannot pin 34 of 63 GB) and falls back to the stager:
