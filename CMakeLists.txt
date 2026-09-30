@@ -1,6 +1,6 @@
-﻿# Strata Engine - top-level build (P1.S1).
+# Strata Engine - top-level build (P1.S1).
 #
-# Targets (phase-1 Ă‚Â§P1.S1): `strata_artifact` (no CUDA dependency), `tests`.  `strata_plan` and the C++
+# Targets (phase-1 A�§P1.S1): `strata_artifact` (no CUDA dependency), `tests`.  `strata_plan` and the C++
 # `strata-pack` are added when their sources exist - a target with no sources would make the build graph
 # claim something the tree does not have, which is worse than an absent target.
 #
@@ -241,6 +241,7 @@ if(STRATA_ENABLE_HIP)
                           src/kernels/cuda/fp4_gemv_fast.cu
                           src/kernels/cuda/fp4_gemv_tiled.cu
                           src/kernels/cuda/fp4_gemv_coalesced.cu
+                          src/kernels/cuda/fp4_gemv_q8.cu
                           src/kernels/ngram.cpp
                           src/ngram/ple_reader.cpp
                           src/platform/direct_file.cpp)

@@ -70,10 +70,16 @@ Decision basis for the FP4 matmul kernel, from `hipcc --offload-arch` probes + `
    and x-vectorizing (0.99x, item 2) bought nothing.  Deeper wins need fewer instructions per weight:
    the remaining ~3 instr/element are table-load + fp16->fp32 cvt + FMA.  A shared FLOAT codebook was tried and
    REGRESSED (bank conflicts, 0.363->0.395 ms); a single `__half22float2` per element-pair is the next candidate.
-4. **FP4 int8 dot path (Path C) — DEFERRED (diminishing).** `V_DOT4_I32_IU8` cuts the MAC from 1/element to
-   1/4, but the decode (unpack + codebook lookup) is unchanged and the activation must be int8-quantized
-   (numerics change), so the projected gain is ~20-30% - not worth the parity/numerics cost now that B++ is
-   3.19x.  Revisit only if the remaining 1.9x-over-floor matters.
+4. **FP4 int8-activation path (MoE-shaped, Path C) — DONE, parity-green, 3.24x (tied with B++).**
+   `fp4_gemv_q8.cu`: activation quantized to int8 per 32-group, warp-per-row lane-strided (coalesced), integer
+   MAC, warp-shuffle reduce — the exact shape of `iq_kernels.cu`'s `vec_dot_q4_K_q8_1` + `row_dot` +
+   `mmvq_kernel`.  **Measured gfx1201 4096x32768: 0.350 ms / 0.384 TOPS = 3.24x naive; parity green (worst
+   4.5e-5 vs a reference that models the same int8 activation quantization, tol 1e-4).**
+   Honest finding: int MAC ~= fp32 FMA here (3.24x vs 3.19x) — the cost is the DECODE (nibble extract +
+   codebook lookup), not the MAC type, so int8 does not buy the expected win.  Both paths sit ~1.9x over the
+   0.186 ms memory floor (383 GB/s memprobe); decode and memory are NOT overlapping (0.17 + 0.19 ~= 0.35 ms,
+   additive).  The next real lever is overlap/occupancy, not arithmetic.  No FP4 tensor core exists on gfx1201,
+   so ~0.4 TOPS is the practical ceiling for this decode-bound GEMV without a different algorithm.
 
 
 1. **Verify-window nondeterminism (`--spec`).** The native path requires `--spec ≥ 2`, and that window

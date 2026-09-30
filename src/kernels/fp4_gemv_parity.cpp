@@ -182,6 +182,101 @@ void run(bool mxfp4) {
     }
 }
 
+// int8-activation path (fp4_gemv_q8).  The activation is quantized to int8 per 32-element group on BOTH
+// sides (host here, device in the kernel - same fp16->fp32, same max, same lrintf, same d=mx/127), so the
+// reference and the kernel share the exact same quantized activation; the only freedom is the int-vs-float
+// summation order of the integer dot, which is exact in the kernel and per-term-rounded in the reference.
+// FP4 weights decode via the validated scalar dequantizer, so a weight-layout bug still shows.
+void run_q8(bool mxfp4) {
+    const char* name = mxfp4 ? "MXFP4" : "NVFP4";
+    const long long ELEMS = mxfp4 ? 32 : 64;
+    const int BLOCK_BYTES = mxfp4 ? 17 : 36;
+    std::mt19937 rng(mxfp4 ? 0x514D5846uLL : 0x514E5646uLL);
+    const int n_scales = (int) (sizeof(kScales) / sizeof(kScales[0]));
+    const long long n_out = 48;
+    for (long long n_in : (mxfp4 ? std::vector<long long>{32, 128, 640}
+                                 : std::vector<long long>{64, 128, 640})) {
+        const long long blocks_per_row = n_in / ELEMS;
+        const long long w_bytes = n_out * blocks_per_row * BLOCK_BYTES;
+        std::vector<uint16_t> x((size_t) n_in);
+        for (long long i = 0; i < n_in; ++i) x[(size_t) i] = kScales[rng() % n_scales];
+        std::vector<uint8_t> w((size_t) w_bytes, 0);
+        std::vector<uint8_t> codes_el((size_t) n_in);
+        for (long long o = 0; o < n_out; ++o) {
+            uint8_t* wrow = w.data() + o * blocks_per_row * BLOCK_BYTES;
+            for (long long b = 0; b < blocks_per_row; ++b) {
+                for (int k = 0; k < ELEMS; ++k) codes_el[(size_t) k] = (uint8_t) (rng() & 0x0F);
+                if (mxfp4) build_mxfp4(codes_el.data(), kMxfp4Scales[rng() % 8], wrow + b * BLOCK_BYTES);
+                else {
+                    uint8_t ue[4];
+                    for (int s = 0; s < 4; ++s) ue[s] = kNvfp4Scales[(rng() >> 3) % 8];
+                    build_nvfp4(codes_el.data(), ue, wrow + b * BLOCK_BYTES);
+                }
+            }
+        }
+        // Host quantizer: MUST match fp4_quantize_x_q8_kernel bit-for-bit.
+        std::vector<int8_t> xq((size_t) n_in);
+        std::vector<float> xd((size_t) n_in / 32);
+        for (long long g = 0; g < n_in / 32; ++g) {
+            float v[32], mx = 0.0f;
+            for (int i = 0; i < 32; ++i) { v[i] = h2f(x[(size_t)(g * 32 + i)]); const float a = std::fabs(v[i]); if (a > mx) mx = a; }
+            const float d = mx > 0.0f ? mx / 127.0f : 0.0f;
+            xd[(size_t) g] = d;
+            const float inv = d > 0.0f ? 1.0f / d : 0.0f;
+            for (int i = 0; i < 32; ++i) {
+                int q = (int) lrintf(v[i] * inv);
+                if (q > 127) q = 127; if (q < -127) q = -127;
+                xq[(size_t)(g * 32 + i)] = (int8_t) q;
+            }
+        }
+        // Reference: validated FP4 dequant * quantized activation * group scale.
+        std::vector<float> ref((size_t) n_out, 0.0f);
+        std::vector<float> dec((size_t) ELEMS);
+        for (long long o = 0; o < n_out; ++o) {
+            float acc = 0.0f;
+            const uint8_t* wrow = w.data() + o * blocks_per_row * BLOCK_BYTES;
+            for (long long b = 0; b < blocks_per_row; ++b) {
+                const uint8_t* blk = wrow + b * BLOCK_BYTES;
+                if (mxfp4) strata::dequantize_mxfp4(blk, dec.data());
+                else       strata::dequantize_nvfp4(blk, dec.data());
+                const long long base = b * ELEMS;
+                if (mxfp4) {
+                    const float gs = xd[(size_t)(base / 32)];
+                    for (int j = 0; j < 32; ++j) acc += dec[(size_t) j] * (float) xq[(size_t)(base + j)] * gs;
+                } else {
+                    for (int s = 0; s < 4; ++s) {
+                        const float gs = xd[(size_t)((base + s * 16) / 32)];
+                        for (int j = 0; j < 16; ++j)
+                            acc += dec[(size_t)(s * 16 + j)] * (float) xq[(size_t)(base + s * 16 + j)] * gs;
+                    }
+                }
+            }
+            ref[(size_t) o] = acc;
+        }
+        uint16_t* d_x=nullptr; uint8_t* d_w=nullptr; float* d_y=nullptr;
+        check(hipMalloc(&d_x, x.size()*2), "q8 x"); check(hipMalloc(&d_w, (size_t) w_bytes), "q8 w");
+        check(hipMalloc(&d_y, (size_t) n_out*4), "q8 y");
+        check(hipMemcpy(d_x, x.data(), x.size()*2, hipMemcpyHostToDevice), "q8 cx");
+        check(hipMemcpy(d_w, w.data(), (size_t) w_bytes, hipMemcpyHostToDevice), "q8 cw");
+        strata::kernels::fp4_gemv_q8(d_x, d_w, d_y, n_in, n_out, mxfp4);
+        std::vector<float> got((size_t) n_out);
+        check(hipMemcpy(got.data(), d_y, got.size()*4, hipMemcpyDeviceToHost), "q8 cy");
+        check(hipFree(d_x), "q8 fx"); check(hipFree(d_w), "q8 fw"); check(hipFree(d_y), "q8 fy");
+        // Tolerance: int8 activations add real error vs the fp32 path, so compare kernel-to-reference (same
+        // quantized activations) tightly; this checks the DOT, not the quantization.
+        int bad = 0; double worst = 0.0;
+        for (long long o = 0; o < n_out; ++o) {
+            const double a = ref[(size_t) o], b = got[(size_t) o];
+            const double den = std::fabs(a) > 1e-30 ? std::fabs(a) : 1e-30;
+            const double rel = std::fabs(a - b) / den;
+            if (rel > worst) worst = rel;
+            if (!(rel <= 1e-4)) ++bad;
+        }
+        std::printf("  %-6s Q8 n_in %4lld n_out %3lld  %d over tol  worst rel %.3e\n",
+                    name, (long long) n_in, n_out, bad, worst);
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -229,13 +324,14 @@ int main(int argc, char** argv) {
                        (std::fabs((double)r1[i])>1e-30 ? std::fabs((double)r1[i]) : 1e-30);
             if (rel>1e-5) ++mism_t;
         }
-        double t0=0,t1=0,t2=0,t3=0;
+        double t0=0,t1=0,t2=0,t3=0,t4=0;
         for (int i=0;i<reps;++i){
             t0 += tb(strata::kernels::fp4_gemv,          d_x,d_w,d_y1,n_in,n_out,mxfp4);
             t1 += tb(strata::kernels::fp4_gemv_fast,     d_x,d_w,d_y2,n_in,n_out,mxfp4);
             t2 += tb(strata::kernels::fp4_gemv_tiled,    d_x,d_w,d_y3,n_in,n_out,mxfp4);
-            t3 += tb(strata::kernels::fp4_gemv_coalesced,d_x,d_w,d_y4,n_in,n_out,mxfp4); }
-        const double t0a=t0/reps, t1a=t1/reps, t2a=t2/reps, t3a=t3/reps;
+            t3 += tb(strata::kernels::fp4_gemv_coalesced,d_x,d_w,d_y4,n_in,n_out,mxfp4);
+            t4 += tb(strata::kernels::fp4_gemv_q8,       d_x,d_w,d_y4,n_in,n_out,mxfp4); }
+        const double t0a=t0/reps, t1a=t1/reps, t2a=t2/reps, t3a=t3/reps, t4a=t4/reps;
         const double elems = (double)n_in * (double)n_out;
         const double wbytes = (double)(n_in / (mxfp4 ? 32 : 64)) * (double)n_out * (double)(mxfp4 ? 17 : 36);
         std::printf("bench n_in=%lld n_out=%lld mxfp4=%d reps=%d  coalesced_vs_baseline_mismatch=%d\n",
@@ -245,6 +341,8 @@ int main(int argc, char** argv) {
         std::printf("  tiled    : %.4f ms  %.3f TOPS  (%.2fx naive)\n", t2a, elems/1e12/(t2a/1e3), t0a/t2a);
         std::printf("  COALESCED: %.4f ms  %.3f TOPS  (%.2fx naive)  %.1f GB/s weight stream\n",
                     t3a, elems/1e12/(t3a/1e3), t0a/t3a, wbytes/1e9/(t3a/1e3));
+        std::printf("  Q8(int8) : %.4f ms  %.3f TOPS  (%.2fx naive)  <- MoE-shaped (warp/row, int MAC)\n",
+                    t4a, elems/1e12/(t4a/1e3), t0a/t4a);
         // memory floor: same bytes, coalesced read, no decode
         float* d_probeout = nullptr;
         check(hipMalloc(&d_probeout, 4096*4), "probeout");
@@ -261,6 +359,8 @@ int main(int argc, char** argv) {
     int bad = 0;
     run(true);   // MXFP4
     run(false);  // NVFP4
+    run_q8(true);   // MXFP4 int8-activation path
+    run_q8(false);  // NVFP4 int8-activation path
     (void)bad;
     std::printf("PASS\n");
     return 0;

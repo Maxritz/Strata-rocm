@@ -58,4 +58,10 @@ void fp4_gemv_coalesced(const uint16_t* x, const uint8_t* w, float* y,
 // memory floor from the decode cost.
 void fp4_memprobe(const uint8_t* w, float* out, int64_t bytes, int grid);
 
+// The MoE-shaped path: activation quantized to int8 per 32-element group, integer MAC (like the engine's
+// vec_dot_q4_K_q8_1 + row_dot), warp-per-row, warp-shuffle reduce.  Changes the activation numerics
+// (int8), so parity is against a reference that models the same quantization - NOT the fp32 reference.
+void fp4_gemv_q8(const uint16_t* x, const uint8_t* w, float* y,
+                 int64_t n_in, int64_t n_out, bool mxfp4);
+
 }  // namespace strata::kernels
