@@ -701,6 +701,21 @@ Ranked by impact/effort, on a PCIe-4.0-bound box (wins = fewer bytes over the li
 
 Takeaway for us: steal the **`ft bench bw` → calibrated hybrid split** first (it directly tunes the PCIe-vs-CPU-pool choice we already have knobs for, and fixes our bogus PCIe probe); then the **LRU slot cache** and **elastic cache/KV** are the next tier.
 
+### 12.4 PLE n-gram table — footprint
+
+The Qwen3.8-Flash-Next PLE n-gram table (51.2 B params) is **already not pinned** in this engine: it
+lives on disk and rows are read on demand (`--ple-io direct`, unbuffered SSD) under a bounded row cache
+(`--ple-row-cache`, default 1 M rows x 90 B ≈ **90 MB**). FreeToken pins the same table at **47.7 GiB**;
+this engine does not — so RAM is a non-issue here.
+
+The remaining question is the **on-disk** shard: our Swift shard 2 is **26.42 GiB** (IQ4_NL, ~4.5 bpw).
+To reach <= 20 GB: re-quantize to **Q3_K/IQ3 (~3 bpw ≈ 19 GB)** or **Q2_0/IQ2 (~2.5 bpw ≈ 16 GB)**, and
+add a matching type-aware row reader in `ngram.cpp` (today only IQ4_NL direct / Q5_0 mmap are accepted).
+Caveat: the GSQ-RCO authors **deliberately held this table at 4.5 bpw** ("a lookup, not a matmul weight")
+— lowering it is a quality risk to measure against the PLE oracle vectors, not assume. Alternatives:
+prune rare n-grams, or leave disk at 26 GiB (RAM is already tiny).
+
+
 
 
 
