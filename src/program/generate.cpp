@@ -1408,16 +1408,23 @@ int main(int argc, char** argv) {
                          o.native_preset.c_str(), e.what());
             return 1;
         }
-        // docs/MODEL_SUPPORT.md Family A: the prompt path now takes its geometry (N / HC / LR / K / n_ff) from the
-        // header, so any qwen4exp shape runs - the 2560 original and the Whittle 2048 / ff 512 / 8-of-180 alike.
-        // What is still refused is a geometry the kernels cannot serve (the SSM path is compiled for 128).
-        if (g.n_embd <= 0 || g.hc <= 0 || g.hc_lr <= 0 || g.n_ff <= 0 || g.ssm_state_size != 128) {
+        // docs/MODEL_SUPPORT.md Family A: the prompt path takes its geometry (N / HC / LR / K / n_ff) from the
+        // header, so any qwen4exp shape *intends* to run.  **BUT A SHAPE THE PROMPT PATH'S BUFFERS ARE NOT
+        // PROVEN FOR IS REFUSED, NOT RUN**: the 180-expert Whittle path aliased a prefill buffer, read garbage
+        // into the router's ids (0x464C457F, the ELF magic) and HUNG THE GPU.  Until that is fixed, a native
+        // pack must carry an expert count the prompt path has been verified on (288 reap / 512 canonical);
+        // 180 is refused loudly here rather than crashing the card (docs/TODO.md P0).
+        const bool tested_experts = g.n_expert == 288 || g.n_expert == 512;
+        if (g.n_embd <= 0 || g.hc <= 0 || g.hc_lr <= 0 || g.n_ff <= 0 || g.ssm_state_size != 128 ||
+            (native_pack && !tested_experts)) {
             std::fprintf(stderr,
                          "strata generate: %s geometry (n_embd %lld, hc %lld, hc_lr %lld, n_ff %lld, qsa_interval "
-                         "%lld, ssm %lld) is not runnable by this build (needs ssm 128 and positive "
-                         "embedding/hyper-connection/feed-forward widths)\n",
+                         "%lld, ssm %lld, experts %lld) is not runnable by this build yet (needs ssm 128 and "
+                         "positive widths, and a native pack needs a VERIFIED expert count: 288 or 512 - the "
+                         "prompt path's buffers for other counts are not proven and have hung the GPU)\n",
                          o.native_preset.c_str(), (long long) g.n_embd, (long long) g.hc, (long long) g.hc_lr,
-                         (long long) g.n_ff, (long long) g.qsa_interval, (long long) g.ssm_state_size);
+                         (long long) g.n_ff, (long long) g.qsa_interval, (long long) g.ssm_state_size,
+                         (long long) g.n_expert);
             return 2;
         }
     }
