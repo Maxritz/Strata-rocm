@@ -1069,8 +1069,34 @@ int main(int argc, char** argv) {
                             u("deepseek4.hyper_connection.count"), u("deepseek4.hash_layer_count"));
                 std::printf("support: RECOGNISED, not yet runnable (MLA + compressed sparse attention; "
                             "docs/ROCM_PORTING.md section 14)\n");
+            } else if (arch.rfind("qwen35", 0) == 0) {
+                // the qwen35 family (Qwen3.5-35B-A3B `qwen35moe` and the dense `qwen35` 9B/27B): the biggest
+                // "large MoE" shelf in the zoo.  A DIFFERENT decoder - its own gated/SSM attention and MoE
+                // router - so it is recognised and triaged here, not run (docs/MODEL_SUPPORT.md section 4).
+                const std::string p = arch + ".";
+                std::printf("  embd %lld  layers %lld  experts %lldx%lld  ff %lld  ffn %lld\n",
+                            u((p + "embedding_length").c_str()), u((p + "block_count").c_str()),
+                            u((p + "expert_used_count").c_str()), u((p + "expert_count").c_str()),
+                            u((p + "expert_feed_forward_length").c_str()), u((p + "feed_forward_length").c_str()));
+                std::printf("support: RECOGNISED, not yet runnable (qwen35 family: a different attention - "
+                            "gated/SSM hybrid - and MoE than the compiled qwen4exp path; docs/MODEL_SUPPORT.md "
+                            "section 4)\n");
+            } else if (arch == "deepseek2") {
+                std::printf("  embd %lld  layers %lld  experts %lldx%lld\n",
+                            u("deepseek2.embedding_length"), u("deepseek2.block_count"),
+                            u("deepseek2.expert_used_count"), u("deepseek2.expert_count"));
+                std::printf("support: RECOGNISED, not yet runnable (deepseek2 / GLM MoE; no decoder in this build)\n");
+            } else if (arch == "llama" || arch == "qwen2" || arch == "qwen3" || arch == "qwen3moe" ||
+                       arch == "qwen3vl" || arch == "gemma3" || arch == "gemma4" || arch == "phi3" ||
+                       arch == "mistral3" || arch == "starcoder2" || arch == "olmoe" || arch == "gpt-oss" ||
+                       arch == "nemotron_h" || arch == "nemotron_h_moe" || arch == "modern-bert" ||
+                       arch == "clip" || arch == "diffuse" || arch == "laguna" || arch == "dflash" ||
+                       arch == "dspark" || arch == "k2-horizon" || arch == "muse-glimmer" ||
+                       arch == "spark2_5" || arch == "deepseek4-dspark") {
+                std::printf("support: recognised architecture, no decoder in this build (see docs/MODEL_SUPPORT.md)\n");
             } else {
-                std::printf("support: unsupported architecture (this build runs qwen4exp; docs/ROCM_PORTING.md section 14)\n");
+                std::printf("support: unsupported architecture (this build runs qwen4exp; see docs/MODEL_SUPPORT.md "
+                            "for the planned families)\n");
             }
         } catch (const std::exception& e) {
             std::fprintf(stderr, "strata generate: --model-info: %s\n", e.what());
