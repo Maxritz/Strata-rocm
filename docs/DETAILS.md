@@ -55,6 +55,53 @@ halves the KV cache's memory with a Hadamard rotation before 4-bit rounding (PR 
 is measurably less precise on long documents (perplexity +8-12%; needle tests still pass). 8-bit stays the default.
 Details: [`bench/results/2026-09-27-kv-q4`](../bench/results/2026-09-27-kv-q4/README.md).
 
+**Hybrid K8V4 KV cache (engine 0.1.25, optional, PR #120):** `--kv k8v4` (`START-HERE.bat --setup --kv k8v4`) keeps
+the keys at 8 bits and stores the values as rotated 4-bit: 23% less KV memory than 8-bit, so more experts fit in
+VRAM. RTX 3090, the Coder at 198K context: 99 instead of 85 tokens/s output, the same needle results, prompts 2-5%
+slower. It does not stream its KV cache (KV streaming is on by default from 64K), so it pays off mostly on large
+cards at long contexts.
+
+**Reproducible greedy output (0.1.30, opt-in, `STRATA_IQ_MT_MIN=1`):** with the IQ models, the CPU computes an
+expert for one token with ggml's dot product and for several tokens with Strata's multi-token kernels, which round
+slightly differently. How many tokens share an expert depends on the drafts in a verify window, so the same prompt
+at temperature 0 can end in a different (equally good) answer when the drafting, the cache state or a resumed
+conversation differ (issue #152). `STRATA_IQ_MT_MIN=1` (in the config's `env`) uses the multi-token kernels for
+every group: the answer then no longer depends on the drafting. Measured on a Ryzen 7600 (AVX-512): IQ3_S decode
+-1..-3%, the other models the same; the default stays the fastest rule.
+
+**The draft layer's tokens (0.1.27, `--draft-vocab`):** the MTP draft layer can only propose tokens from a subset
+of the vocabulary (`mtp/rt/draft_vocab.bin`). Since 0.1.27 the subset includes every Chinese, Japanese and Korean
+token (106,299 ids), so answers in those languages are 15-38% faster (Q2_0, RTX 5070). Its head takes ~180 MiB of
+VRAM, which the expert cache leaves free for it (0.1.28). `START-HERE.bat --setup --draft-vocab en` keeps the
+English/code subset from before (40,525 ids, ~110 MiB less VRAM, English answers 1-2% faster; CJK answers get
+almost no drafts). `tools/draft_vocab.py` builds and inspects subsets.
+
+**Low-RAM mode (engine 0.1.26, chosen by setup):** normally all of a model's experts are copied into RAM (23-50 GB,
+pinned) and the GPU holds a copy of the most-used ones. On a PC whose RAM cannot hold them beside the system (the
+experts plus ~10 GB), setup instead maps them from one file in the model's folder (`--mmap-experts`, the pack's
+`experts.bin`, +23-50 GB of disk). The OS file cache holds what the GPU does not, and it can give that memory back.
+On the Coder the engine's committed memory drops from 36 to ~13 GB, with the same answers. With a big GPU (an RTX
+5090 holds all of the Coder's experts, most of Q2_0's) it runs at nearly the usual speed. With a small one, most
+experts come from the SSD and it is much slower (setup says so). `START-HERE.bat --setup --low-ram on|off` overrides
+the choice.
+
+**Low-RAM mode, resident (engine 0.1.30):** when the experts the GPU does not hold fit the RAM (with the same ~10 GB
+beside them), setup picks the resident variant instead (`--resident-experts`): at start the engine copies exactly those
+experts from `experts.bin` into RAM (page-locked when the driver allows, else locked in RAM), so while it answers
+nothing is read from the SSD, however little RAM the OS leaves for its file cache. Examples with setup's context: a
+32 GB PC with a 24 GB GPU runs Q2_0, IQ2_XS and the Coder this way (~16-18 GB of experts in RAM, the GPU holds the
+other ~18 GB), a 32 GB PC with a 12-16 GB GPU the Coder; IQ3_XXS on a 32 GB PC stays mapped. The details:
+- The prompt path borrows room in the GPU's expert cache for its buffers and puts those experts back after the prompt;
+  as far as the RAM allows, their experts are kept in RAM too (so a prompt reads nothing from the SSD either).
+- The cache still follows the conversation (`--adapt-every`): a swap copies the evicted expert back from VRAM into the
+  RAM place of the one that replaces it, so the RAM copy keeps holding exactly what the GPU does not.
+- The answers are the plain mapped mode's for the same expert placement: the bytes are the file's. With a page-locked
+  copy the GPU also takes its usual share of the misses over PCIe (`--pcie-frac`), as with enough RAM; `--pcie-frac 0`
+  (or `STRATA_RESIDENT_PIN=0`) gives the mapped mode's exact tokens.
+- The engine leaves 4 GB of the RAM it finds free (`STRATA_RESIDENT_HEADROOM_GIB`); when even the experts the GPU does
+  not hold do not fit, it says so and runs the plain mapped mode. The server log shows, per request, how many expert
+  reads went to the file (`resident RAM: ... blob reads from the file`: 0 in steady use).
+- `--low-ram resident|mmap` forces one variant (also on a PC with enough RAM, e.g. to try it).
 Time to first token is prompt length / prompt speed: with Q2_0 about 4 s at 4K, 25 s at 32K, under 2 minutes at 128K
 and 4.5 minutes at 262K (engine 0.1.13 made long prompts about twice as fast, below).
 
