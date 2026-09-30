@@ -670,6 +670,26 @@ Targets: prefill 800 tok/s (**met on large chunks**), decode 40+ (**open**).
 | 17 | **Engram hash layers**; **MTP head** (`nextn_predict_layers 1`) | open |
 | 18 | **`qwen35moe`** path (GDN + gated attention lineage) — smallest new model; warm-up before MLA | open |
 
+### 12.2 Consolidated conclusions (all evaluated sources)
+
+Ranked by impact/effort, on a PCIe-4.0-bound box (wins = fewer bytes over the link, or less VRAM pressure):
+
+| # | conclusion | source(s) | item |
+|---|-----------|-----------|------|
+| 1 | **Expert bundling**: co-locate one expert's gate/up/down contiguously so a miss is one sequential read (Apple's row-column bundling; = ZipMoE co-activation layout) | Apple LLM-in-a-Flash (2312.11514); edge survey (2607.20981) | §12/12.1 |
+| 2 | **KV `q8_0` then `q4_0`** (drop-in, ~1.88x / ~3.56x, frees VRAM for the hot expert set); TurboQuant 3.5b only for sub-3-bit | TurboQuant (2504.19874) | §12 item 10 |
+| 3 | **Q2_0 over IQ2_XS** — measured 367 vs 108 prompt tok/s on the same model | GSQ-RCO card | §12 item 3 |
+| 4 | **MTP / spec decode** for TG 40+ (also amortizes a PCIe expert fetch over k tokens) | Qwen MTP; DSpark; llamastash | §12 item 2 |
+| 5 | **Windowing (hot-expert VRAM cache) + async multi-stream prefetch via the router as oracle + preallocated slab with evict-by-overwrite + selective persistence** | Apple LLM-in-a-Flash | §12 item 5 |
+| 6 | **Gate/up/down kernel fusion**; per-expert mixed precision + routing-preserving quant | Mega-MoE (2609.19969); survey (2607.20981) | §12 items 7/8 |
+| 7 | **DeepSeek-V4 = CUDA→HIP port** of `ds4_cuda.cu`, gated on `official.vec` | antirez/ds4; ds4-ssd | §12.1 items 13-17 |
+| 8 | **Autoresearch ratchet loop** for tuning (immutable bench + editable config + `results.tsv`, keep only on a measured new best) | karpathy/autoresearch | new |
+
+**Non-transferable** (do not port): Apple's unified-memory + SSD cost model (our two hops NVMe→host→PCIe→VRAM differ), its ReLU activation-sparsity predictor (our MoE is top-k structural, not activation-sparse), and TurboQuant's dense rotation on the hot path (needs a structured/HD rotation to be worth it).
+
+**Autoresearch harness contract for this repo** (when we build it): immutable `bench/` driver (fixed model + prompt + `--max-tokens`/warmup/repeats + JSON), editable `config.yaml` (chunk size, `STREAM_ALL_MIN`, expert cache, spec depth, KV quant), untracked `results.tsv` (`commit	throughput_tps	vram_gb	status	description`), keep a candidate only if median tok/s beats the best by more than run-to-run σ with the output hash unchanged.
+
+
 
 ## 13. Measured scores (gfx1201, RX 9070 XT, PCIe 4.0 x16)
 
