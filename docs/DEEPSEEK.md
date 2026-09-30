@@ -74,3 +74,34 @@ What each gives us:
 - The DSA/MLA **math** is in ds4 — read it, don't invent it.
 - The **parity vectors** already exist (`official.vec`) — use them as the gate, not a hand-built reference.
 - The **hyper-connection** block is already in this engine (`qwen4exp`) — reuse it, don't re-port it.
+
+---
+
+## 5. deepseek2 / GLM-4.7-Flash MLA — the EXACT forward (verified, not invented)
+
+Source of record: the vendored llama.cpp at `build_gfx1201/_deps/strata_llamacpp-src/src/models/deepseek2.cpp`
+(shape creation lines 99-119, the attention graph lines 246-347). This is the same math ds4 ports, so a fresh
+session implements from this instead of fetching ds4 first.
+
+**Shapes** (from `deepseek2.cpp:105-117` and the GGUF, which match):
+`q_lora_rank = 768`, `kv_lora_rank = 512`, `n_head = 20`, `n_embd_head_k = 256`, `n_rot = 64`
+⇒ `nope = 192`, `v = 256`. Tensors: `wq_a [2048,768]`, `wq_b [768,5120]=[768,20*256]`,
+`wkv_a_mqa [2048,576]=[2048,512+64]`, `wk_b [192,512,20]`, `wv_b [512,256,20]`, `wo [5120,2048]`.
+
+**Per layer (single token; the graph is over n_tokens):**
+1. `q  = cur @ wq_a` → `rmsnorm(q, attn_q_a_norm)` → `q = q @ wq_b` → `[20, 256]`, split `[nope 192 | rope 64]`.
+2. `kv_pe = cur @ wkv_a_mqa` → `[latent 512 | rope 64]`; `kv_cmpr = rmsnorm(latent, attn_kv_a_norm)`.
+3. `q_pe = rope(q[...,192:256], pos)`, `k_pe = rope(kv_pe, pos)` — NeoX pairs, `freq_base 1e7`.
+4. **absorption:** `q_nope_absorbed = wk_b @ q_nope` (192 → 512, per head).
+5. `Qcur = concat(q_nope_absorbed[512], q_pe[64])` per head; `Kcur = concat(kv_cmpr[512], k_pe[64])`;
+   `Vcur = kv_cmpr[512]`.
+6. `attn = softmax(Qcur·Kcur / sqrt(n_embd_head_k)) @ Vcur`, then V is **up-projected by `wv_b`** (512→256/head).
+7. `out = attn @ wo`.
+
+**MoE** (`deepseek2.cpp:363-392`): `build_moe_ffn(gate_inp, up_exps, gate_exps, down_exps, exp_probs_b, 64, 4,
+SILU, weights_norm, scale, gating_func)` — the router carries the **`exp_probs_b` bias** and a `gating_func`
+(softmax/sigmoid); then **+ the shared expert** `ffn_{up,gate,down}_shexp` (SILU).
+
+**GGUF → pack:** already handled by `tools/iq_pack.py` (arch-generic since this session): `blk.1..46.*_exps`,
+64 experts, `n_embd 2048`, `n_ff 1536`; layer 0 is dense.  `attn_k_b`/`attn_v_b` are 3-D and served natively.
+
