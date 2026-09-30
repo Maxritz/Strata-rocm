@@ -640,6 +640,20 @@ Targets: prefill 800 tok/s (**met on large chunks**), decode 40+ (**open**).
 | 9 | **[LIT-7] FP4/FP8 expert weights** | cuts PCIe bytes only above ~4 bpw; subordinate to #3 | open |
 | 10 | **KV cache in VRAM** (block layout) | keep KV from displacing the expert hot set | open |
 
+### 12.1 Multi-architecture backlog (see §14 for the DeepSeek plan)
+
+| # | item | status |
+|---|------|--------|
+| 11 | **`--model-info`**: recognise every architecture + read its geometry, report support | **done** |
+| 12 | **Parity reference** (llama.cpp on the same GGUF) — the gate every arch stage must pass | open |
+| 13 | **DeepSeek-V4 pack tooling** (MLA tensors, Engram tables, sigmoid MoE 256/6/1 ff2048, MTP) + per-tensor xcheck | open |
+| 14 | **DeepSeek-V4 layer graph** (RMSNorm → MLA → sparse select → output → hyper-connection → sigmoid MoE → Engram) | open |
+| 15 | **MLA attention kernel** (naive-correct → partial RoPE 64d/yarn → compressed-KV → indexer) | open |
+| 16 | **Compressed sparse attention** (compress_ratios 4/128, sliding 128, indexer top_k 512) | open |
+| 17 | **Engram hash layers**; **MTP head** (`nextn_predict_layers 1`) | open |
+| 18 | **`qwen35moe`** path (GDN + gated attention lineage) — smallest new model; warm-up before MLA | open |
+
+
 ## 13. Measured scores (gfx1201, RX 9070 XT, PCIe 4.0 x16)
 
 All runs: Qwen3.8-Flash-Next Swift (IQ2_XS, 512 experts) via the native pack, `--expert-cache 2600
