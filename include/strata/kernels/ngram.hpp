@@ -92,6 +92,10 @@ struct PleConsts {
     PleGeom geom;
 };
 PleConsts ple_artifact_consts();
+/// Read a model's `qwen4exp.ple.*` (ngram_size, heads_per_ngram, vocab sizes, offsets, multipliers, conv,
+/// eos) plus `per_layer_token_embd.weight`'s shape, and build the constants + geometry.  Falls back to
+/// `ple_artifact_consts()` (the 2560 artifact) when the keys are absent or inconsistent.
+PleConsts ple_consts_from_gguf(const std::string& gguf_path);
 /// The same four arrays, read from a GGUF's `qwen4exp.ple.*` (falls back to the compiled constants when the
 /// keys are absent).  `n_heads`/`head_dim`/`fmt`/`table_rows` come from the metadata + the tensor, not here.
 PleConsts ple_consts_from_meta(uint64_t n_heads, uint64_t head_dim, int heads_per_ngram, int ngram_size,
@@ -162,6 +166,12 @@ public:
 
     /// Open with an explicit I/O mode. The two-argument `open` below is the default (Direct).
     bool open(const std::string& gguf_path, std::string& err, const PleIoOptions& io);
+    /// Open with a runtime geometry (from `ple_consts_from_gguf`).  `head_dim`/`fmt`/`row_bytes` come from the
+    /// tensor; `n_heads`/`ngram_size`/`conv_kernel`/`eos` come from `geom`.  The default `open` uses a
+    /// default-constructed `PleGeom`, so the 2560 artifact is byte-identical.
+    bool open(const std::string& gguf_path, std::string& err, const PleIoOptions& io, const PleGeom& geom);
+    /// The geometry this table is open with (for the caller to size the PLE block's output).
+    const PleGeom& geom() const;
 
     /// The split the plan asks for: `issue` as soon as the token id is known, `collect` just before layer 1
     /// needs the rows. `gather` is `issue` followed by `collect`. In Mmap mode `issue` only prefetches.

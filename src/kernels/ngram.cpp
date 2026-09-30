@@ -218,19 +218,64 @@ struct PleTable::Impl {
     strata::ngram::PleReader::Ticket ticket;
     bool pending = false;
     bool q5_0 = false;                          // the table's quant type: IQ4_NL (default) or Q5_0
+    // **RUNTIME GEOMETRY.**  A default `PleGeom` reproduces the compiled 2560/IQ4_NL artifact exactly; `open`
+    // overwrites it from the tensor (head_dim, fmt, row_bytes) and the caller's metadata (n_heads, ...).
+    PleGeom geom;
     int row_bytes = PLE_ROW_BYTES;
-    uint32_t rows[PLE_N_HEADS] = {};
-    uint8_t raw[PLE_N_HEADS * PLE_ROW_BYTES_MAX] = {};
+    std::vector<uint32_t> rows;                 // geom.n_heads
+    std::vector<uint8_t> raw;                   // geom.n_heads * row_bytes
 };
+
+PleConsts ple_consts_from_gguf(const std::string& path) {
+    try {
+        GgufFile f(path);
+        const auto uv = [&](const char* k, uint64_t dflt) -> uint64_t {
+            const MetaValue* v = f.get(k);
+            return (v != nullptr && v->is_num()) ? v->u : dflt;
+        };
+        const auto vec = [&](const char* k) -> std::vector<uint64_t> {
+            std::vector<uint64_t> out;
+            if (const MetaValue* v = f.get(k); v != nullptr)
+                for (const MetaValue& m : v->items) out.push_back(m.u);
+            return out;
+        };
+        uint64_t head_dim = PLE_HEAD_DIM, rows = PLE_TABLE_ROWS;
+        if (const TensorInfo* t = f.find("per_layer_token_embd.weight"); t != nullptr && t->shape.size() == 2) {
+            head_dim = t->shape[0];
+            rows = t->shape[1];
+        }
+        const uint64_t ng = uv("qwen4exp.ple.ngram_size", NGRAM_SIZE);
+        const uint64_t hpn = uv("qwen4exp.ple.heads_per_ngram", HEADS_PER_NGRAM);
+        const uint64_t n_heads = (ng - 1) * hpn;
+        const std::vector<uint64_t> vocab = vec("qwen4exp.ple.head_vocab_sizes");
+        const std::vector<uint64_t> offset = vec("qwen4exp.ple.head_offsets");
+        const std::vector<uint64_t> mult = vec("qwen4exp.ple.layer_multipliers");
+        if (n_heads == 0 || vocab.size() != n_heads || offset.size() != n_heads || mult.size() < ng)
+            return ple_artifact_consts();       // not a PLE model (or a shape we do not recognise): the default
+        PleConsts c = ple_consts_from_meta(n_heads, head_dim, (int) hpn, (int) ng, mult, vocab, offset);
+        c.geom.conv_kernel = (int) uv("qwen4exp.ple.conv_kernel", PLE_CONV_KERNEL);
+        c.geom.eos = (int32_t) uv("qwen4exp.ple.eos_token_id", (uint32_t) PLE_EOS_TOKEN_ID);
+        c.geom.table_rows = rows;
+        return c;
+    } catch (...) {
+        return ple_artifact_consts();
+    }
+}
 
 PleTable::PleTable() : impl_(new Impl) {}
 PleTable::~PleTable() { close(); delete impl_; }
 
 bool PleTable::open(const std::string& gguf_path, std::string& err) {
-    return open(gguf_path, err, PleIoOptions{});
+    return open(gguf_path, err, PleIoOptions{}, PleGeom{});
 }
 
 bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoOptions& io) {
+    return open(gguf_path, err, io, PleGeom{});
+}
+
+const PleGeom& PleTable::geom() const { return impl_->geom; }
+
+bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoOptions& io, const PleGeom& geom_in) {
     close();
     try {
         impl_->file = new GgufFile(gguf_path);
@@ -244,24 +289,36 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
         close();
         return false;
     }
-    // [160, 320001536]: ne0 = 160 is the FAST axis, so the ROW index is shape[1] and a row is contiguous.
-    if (t->shape.size() != 2 || t->shape[0] != (uint64_t) PLE_HEAD_DIM) {
+    // **GEOMETRY FROM THE TENSOR.**  `head_dim` = shape[0] (the fast axis, so a row is contiguous), the format
+    // from the type, the row size from both.  `geom_in` carries what the tensor cannot say - n_heads (from
+    // heads_per_ngram/ngram_size), conv_kernel, eos, hc - the 2560 defaults unless `ple_consts_from_gguf`
+    // filled them.  A default `geom_in` therefore reproduces the compiled artifact exactly.
+    if (t->shape.size() != 2) {
         err = "per_layer_token_embd.weight has an unexpected shape";
         close();
         return false;
     }
-    if (std::strcmp(t->type_name(), "IQ4_NL") == 0) {
-        impl_->q5_0 = false;
-        impl_->row_bytes = PLE_ROW_BYTES;
-    } else if (std::strcmp(t->type_name(), "Q5_0") == 0) {
-        impl_->q5_0 = true;
-        impl_->row_bytes = PLE_ROW_BYTES_MAX;
+    PleGeom g = geom_in;
+    g.head_dim = (int) t->shape[0];
+    g.table_rows = t->shape[1];
+    if (g.n_heads <= 0) g.n_heads = (g.ngram_size - 1) * g.heads_per_ngram;
+    const char* tn = t->type_name();
+    if (std::strcmp(tn, "IQ4_NL") == 0) {
+        g.fmt = PleFmt::IQ4NL; g.row_bytes = (g.head_dim / 32) * 18; impl_->q5_0 = false;
+    } else if (std::strcmp(tn, "Q5_0") == 0) {
+        g.fmt = PleFmt::Q5_0; g.row_bytes = (g.head_dim / 32) * 22; impl_->q5_0 = true;
+    } else if (std::strcmp(tn, "Q4_K") == 0) {
+        g.fmt = PleFmt::Q4K; g.row_bytes = (g.head_dim / 256) * 144; impl_->q5_0 = false;
     } else {
-        err = std::string("per_layer_token_embd.weight is ") + t->type_name() + ", not IQ4_NL or Q5_0";
+        err = std::string("per_layer_token_embd.weight is ") + tn + ", not IQ4_NL, Q5_0 or Q4_K";
         close();
         return false;
     }
+    impl_->geom = g;
+    impl_->row_bytes = g.row_bytes;
     impl_->n_rows = t->shape[1];
+    impl_->rows.assign((size_t) g.n_heads, 0);
+    impl_->raw.assign((size_t) g.n_heads * (size_t) g.row_bytes, 0);
     impl_->data = impl_->file->tensor_data(*t);
 
     // THE CHECK THAT MAKES THE OFFSET FALSIFIABLE.  The manifest's `shard2_tensor.offset` is 0, but that is
@@ -289,7 +346,7 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
     }
     // The direct SSD reader is IQ4_NL-only (90-byte rows); a Q5_0 table stays on the mmap path, whose row
     // size is type-aware below.
-    if (io.mode == PleIo::Direct && !impl_->q5_0) {
+    if (io.mode == PleIo::Direct && g.fmt == PleFmt::IQ4NL) {
         // The parse above is the validated source of the offset; the mapping itself is not kept, so no page of
         // the table can enter this process's working set or the file cache through it.
         const uint64_t table_offset = impl_->file->data_start() + t->offset;
@@ -303,7 +360,7 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
         }
         impl_->n_rows = n_rows;
     }
-    impl_->mode = (io.mode == PleIo::Direct && impl_->q5_0) ? PleIo::Mmap : io.mode;
+    impl_->mode = (io.mode == PleIo::Direct && g.fmt != PleFmt::IQ4NL) ? PleIo::Mmap : io.mode;
     return true;
 }
 
@@ -322,43 +379,45 @@ PleIo PleTable::mode() const { return impl_->mode; }
 uint64_t PleTable::rows() const { return impl_->n_rows; }
 uint64_t PleTable::bytes_read() const { return impl_->bytes_read; }
 
-void PleTable::read_row(uint32_t row, float* out160) const {
+void PleTable::read_row(uint32_t row, float* out) const {
+    const PleGeom& g = impl_->geom;
     if (impl_->mode == PleIo::Direct && impl_->reader.is_open()) {
-        uint8_t raw[PLE_ROW_BYTES_MAX];
+        uint8_t raw[512];   // >= any row (Q4_K 144, Q5_0 head_dim/32*22, IQ4_NL 90)
         std::string err;
         const auto t = impl_->reader.issue(&row, 1, raw);
         if (!impl_->reader.collect(t, err)) {
-            std::memset(out160, 0, (size_t) PLE_HEAD_DIM * sizeof(float));
+            std::memset(out, 0, (size_t) g.head_dim * sizeof(float));
             return;
         }
-        ple_dequant_row(impl_->q5_0, raw, out160);
-        impl_->bytes_read += impl_->row_bytes;
+        ple_dequant_row_fmt(g.fmt, raw, out, g.head_dim);
+        impl_->bytes_read += (uint64_t) g.row_bytes;
         return;
     }
     if (impl_->data == nullptr || row >= impl_->n_rows) {
-        std::memset(out160, 0, (size_t) PLE_HEAD_DIM * sizeof(float));
+        std::memset(out, 0, (size_t) g.head_dim * sizeof(float));
         return;
     }
-    ple_dequant_row(impl_->q5_0, impl_->data + (size_t) row * impl_->row_bytes, out160);
-    impl_->bytes_read += impl_->row_bytes;
+    ple_dequant_row_fmt(g.fmt, impl_->data + (size_t) row * (size_t) g.row_bytes, out, g.head_dim);
+    impl_->bytes_read += (uint64_t) g.row_bytes;
 }
 
 bool PleTable::issue(const uint32_t* rows16) {
-    std::memcpy(impl_->rows, rows16, sizeof impl_->rows);
+    const PleGeom& g = impl_->geom;
+    std::memcpy(impl_->rows.data(), rows16, (size_t) g.n_heads * sizeof(uint32_t));
     if (impl_->mode == PleIo::Direct) {
         if (impl_->pending) return false;              // one token in flight per table
-        impl_->ticket = impl_->reader.issue(impl_->rows, PLE_N_HEADS, impl_->raw);
+        impl_->ticket = impl_->reader.issue(impl_->rows.data(), g.n_heads, impl_->raw.data());
         impl_->pending = true;
         return true;
     }
 #if defined(_WIN32)
     if (impl_->data != nullptr && g_ple_prefetch) {
-        WIN32_MEMORY_RANGE_ENTRY ranges[PLE_N_HEADS];
+        WIN32_MEMORY_RANGE_ENTRY ranges[64];
         ULONG_PTR n = 0;
-        for (int h = 0; h < PLE_N_HEADS; ++h) {
+        for (int h = 0; h < g.n_heads && n < 64; ++h) {
             if (rows16[h] >= impl_->n_rows) continue;
-            ranges[n].VirtualAddress = (PVOID) (impl_->data + (size_t) rows16[h] * impl_->row_bytes);
-            ranges[n].NumberOfBytes = impl_->row_bytes;
+            ranges[n].VirtualAddress = (PVOID) (impl_->data + (size_t) rows16[h] * (size_t) g.row_bytes);
+            ranges[n].NumberOfBytes = (SIZE_T) g.row_bytes;
             ++n;
         }
         if (n > 0) (void) PrefetchVirtualMemory(GetCurrentProcess(), n, ranges, 0);
@@ -368,34 +427,36 @@ bool PleTable::issue(const uint32_t* rows16) {
     return true;
 }
 
-bool PleTable::collect(float* out2560, std::string& err) {
+bool PleTable::collect(float* out, std::string& err) {
+    const PleGeom& g = impl_->geom;
     if (!impl_->pending) { err = "PleTable::collect without issue"; return false; }
     impl_->pending = false;
     if (impl_->mode == PleIo::Direct) {
         if (!impl_->reader.collect(impl_->ticket, err)) return false;
-        for (int h = 0; h < PLE_N_HEADS; ++h)
-            ple_dequant_row(impl_->q5_0, impl_->raw + (size_t) h * impl_->row_bytes,
-                            out2560 + (size_t) h * PLE_HEAD_DIM);
-        impl_->bytes_read += (uint64_t) PLE_N_HEADS * impl_->row_bytes;
+        for (int h = 0; h < g.n_heads; ++h)
+            ple_dequant_row_fmt(g.fmt, impl_->raw.data() + (size_t) h * (size_t) g.row_bytes,
+                                out + (size_t) h * (size_t) g.head_dim, g.head_dim);
+        impl_->bytes_read += (uint64_t) g.n_heads * (uint64_t) g.row_bytes;
         return true;
     }
-    for (int h = 0; h < PLE_N_HEADS; ++h) read_row(impl_->rows[h], out2560 + (size_t) h * PLE_HEAD_DIM);
+    for (int h = 0; h < g.n_heads; ++h) read_row(impl_->rows[(size_t) h], out + (size_t) h * (size_t) g.head_dim);
     return true;
 }
 
 bool PleTable::gather_batch(const uint32_t* rows, size_t n_tokens, float* out, std::string& err) {
+    const PleGeom& g = impl_->geom;
     if (impl_->pending) { err = "PleTable::gather_batch while a token is in flight"; return false; }
-    const size_t n = n_tokens * (size_t) PLE_N_HEADS;
+    const size_t n = n_tokens * (size_t) g.n_heads;
     if (impl_->mode == PleIo::Direct) {
-        std::vector<uint8_t> raw(n * impl_->row_bytes);
+        std::vector<uint8_t> raw(n * (size_t) g.row_bytes);
         const auto ticket = impl_->reader.issue(rows, n, raw.data());
         if (!impl_->reader.collect(ticket, err)) return false;
         for (size_t i = 0; i < n; ++i)
-            ple_dequant_row(impl_->q5_0, raw.data() + i * impl_->row_bytes, out + i * PLE_HEAD_DIM);
-        impl_->bytes_read += (uint64_t) n * impl_->row_bytes;
+            ple_dequant_row_fmt(g.fmt, raw.data() + i * (size_t) g.row_bytes, out + i * (size_t) g.head_dim, g.head_dim);
+        impl_->bytes_read += (uint64_t) n * (uint64_t) g.row_bytes;
         return true;
     }
-    for (size_t i = 0; i < n; ++i) read_row(rows[i], out + i * PLE_HEAD_DIM);
+    for (size_t i = 0; i < n; ++i) read_row(rows[i], out + i * (size_t) g.head_dim);
     return true;
 }
 
@@ -422,7 +483,7 @@ void PleTable::gather(const uint32_t* rows16, float* out2560) const {
         std::string err;
         if (!self->issue(rows16) || !self->collect(out2560, err)) {
             std::fprintf(stderr, "PleTable::gather: %s\n", err.empty() ? "a token is already in flight" : err.c_str());
-            std::memset(out2560, 0, (size_t) NG_N_EMBD * sizeof(float));
+            std::memset(out2560, 0, (size_t) impl_->geom.n_heads * (size_t) impl_->geom.head_dim * sizeof(float));
         }
         return;
     }
