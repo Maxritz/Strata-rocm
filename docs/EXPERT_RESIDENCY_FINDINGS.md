@@ -280,6 +280,74 @@ Implications:
   hot-expert pinning with `count*0.75+1` → (optional, only if accuracy ≥70%) frequency-based prerouter.
 - **P3:** the existing backlog — DeepSeek S2, qwen35moe/Q2_0, PLE, LIT items (docs §12, §14).
 
+## 10b. Cross-document synthesis (all MD findings + a 3rd deploy-3 run)
+
+Sources read in full: `docs/ROCM_PORTING.md` (§11.1-§15), `docs/DETAILS.md`, `README.md`, every
+`bench/results/*/README.md`, `data/experimental-speed-projection/README.md`, and this file. A third
+`/deploy-3` run was given the consolidated set; all three agents **converged**.
+
+### 10b.1 The agents' consensus ranking
+
+**For decode 22 → 40+:** (1) fix the transient-pointer race — critical, unblocks everything; (2)
+**routing-predicted prefetch** (use the existing `--expert-profile` to *prefetch*, not just admit) —
++15-40%; (3) **co-activation-ordered expert layout** (ZipMoE, up to 72.77% cited); (4) **KV streaming**
+(`--kv-resident`, frees VRAM); (5) spec tuning; (6) Q2_0 re-pack (~33% by the upstream card, high effort).
+Edge0's full tiered resolution and the prerouter *head* were rated redundant/marginal (they overlap item 2).
+
+**For the min tier (12 GB VRAM / 48 GB / gfx1031) running at all:** (1) the bounded ring, correct; (2) KV
+streaming; (3) kernel-load-at-start; (4) profile prefetch.
+
+**Their answers to the two pointed questions:** the Q2_0-vs-IQ2_XS gap is plausibly real and worth a re-pack
+**after** the race fix + prefetch; and co-activation ordering must **not** be done before the race fix
+("you cannot measure an optimisation on a system producing wrong results").
+
+### 10b.2 My deep analysis — the decode bottleneck is NOT the one prefill had
+
+The agents ranked items 2/3 as if decode were PCIe-saturated like the §11.8 prefill gather. It is not.
+The decode budget:
+
+- 48 layers x 10 experts = **480 expert fetches/token**; x 1.5 MB = **~720 MB/token**.
+- At the measured **22 tok/s** that is **~15.8 GB/s = ~half the 30 GB/s link**. So decode leaves **half the
+  PCIe link idle** — there is genuine headroom to fill, unlike the prefill gather that ran at 30.4 GB/s.
+- **This resolves the conflict the docs left open.** §11.8's overlap test regressed (524 vs 485 ms) because
+  it overlapped the *prefill gather*, where the link is already saturated — two streams then contend for one
+  full link. Decode is the opposite case. **Overlap/prefetch should be evaluated on the decode path, and the
+  prefill regression is not evidence against it there.**
+- The zero-residency floor: 720 MB / 30 GB/s = **24 ms/token = ~42 tok/s**. So 40+ is *right at* the PCIe
+  floor with no residency benefit: it is **not** reachable by overlap alone (overlap only approaches the
+  floor, never beats it). At a 40% VRAM hit rate, bytes fall to ~432 MB/token → 14.4 ms → a ~70 tok/s
+  ceiling. **Conclusion: 40+ needs BOTH (a) overlap/prefetch to approach the floor and (b) residency to
+  lower the floor.** Layout (item 3) only improves *burst efficiency* of the same bytes — a few tok/s, not
+  72%; the 72.77% figure is from a different context and should not be quoted as ours.
+
+### 10b.3 Secondary findings worth keeping
+
+- **Q2_0 is also SMALLER** (`DETAILS.md`: ~34 GB experts vs IQ2_XS ~36 GB) *and* faster to decode — so it
+  helps the min tier's footprint as well as speed. That makes it the one high-effort item with a double payoff.
+- **Kernel-load-at-start** (upstream `CUDA_MODULE_LOADING=EAGER`, ~30 MB VRAM) is the same class as our
+  `Gemm::warmup` (`a6949a0`) and should be generalised to every lazily-loaded module (the Q5_K head, the
+  MMQ instances) so no first-use code load lands mid-prompt.
+- **Expert cache parity is settled** (`bench/results/2026-09-27-cache-parity`): on-vs-off perplexity is equal
+  within 1 SE; the flips are top-2 margins < 0.5 logits. Neither is "more correct", so cache changes are safe
+  to make for speed.
+- **`tools/make_profile.py` + `--dump-routing`** already exist upstream; we should build a *real* profile from
+  our own prompts instead of the bootstrap round-robin one (which gives ~13/1579 hit rate, §11.5).
+
+### 10b.4 The resulting TODO (see also the session todo list)
+
+| # | action | gate |
+|---|---|---|
+| P0 | Event-tied slot release in the ring/prefill | ring 20/22 == arena `248068 198 760 1156` |
+| P0.5 | Measure PCIe utilization during **decode** (confirm the ~half-link idle) | measured decode GB/s and overlap fraction |
+| P1 | KV streaming (`--kv-resident`) to free VRAM for experts | VRAM drop; decode up at 8K+ |
+| P1 | Profile-driven prefetch + async build pool (Edge0 tiering) | decode 22 → ≥26, identical output |
+| P1 | Derive `--expert-ram-gb` from available RAM; verify gfx1031/12 GB/48 GB | min tier starts and decodes |
+| P2 | Co-activation-ordered layout (only if gather fragmentation confirmed) | gather time drops for 8.0 GiB |
+| P2 | Q2_0 Swift re-pack (validate) | measured decode gain + smaller footprint |
+| P2 | Spec tuning (`--spec 4 --spec-min-p 0.5`, warm verify experts) | decode up, identical greedy stream |
+| P3 | Decayed hot-pinning; prerouter head (only if accuracy ≥70%) | measured accuracy |
+| P3 | Kernel-load-at-start; fix `--expert-cache-per-layer`; backlog (DeepSeek S2, qwen35moe, PLE) | — |
+
 ## 10. One-line summary
 
 The 34 GB arena is unbounded residency; the fix — a bounded pinned LRU ring (`RingExpertSource`,
@@ -287,4 +355,5 @@ The 34 GB arena is unbounded residency; the fix — a bounded pinned LRU ring (`
 ring reproduces the arena exactly). It needs **one correctness step** (event-tied release) plus **three
 borrowables from Edge0** (shared-LRU/prefetch-buffer tiering, an async build pool, and decayed hot-expert
 pinning) — and the same ring must be the path that lets the **12 GB VRAM / 48 GB RAM gfx1031** tier run the
-model at all.
+model at all. Decode 40+ additionally needs BOTH overlap (decode leaves ~half the link idle, unlike the
+saturated prefill gather) AND residency (to lower the ~42 tok/s PCIe floor).
