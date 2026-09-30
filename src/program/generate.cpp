@@ -1668,6 +1668,10 @@ int main(int argc, char** argv) {
                      arena_src.load_gib_per_second());
         srcp = &arena_src;
     }
+    // The ring is transient (its slots are reused); disable the async MMQ prefill gather against it, which would
+    // read a slot the ring already reused - "gather_native: unspecified launch failure" (the docs section 15.5
+    // step 2 release is not wired yet).  A persistent source (arena/mmap) is unaffected.
+    strata::prefill::Prefill::set_source_transient(srcp != nullptr && srcp->transient());
     // Plan v0.3 P6: the MTP draft layer, loaded before the VRAM expert tier is sized from what is left.
     strata::core::MtpDrafter mtp;
     if (!o.mtp.empty()) {

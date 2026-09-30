@@ -57,6 +57,9 @@ public:
     /// ring (a big one only pays when the copy engine, not the host copies, is the limit); set before bytes_needed.
     static void set_pinned_share(double share);
     static double pinned_share();
+    /// Declare the active ExpertSource transient (the ring).  Disables the async MMQ prefill gather, which would
+    /// read a ring slot the source has already reused (a GPU hang) until the release is event-gated.
+    static void set_source_transient(bool transient);
 
     /// Device bytes `init` needs for a chunk of `chunk` tokens (what a borrowed region must hold).
     static uint64_t bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk);
