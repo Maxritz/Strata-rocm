@@ -159,9 +159,48 @@ RDNA3/4, never a correctness requirement.** What differs on the 6700 XT is *tuni
 ~640 on the 9070 XT) and no RDNA4-specific matrix path, so the kernel-shape and cache choices must be
 measured on it separately — but the same binaries' code paths run.
 
+## 6c. `qwen35moe` — exact tensor map vs the running engine (read from the GGUF)
+
+The concrete reuse, name by name. **Identical to `qwen4exp` (same kernels, same weights):**
+
+```
+GDN layer     attn_qkv.weight  attn_gate.weight  ssm_a  ssm_alpha.weight  ssm_beta.weight
+              ssm_conv1d.weight  ssm_dt.bias  ssm_norm.weight  ssm_out.weight
+MoE           ffn_gate_inp.weight  ffn_gate/up/down_exps.weight  ffn_gate_inp_shexp.weight
+              ffn_gate/up/down_shexp.weight
+full attn     attn_q/k/v.weight  attn_output.weight  attn_q_norm.weight  attn_k_norm.weight
+glue          token_embd.weight  output.weight  output_norm.weight
+```
+
+**Absent from qwen35moe** (so the engine's hyper-connection and QSA code is simply not entered):
+`hc_attn_*`, `hc_ffn_*` (hyper-connections ×4), `indexer.q_proj/k_proj/q_norm/k_norm` (the QSA selection).
+
+**Added by qwen35moe:** `attn_norm.weight` + `post_attention_norm.weight` — a **plain residual** (two norms,
+no hyper-connection streams).
+
+**So the port is:** reuse the GDN block and the MoE block verbatim (same names, same kernels, new dims —
+embd 2048, 40L, `full_attention_interval 4`, ssm state 128 / conv 4 / inner 4096 / group 16); **write one new
+kernel** — standard **GQA** (16 heads / 2 kv, key/value 256) with **partial RoPE** (64 dims, sections
+`[11,11,10,0]`, base 1e7); and skip the hyper-connection block. Everything else is the engine.
+
+## 6d. Whittle — DEFERRED (future work)
+
+Whittle-Qwen-3.8-35B-A3B is `qwen4exp` and its foundation is done (`PleFmt`/`q4_K_dequant_row` `7196897`;
+runtime `PleGeom` + `ple_consts_from_meta` `4967fb8`, both byte-identical on the working path). What remains
+is mechanical but not started: `PleTable::open` taking `head_dim`/format from the tensor, the loader calling
+`ple_consts_from_meta`, the caller-side `NG_N_EMBD`/`NG_HC_DIM`/`PLE_N_HEADS` → `ss.ple.consts.geom`, and a
+pack. **Deferred by request** in favour of the larger `qwen35moe` shelf; the commits stay valid.
+
 ## 7. Priority
 
-1. **Family A (`qwen4exp` geometry)** — smallest, unlocks real models, and de-risks the kernel plumbing the
-   other families need. **Do this next.**
-2. **Family C (`deepseek4`)** — already designed (§14); high value, large effort.
-3. **Family B (`qwen35moe`)** — the biggest shelf, but a full new decoder.
+Current order (set 2026-09-30):
+
+1. **`qwen35moe`** — the biggest shelf (Qwen3.5-35B-A3B, ornith-35b, Tiel, qwable, Unsloth, Qwen3.8-Distill),
+   17-25 GB, fits 32 GB RAM / 12 GB VRAM, and shares the GDN + MoE kernels and weight names with the running
+   engine (§6c). The only new code is a **plain GQA + partial-RoPE attention** and the geometry. **This is the
+   current work, in progress.**
+2. **`deepseek4`** (MLA + sparse attention) — designed (§14), ds4's `rocm/*.cuh` is the reference. Largest.
+3. **`laguna`, `muse-glimmer`, `k2-horizon`, `nemotron_h_moe`, …** — each its own decoder; after the above.
+4. **Whittle (`qwen4exp` 2048)** — foundation done, **deferred** (§6d); ~1 session to finish when wanted.
+5. **The verify-window bug** — bites the *native* path only; a **canonical pack avoids it** (deterministic
+   token path). Treat as a speed item for most models, a correctness item for `--native`.
