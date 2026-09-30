@@ -1492,7 +1492,7 @@ int main(int argc, char** argv) {
     // is a mapping of the ORIGINAL second GGUF shard, the six weights are already loaded in the arena, and the
     // three buffers are the only allocation.
     strata::kernels::PleTable ple_table;
-    std::vector<float> ple_emb_host((size_t) strata::kernels::NG_N_EMBD);
+    std::vector<float> ple_emb_host;
     float* ple_emb_dev = nullptr;
     float* ple_scratch = nullptr;
     if (!o.ple_gguf.empty()) {
@@ -1501,10 +1501,16 @@ int main(int argc, char** argv) {
         pio.max_inflight = (uint32_t) o.ple_inflight;
         pio.cache_rows = (uint64_t) o.ple_row_cache;
         pio.io_thread = !o.ple_sync_submit;
-        if (!ple_table.open(o.ple_gguf, err, pio)) {
+        // **THE PLE GEOMETRY IS THE MODEL'S, NOT THE 2560 ARTIFACT'S.**  `ple_consts_from_gguf` reads the
+        // model's `qwen4exp.ple.*` (n_heads, ngram_size, vocab/offsets/multipliers, conv, eos) and the table's
+        // shape (head_dim), so the Whittle 2048 / 8-head / Q4_K table is sized correctly; a model without the
+        // keys gets the compiled 2560 constants, byte-for-byte.
+        ss.ple.consts = strata::kernels::ple_consts_from_gguf(o.ple_gguf);
+        if (!ple_table.open(o.ple_gguf, err, pio, ss.ple.consts.geom)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
+        ple_emb_host.assign((size_t) ss.ple.consts.geom.n_embd, 0.0f);
         const strata::core::WeightRef* wk = wt.find("blk.1.ple_key.weight");
         const strata::core::WeightRef* wv = wt.find("blk.1.ple_value.weight");
         const strata::core::WeightRef* wnk = wt.find("blk.1.ple_norm_key.weight");
@@ -1539,14 +1545,13 @@ int main(int argc, char** argv) {
         ss.ple.w.norm_query = (const float*) wnq->data;
         ss.ple.w.norm_conv = (const float*) wnc->data;
         ss.ple.w.conv1d_f16 = (const uint16_t*) wc->data;
-        ss.ple.consts = strata::kernels::ple_artifact_consts();
         if (o.ple_delay_us > 0) ple_table.set_injected_delay_us(o.ple_delay_us);
         ss.ple.table = &ple_table;
         ss.ple.token = &ss.ple_token;
         ss.ple.prev = ss.ple_prev;
         ss.ple.hist = ss.ple_hist;
         ss.ple.emb_host = ple_emb_host.data();
-        if (hipMalloc((void**) &ple_emb_dev, (size_t) strata::kernels::NG_N_EMBD * 4) != hipSuccess ||
+        if (hipMalloc((void**) &ple_emb_dev, (size_t) ss.ple.consts.geom.n_embd * 4) != hipSuccess ||
             hipMalloc((void**) &ple_scratch, strata::core::ple_run_scratch_bytes()) != hipSuccess) {
             std::fprintf(stderr, "strata generate: the PLE buffers failed\n");
             return 1;
