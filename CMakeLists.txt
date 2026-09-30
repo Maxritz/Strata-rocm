@@ -435,11 +435,13 @@ if(STRATA_ENABLE_HIP)
   add_test(NAME cvec_parity COMMAND cvec_parity)
 
   # Plan v0.3 P3: native MMVQ for 1..8 tokens (bitwise selftest + --bench timing); synthetic data, no model.
-  if(STRATA_BUILD_TESTS)
+  if(STRATA_BUILD_TESTS AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/bench/micro/native_mmvq_multi.cpp)
   add_executable(native_mmvq_multi bench/micro/native_mmvq_multi.cpp)
   target_include_directories(native_mmvq_multi PRIVATE ${ROCM_INCLUDE})
   target_link_libraries(native_mmvq_multi PRIVATE strata_kernels ${ROCM_LIBRARY}/amdhip64.lib)
   add_test(NAME native_mmvq_multi COMMAND native_mmvq_multi --selftest)
+  else()
+  message(STATUS "strata: bench/micro/native_mmvq_multi.cpp absent - that micro-bench is NOT registered")
   endif()
 
   # Plan v0.3 P0.1: working-set lock of a host region (CPU only).
@@ -461,7 +463,7 @@ if(STRATA_ENABLE_HIP)
   # ---- P2.S5: the GraphRegistry --------------------------------------------------
   # A .cu because the test needs real kernels to capture; it links `strata_core` and not `strata_kernels`,
   # because what it exercises is the capture machinery and not any kernel in it.
-  if(STRATA_BUILD_TESTS)
+  if(STRATA_BUILD_TESTS AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/bench/micro/graph_registry_test.cu)
   add_executable(graph_registry_test bench/micro/graph_registry_test.cu)
   target_include_directories(graph_registry_test PRIVATE ${ROCM_INCLUDE})
   target_link_libraries(graph_registry_test PRIVATE strata_core ${ROCM_LIBRARY}/amdhip64.lib)
@@ -476,6 +478,8 @@ if(STRATA_ENABLE_HIP)
   target_include_directories(pinned_capture PRIVATE ${ROCM_INCLUDE})
   target_link_libraries(pinned_capture PRIVATE ${ROCM_LIBRARY}/amdhip64.lib)
   add_test(NAME pinned_capture COMMAND pinned_capture)
+  else()
+  message(STATUS "strata: bench/micro/graph_registry_test.cu absent - GraphRegistry + pinned_capture are NOT registered")
   endif()
 
   # Tells tests/CMakeLists.txt to add the CUDA-dependent Catch2 target.  It cannot be declared there
@@ -638,9 +642,11 @@ if(STRATA_NATIVE_EXPERTS)
   endif()
 endif()
 
-if(STRATA_ENABLE_HIP AND STRATA_BUILD_TESTS)
+if(STRATA_ENABLE_HIP AND STRATA_BUILD_TESTS AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/bench/micro/hit_cpu_order_parity.cu)
   add_executable(hit_cpu_order_parity bench/micro/hit_cpu_order_parity.cu)
   target_link_libraries(hit_cpu_order_parity PRIVATE strata_kernels strata_kernels_cpu ${ROCM_LIBRARY}/amdhip64.lib)
+elseif(STRATA_ENABLE_HIP AND STRATA_BUILD_TESTS)
+  message(STATUS "strata: bench/micro/hit_cpu_order_parity.cu absent - that parity test is NOT registered")
 endif()
 
 if(STRATA_BUILD_TESTS)
@@ -649,6 +655,20 @@ if(STRATA_BUILD_TESTS)
   # the 38 GB model; run it by hand or from tools/gpu_session.py)
   add_executable(dequant_bf16_test src/kernels/dequant_bf16_test.cpp)
   target_link_libraries(dequant_bf16_test PRIVATE strata_kernels strata_artifact ${ROCM_LIBRARY}/amdhip64.lib)
+
+  # FP4 reference dequant (MXFP4/NVFP4) vs ggml's own dequantize_row_mxfp4/dequantize_row_nvfp4, BITWISE.
+  # The project's rule is that a reference validated against a copy of itself proves nothing, and these
+  # two formats have no vec_dot kernel in any ggml backend - so this scalar path is the reference the
+  # future __dp4a path is measured against, which makes it load-bearing.  ggml-base exports both symbols.
+  # Host-only (no GPU, no model), so it is a plain ctest:  the 256-encoding scale sweeps and the
+  # nibble-permutation cases are the parts a random differential alone would let through.
+  if(STRATA_NATIVE_EXPERTS)
+    add_executable(dequant_fp4_test src/kernels/dequant_fp4_test.cpp)
+    target_link_libraries(dequant_fp4_test PRIVATE strata_artifact ggml-base)
+    add_test(NAME dequant_fp4_test COMMAND dequant_fp4_test)
+  else()
+    message(STATUS "strata: STRATA_NATIVE_EXPERTS off - the FP4 reference-dequant differential test is NOT registered")
+  endif()
 
   add_executable(expert_multi_test src/kernels/cpu/expert_multi_test.cpp)
   target_link_libraries(expert_multi_test PRIVATE strata_kernels_cpu)
@@ -672,6 +692,14 @@ endif()
 
 if(STRATA_BUILD_TESTS)
   enable_testing()
-  add_subdirectory(tests)
+  # Guarded like the default above: the per-file *_test executables above are all in-tree and build
+  # fine, but tests/ ships separately, and an unguarded add_subdirectory of a missing directory makes
+  # -DSTRATA_BUILD_TESTS=ON fail to CONFIGURE - which silently disables every other test in the project
+  # rather than just this one. An absent registration is visible; a failed configure is not.
+  if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.txt)
+    add_subdirectory(tests)
+  else()
+    message(STATUS "strata: tests/ absent - the tests/ subdirectory is NOT added (in-tree tests still register)")
+  endif()
 endif()
 

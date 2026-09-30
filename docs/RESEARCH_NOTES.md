@@ -68,7 +68,7 @@ reports contradicted them, so they are recorded here as the tiebreaker.
 #define QK_MXFP4 32
 typedef struct {
     uint8_t e;              // E8M0 scale
-    uint8_t qs[QK_MXFP4/2]; // 16 bytes, two E2M1 values per byte, low nibble first
+    uint8_t qs[QK_MXFP4/2]; // 16 bytes, two E2M1 values per byte
 } block_mxfp4;              // sizeof == 17
 
 #define QK_NVFP4 64
@@ -79,7 +79,52 @@ typedef struct {
 } block_nvfp4;              // sizeof == 36
 ```
 
-E2M1 codebook: `{0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12}`.
+E2M1 codebook (`ggml-common.h`, `int8_t kvalues_fp4[16]`):
+`{0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12}`.
+
+**The nibble order is a split half, not an interleave** — the single easiest
+thing to get wrong here, because "low nibble first" reads as if byte *j* holds
+elements `2j`/`2j+1`. It does not. From `dequantize_row_mxfp4` /
+`dequantize_row_nvfp4` in `ggml-quants.c`:
+
+```c
+// MXFP4: y[i*32 + j] = low nibble, y[i*32 + j + 16] = high nibble
+const int8_t x0 = kvalues_mxfp4[x[i].qs[j] & 0x0F];
+const int8_t x1 = kvalues_mxfp4[x[i].qs[j] >>   4];
+y[i*qk + j + 0   ] = x0*d;
+y[i*qk + j + qk/2] = x1*d;          // qk/2 == 16
+
+// NVFP4: per sub-block s, byte index s*8 + j
+//   yb[j] = low nibble, yb[j+8] = high nibble, where yb = y + i*64 + s*16
+const int8_t v0 = kvalues_mxfp4[x[i].qs[s*(qk_sub/2) + j] & 0x0F];
+const int8_t v1 = kvalues_mxfp4[x[i].qs[s*(qk_sub/2) + j] >>   4];
+yb[j + 0       ] = v0*d;
+yb[j + qk_sub/2] = v1*d;            // qk_sub/2 == 8
+```
+
+So MXFP4 is exactly the Q4_0/IQ4_NL split-half convention this codebase already
+implements, and NVFP4 is the same idea 16 elements at a time. An interleave
+reading is bit-plausible and numerically wrong, and it survives any spot check
+that only inspects element 0.
+
+**Both scale decoders halve their input**, because `kvalues_fp4 = 2 *
+E2M1_float`. From `ggml-impl.h`:
+
+```c
+static inline float ggml_e8m0_to_fp32_half(uint8_t x) {   // == 2^(x-128)
+    uint32_t bits = x < 2 ? (0x00200000u << x) : ((uint32_t)(x - 1) << 23);
+    float result; memcpy(&result, &bits, sizeof(float)); return result;
+}
+
+static inline float ggml_ue4m3_to_fp32(uint8_t x) {       // == 0.5 * ue4m3(x)
+    if (x == 0 || x == 0x7F) return 0.0f;                 // 0x7F is the NaN encoding, zeroed on purpose
+    int exp = (x >> 3) & 0xF, man = x & 0x7;
+    float raw = exp == 0 ? ldexpf((float) man, -9)
+                         : ldexpf(1.0f + (float) man / 8.0f, exp - 7);
+    return raw * 0.5f;
+}
+```
+
 
 Overhead:
 
@@ -528,9 +573,18 @@ Artifacts (scratch, outside the repository):
    source but not the mapping from GGUF metadata type IDs to MXFP4 and NVFP4 on
    our ROCm build. This is the single blocking unknown for the whole FP4 path
    and must be resolved by probing the GGUF reader, not by inference.
-2. **UE4M3 scale edge cases.** ggml's reference dequant must be probed for NaN,
-   infinity, and the 255 encoding. A scale of 255 is a plausible calibration bug
-   and would silently produce zero weights. Needs explicit tests, not trust.
+2. **The two FP4 scale decoders.** Both are non-obvious and both fail silently,
+   so they are transcribed from `ggml-impl.h` and pinned by a differential test
+   against ggml's own `dequantize_row_mxfp4`/`dequantize_row_nvfp4` rather than
+   trusted. `ggml_e8m0_to_fp32_half(x)` is `2^(x-128)` — *half* of E8M0, because
+   `kvalues = 2 * E2M1_float`; dropping the "half" is a uniform 2x error that
+   still produces plausible-looking output. `ggml_ue4m3_to_fp32(x)` also halves,
+   and maps **both `0x00` and `0x7F` to `0.0f`**: `0x7F` is the standard UE4M3
+   NaN encoding and ggml deliberately zeroes it, so a NaN scale silently
+   discards 16 weights instead of poisoning them. The sentinels are `0x7F`
+   (UE4M3) and `0xFF` (E8M0 → `2^127`); note `0xFF` through a UE4M3 decoder is a
+   perfectly valid `240.0`, not an error, so a "scale 255" check written against
+   the wrong format would pass while testing nothing.
 3. **Fused-GEMM global-scale mismatch.** Minima found this as a real bug in
    per-module-calibrated NVFP4 served through fused GEMMs. We fuse. A test must
    assert that scales from different modules are never combined in one
@@ -556,8 +610,10 @@ Artifacts (scratch, outside the repository):
 
 ## 10. Implementation order implied by this corpus
 
-1. Resolve the ROCmFPX type IDs and the UE4M3 edge cases, with tests, before
-   writing any kernel.
+1. Resolve the ROCmFPX type IDs before writing any kernel, and pin the two FP4
+   scale decoders with a differential test against ggml's own
+   `dequantize_row_mxfp4`/`dequantize_row_nvfp4` (§3) — including the split-half
+   nibble order, the halved scales, and `0x7F -> 0`.
 2. Write a reference MXFP4 and NVFP4 dequantizer matching section 3 exactly,
    with random **non-constant** scale tests and nibble-permutation tests.
 3. Build the `__dp4a` path: keep FP4 packed, expand via exact int8 LUT,

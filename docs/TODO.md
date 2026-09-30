@@ -96,8 +96,13 @@ The single list. Priorities: **P0** blocks a shipping milestone, **P1** a family
    (one per 16-elem sub-block) + 32 B packed E2M1. Both layouts, the E2M1 codebook, and a 45-paper survey
    of what does and does not apply to gfx1031 are in **`RESEARCH_NOTES.md`** — read §3 before writing the
    dequant and §4.1 for why activations stay INT8. Two adopted specifics: **keep the FP4 packed and expand
-   via an int8 LUT into `__dp4a`** (no offline FP4→int8 expansion), and the **UE4M3 scale edge cases
-   (NaN/255) need explicit tests** — a 255 scale is a plausible calibration bug that silently zeroes weights.
+   via an int8 LUT into `__dp4a`** (no offline FP4→int8 expansion), and **test the two scale decoders
+   against `ggml-impl.h` verbatim** — both are non-obvious and both fail silently. `ggml_e8m0_to_fp32_half`
+   is `2^(x-128)`, i.e. *half* of E8M0, because `kvalues = 2 * E2M1_float`; the "half" is the easy thing to
+   omit and it is a uniform 2x error. `ggml_ue4m3_to_fp32` also halves, and maps **both `0x00` and `0x7F`
+   to 0.0f** — `0x7F` is the standard UE4M3 NaN encoding and ggml deliberately zeroes it, so a NaN scale
+   silently kills 16 weights instead of poisoning them. Note the sentinels are `0x7F` (UE4M3) and `0xFF`
+   (E8M0 → 2^127); `0xFF` fed to a UE4M3 decoder is a *valid* 240.0, not an error.
 7. **`qwen35moe`** (Qwen3.5-35B-A3B, ornith-35b, Tiel-Coder-35B, qwable, Unsloth-Ornith-1.5). Measured:
    40L / d 2048 / **16 heads / 2 kv** (8:1 GQA) / key=val=256, **256 experts / 8 + shared 512**, GDN on 3 of
    every 4 layers (`full_attention_interval = 4`), **partial RoPE 64 of 256** with

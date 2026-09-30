@@ -278,6 +278,89 @@ inline void dequantize_iq4_xs(const uint8_t* block, float* out) {
         qs += 16;
     }
 }
+// ---- MXFP4 / NVFP4 (FP4 microscaling). These are the formats that gate the three largest models on
+// the shelf, and the ones with no vec_dot kernel anywhere, so the scalar path below is the reference
+// the __dp4a path will be measured against.
+//
+// Layouts, from ggml-common.h at 3cf03257 (structs assert their own sizes):
+//   block_mxfp4 { uint8 e;            uint8 qs[16]; }  = 32 elements, 17 bytes
+//   block_nvfp4 { uint8 d[4];         uint8 qs[32]; }  = 64 elements, 36 bytes
+// i.e. 0.53125 and 0.56250 bytes/element. NVFP4 carries FOUR scales, one per 16-element sub-block -
+// it is not "MXFP4 with a different scale", and 16 is a sub-block size, not a storage block.
+//
+// E2M1 codebook, copied verbatim from ggml-common.h `kvalues_fp4` at 3cf03257. Note the two zeroes:
+// index 7 (+12) and index 8 (-0) are the only unsigned/negative pair with no negative counterpart at
+// index 8 being -0, so a codebook transcribed with signs in a different order silently drops the
+// sign of every negative value.
+//     0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12
+static const int8_t kvalues_fp4[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+
+// ---- E8M0 scale -> fp32. Transcribed from ggml_e8m0_to_fp32_half (ggml-impl.h, 3cf03257).
+//
+// It is `ggml_e8m0_to_fp32(x)/2`, and the halving is not cosmetic: the codebook above is stored DOUBLED
+// (`kvalues = 2 * E2M1_float`, per ggml's own comment), so the scale must be halved to cancel. Omitting
+// the "half" yields a uniform 2x error that still looks like plausible weight magnitudes.
+//
+// == 2^(x-128) for every x in [0,255]; x=0 is 2^-128, not zero, and x=255 is 2^127, not NaN (the
+// upstream comment "NaNs are not handled here" is about the non-half variant's 0xFF).
+inline float e8m0_to_fp32_half(uint8_t x) {
+    // x < 2 uses the denormal patterns 0x00200000 (2^-128) and 0x00400000 (2^-127); x >= 2 puts the
+    // exponent (x-1) into the fp32 exponent field, since 2^(x-128) = 2^((x-1)-127).
+    const uint32_t bits = x < 2 ? (0x00200000u << x) : ((uint32_t)(x - 1) << 23);
+    float result;
+    __builtin_memcpy(&result, &bits, sizeof(float));
+    return result;
+}
+
+// ---- UE4M3 scale -> fp32. Transcribed from ggml_ue4m3_to_fp32 (ggml-impl.h, 3cf03257).
+//
+// Also halved, same reason as above. Two encodings return 0.0f: 0x00 (zero) and 0x7F. 0x7F is the
+// standard UE4M3 NaN encoding and ggml deliberately maps it to zero, so a corrupt scale discards its
+// 16 weights instead of poisoning them. This is worth a test of its own: a NaN scale must not be
+// allowed to reach the output, and "the decoder handles NaN" and "the decoder maps NaN to zero" are
+// different requirements.
+inline float ue4m3_to_fp32(uint8_t x) {
+    if (x == 0 || x == 0x7F) return 0.0f;
+    const int exp = (x >> 3) & 0xF;
+    const int man = x & 0x7;
+    // exp == 0 is the subnormal case (2^-9 * man); otherwise 2^(exp-7) * (1 + man/8).
+    const float raw = exp == 0 ? ldexpf((float)man, -9) : ldexpf(1.0f + (float)man / 8.0f, exp - 7);
+    return raw * 0.5f;
+}
+
+// ---- MXFP4: 32 elements from a 17-byte block. Transcribed from dequantize_row_mxfp4 (ggml-quants.c,
+// 3cf03257). The nibble order is a SPLIT HALF, not an interleave: byte j supplies element j from its
+// low nibble and element j+16 from its high nibble - the same convention as Q4_0 and IQ4_NL above.
+// An interleave reading is bit-plausible, numerically wrong, and survives any check that only looks at
+// element 0, so the permutation test in dequant_fp4_test.cpp is not optional.
+inline void dequantize_mxfp4(const uint8_t* block, float* out) {
+    const float d = e8m0_to_fp32_half(block[0]);
+    const uint8_t* qs = block + 1; // 16
+    for (int j = 0; j < 16; ++j) {
+        const uint8_t byte = qs[j];
+        out[j + 0]  = (float)kvalues_fp4[byte & 0x0F] * d;
+        out[j + 16] = (float)kvalues_fp4[byte >> 4] * d;
+    }
+}
+
+// ---- NVFP4: 64 elements from a 36-byte block. Transcribed from dequantize_row_nvfp4 (ggml-quants.c,
+// 3cf03257). Four 16-element sub-blocks, each with its own scale and its own 8 packed bytes; within a
+// sub-block the split half is 8 wide (element j from the low nibble, j+8 from the high), so the byte
+// index is s*8 + j.
+inline void dequantize_nvfp4(const uint8_t* block, float* out) {
+    const uint8_t* d4 = block;     // 4 UE4M3 scales
+    const uint8_t* qs = block + 4; // 32 packed bytes
+    for (int s = 0; s < 4; ++s) {
+        const float d = ue4m3_to_fp32(d4[s]);
+        float* yb = out + s * 16;
+        for (int j = 0; j < 8; ++j) {
+            const uint8_t byte = qs[s * 8 + j];
+            yb[j + 0] = (float)kvalues_fp4[byte & 0x0F] * d;
+            yb[j + 8] = (float)kvalues_fp4[byte >> 4] * d;
+        }
+    }
+}
+
 // ---- element types
 inline void dequantize_f32(const uint8_t* p, float* out, int n) {
     __builtin_memcpy(out, p, (size_t)n * 4);
