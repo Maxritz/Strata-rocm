@@ -337,10 +337,14 @@ def main() -> int:
         blob = per[0] + per[1] + per[2]
         layout.append((l, ts[0].type_id, ts[2].type_id, offset, blob, ts))
         offset += blob * N_EXPERT
+    # v4: record n_embd / n_ff in the header, so the engine sizes the expert blobs from the model and not from its
+    # compiled 2560/640 defaults (the Whittle 35B-A3B is 2048/512).  The gate_exps shape is [n_embd, n_ff, n_expert].
+    n_embd0 = int(layout[0][5][0].shape[0]) if layout else 0
+    n_ff0 = int(layout[0][5][0].shape[1]) if layout else 0
     with open(out / "native_experts.txt", "w", encoding="utf-8", newline="\n") as fo:
-        fo.write("# strata native experts v3: layer gu_type d_type offset blob_bytes gate_off up_off down_off [shard] "
-                 "(n_expert %d, total %d; absolute offsets in %s, or in the named shard beside it)\n"
-                 % (N_EXPERT, offset, src.name))
+        fo.write("# strata native experts v4: layer gu_type d_type offset blob_bytes gate_off up_off down_off [shard] "
+                 "(n_expert %d, n_embd %d, n_ff %d, total %d; absolute offsets in %s, or in the named shard beside it)\n"
+                 % (N_EXPERT, n_embd0, n_ff0, offset, src.name))
         for l, gt, dt, off, blob, ts in layout:
             ws = [model.where[t.name] for t in ts]
             if len({w[3] for w in ws}) != 1:

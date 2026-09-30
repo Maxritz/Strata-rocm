@@ -667,7 +667,9 @@ ConvStateSizes conv_state_sizes(const strata::core::ModelGeometry& g) {
     z.gdn = (size_t) g.n_gdn_layers() *
             ((size_t) g.ssm_state_size * (size_t) g.ssm_v_heads * (size_t) g.ssm_state_size +
              (size_t) g.ssm_conv_channels * (size_t) (g.ssm_d_conv - 1)) * sizeof(float);
-    z.ple = (size_t) strata::kernels::NG_HIST * (size_t) strata::kernels::NG_HC_DIM * sizeof(float);
+    // NG_HIST is (conv_kernel - 1) * ngram_size = 9 in every qwen4exp artifact (conv 4, trigram), so it stays
+    // a constant here where no PLE geometry is in scope.
+    z.ple = (size_t) ((strata::kernels::PLE_CONV_KERNEL - 1) * strata::kernels::NGRAM_SIZE) * sizeof(float);
     z.tail = (size_t) (strata::kernels::qsa_real_shapes().idx_block - 1) * (size_t) g.idx_key_dim * sizeof(float);
     return z;
 }
@@ -1275,7 +1277,15 @@ int main(int argc, char** argv) {
             return 2;
         }
         const strata::core::ModelGeometry g0;
-        if (!native_embed.load(o.native_preset, g0.n_embd, 248320, err)) {
+        // the embedding width comes from the model, not the compiled default (Whittle is 2048, not 2560)
+        int64_t embd0 = g0.n_embd;
+        try {
+            strata::GgufFile mf(o.native_preset);
+            if (const strata::MetaValue* v = mf.get("qwen4exp.embedding_length"); v != nullptr && v->is_num())
+                embd0 = (int64_t) v->u;
+        } catch (...) {
+        }
+        if (!native_embed.load(o.native_preset, embd0, 248320, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
@@ -1552,7 +1562,7 @@ int main(int argc, char** argv) {
         ss.ple.hist = ss.ple_hist;
         ss.ple.emb_host = ple_emb_host.data();
         if (hipMalloc((void**) &ple_emb_dev, (size_t) ss.ple.consts.geom.n_embd * 4) != hipSuccess ||
-            hipMalloc((void**) &ple_scratch, strata::core::ple_run_scratch_bytes()) != hipSuccess) {
+            hipMalloc((void**) &ple_scratch, strata::core::ple_run_scratch_bytes(ss.ple.consts.geom)) != hipSuccess) {
             std::fprintf(stderr, "strata generate: the PLE buffers failed\n");
             return 1;
         }

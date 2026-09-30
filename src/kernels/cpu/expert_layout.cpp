@@ -109,17 +109,28 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
     L.bytes.assign((size_t) n_layers, 0);
     L.max_blob = 0;
     std::string line;
+    // **THE MODEL'S EXPERT WIDTHS, NOT THE COMPILED 2560/640.**  A v4 header carries `n_embd`/`n_ff`; a v3 one
+    // does not, and the compiled defaults (H, FF) are then correct for the 2560 artifact.
+    int64_t n_embd = H, n_ff = FF;
+    const auto header_int = [&](const std::string& ln, const char* tag, int64_t dflt) -> int64_t {
+        const std::string t(tag);
+        const size_t p = ln.find(t);
+        if (p == std::string::npos) return dflt;
+        return (int64_t) std::strtoll(ln.c_str() + p + t.size(), nullptr, 10);
+    };
     while (std::getline(in, line)) {
         if (line.empty()) continue;
         if (line[0] == '#') {
-            // The header records the artifact's own expert count: "(n_expert <N>, total <T>; ...)".  The
-            // engine's 512 default is wrong for a 288-expert reap artifact, so the table is authoritative.
+            // The header records the artifact's own expert count: "(n_expert <N>, n_embd <E>, n_ff <F>, ...)".
+            // The engine's 512 default is wrong for a 288-expert reap artifact, so the table is authoritative.
             const std::string tag = "(n_expert ";
             const size_t p = line.find(tag);
             if (p != std::string::npos) {
                 const int64_t ne = (int64_t) std::strtoll(line.c_str() + p + tag.size(), nullptr, 10);
                 if (ne > 0) { n_expert = ne; L.n_expert = ne; }
             }
+            n_embd = header_int(line, "n_embd ", n_embd);
+            n_ff = header_int(line, "n_ff ", n_ff);
             continue;
         }
         std::istringstream ss(line);
@@ -130,7 +141,7 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
             return false;
         }
         NativeFmt f;
-        if (!native_fmt((int) gt, (int) dt, H, FF, f, err)) return false;
+        if (!native_fmt((int) gt, (int) dt, n_embd, n_ff, f, err)) return false;
         if (f.bytes != blob) {
             err = "native_experts.txt: layer " + std::to_string(l) + " blob is " + std::to_string(blob) +
                   " B but its formats make " + std::to_string(f.bytes);
@@ -152,6 +163,13 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
         L.bytes[(size_t) l] = blob;
         if (blob > L.max_blob) L.max_blob = blob;
     }
+    // **THE TABLE'S OWN LAYER COUNT.**  `expert_layout_load` is called before the model geometry is read, so it
+    // is handed the engine default (48).  A pack with fewer layers (Whittle has 40) must set its own - the last
+    // layer seen in the table is authoritative, and a table with MORE layers than expected is still refused.
+    int64_t max_layer = -1;
+    for (int64_t l = 0; l < n_layers; ++l)
+        if (L.offset[(size_t) l] != ~0ull) max_layer = l;
+    if (max_layer >= 0 && max_layer + 1 < n_layers) { n_layers = max_layer + 1; L.n_layers = n_layers; }
     uint64_t at = 0;
     for (int64_t l = 0; l < n_layers; ++l) {
         if (L.offset[(size_t) l] != at) {
