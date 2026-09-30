@@ -1,6 +1,6 @@
 # Strata Engine - top-level build (P1.S1).
 #
-# Targets (phase-1 A�§P1.S1): `strata_artifact` (no CUDA dependency), `tests`.  `strata_plan` and the C++
+# Targets (phase-1 A�§P1.S1): `strata_artifact` (no CUDA dependency), `tests`.  `strata_plan` and the C++
 # `strata-pack` are added when their sources exist - a target with no sources would make the build graph
 # claim something the tree does not have, which is worse than an absent target.
 #
@@ -703,6 +703,13 @@ if(STRATA_BUILD_TESTS)
   add_executable(pool_stress src/kernels/cpu/pool_stress.cpp)
   target_link_libraries(pool_stress PRIVATE strata_kernels_cpu)
   add_test(NAME pool_stress COMMAND pool_stress 20)
+
+  # contract E7 / TODO P3 #29: per-layer admission must give each layer its OWN slot range (the startup
+  # verify_slot read-back compared two experts because open_sized zeroed the per-layer counters).
+  add_executable(expert_cache_per_layer_test src/core/expert_cache_per_layer_test.cpp)
+  target_link_libraries(expert_cache_per_layer_test PRIVATE strata_engine ${ROCM_LIBRARY}/amdhip64.lib)
+  target_include_directories(expert_cache_per_layer_test PRIVATE ${ROCM_INCLUDE})
+  add_test(NAME expert_cache_per_layer_test COMMAND expert_cache_per_layer_test)
 endif()
 
 if(STRATA_BUILD_TESTS)

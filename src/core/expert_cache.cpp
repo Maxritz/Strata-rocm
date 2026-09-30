@@ -154,7 +154,17 @@ bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_l
     slots_ = (int64_t) slot_bytes.size();
     blob_ = mx;
     off_ = std::move(off);
+    // **THE RANGES MOVE WHEN slots_ CHANGES.**  `open` sized `layer_next_` against the byte-slot count it was
+    // handed; `open_sized` then sets the REAL slot count, so each layer's start must be recomputed here.  The
+    // old line zeroed them, which made EVERY layer admit into slot 0 (their ranges overlap), so the first
+    // profile read-back compared slot 0 holding layer 1's expert against layer 0's blob -
+    // "ExpertCache::verify_slot: slot 0 differs from the arena at byte 0" (TODO P3 #29 / contract E7).
     layer_next_.assign((size_t) (n_layers > 0 ? n_layers : 0), 0);
+    for (int64_t l = 0; l < n_layers; ++l) {
+        int64_t lo = 0, hi = 0;
+        layer_slot_range(l, lo, hi);
+        layer_next_[(size_t) l] = (int32_t) lo;
+    }
     return true;
 }
 

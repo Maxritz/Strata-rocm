@@ -114,6 +114,12 @@ Each is DONE only when it passes G-COH and reports decode/prefill on gfx1201.
 | E6 | **KV `q8_0`/`q4_0`** | free VRAM → larger resident hot set; measured decode gain, G-COH green | `§12.2 #2` |
 | E7 | `--expert-cache-per-layer` `verify_slot` abort | per-layer residency works | `TODO §4` |
 
+- **E7 root cause FIXED (2026-10-01):** `ExpertCache::open_sized` zeroed `layer_next_` right after `open` had set
+  each layer's start to its own range, so every layer admitted into slot 0 (ranges overlapped) and the startup
+  read-back compared two experts -> `verify_slot: slot 0 differs from the arena at byte 0`.  Fixed in
+  `expert_cache.cpp` and unit-tested: `expert_cache_per_layer_test` -> **PASS** (layer 0 -> slots [0,4) -> <0,1>,
+  layer 1 -> [4,8) -> <4,5>).  An end-to-end gfx1201 run is still to be recorded.
+
 ---
 
 ## 6. The one-line contract
