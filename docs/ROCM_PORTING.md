@@ -665,6 +665,63 @@ for the format (it does for Q2_0).
 `<|endoftext|>` (248044) — it runs to `--max-new` and degenerates into `<|im_start|>` repetition after a
 correct answer. The answer itself is coherent.
 
+## 14. DeepSeek-V4 (`deepseek4`) support — staged plan
+
+Scope read from the real metadata of `DeepSeek-V4-Flash-0731-K160-IQ2XXS-…-imatrix.gguf`:
+
+```
+arch deepseek4, block_count 43, embedding_length 4096, vocab 129280, ctx 1M
+attention  MLA: head_count 64, head_count_kv 1, key_length 512, value_length 512,
+           q_lora_rank 1024, output_lora_rank 1024, output_group_count 8,
+           rope.dimension_count 64, rope.freq_base 10000, yarn factor 16 (orig 65536)
+sparse     compress_ratios [0,0,4,128,4,128,...] (44 entries), indexer.head_count 64,
+           indexer.key_length 128, indexer.top_k 512, sliding_window 128
+engram     hash_layer_count 3
+MoE        expert_count 256, expert_used_count 6, expert_shared_count 1,
+           expert_feed_forward_length 2048, expert_gating_func 4 (sigmoid),
+           expert_weights_norm true, expert_weights_scale 1.5
+extra      hyper_connection.count 4 (≈ qwen4exp's hyper-connections), nextn_predict_layers 1 (MTP),
+           swiglu_clamp_exp [10.0 * 43]
+```
+
+**Reused from qwen4exp:** the hyper-connection block (count 4), the generic MoE plumbing (routing →
+grouped expert matmul → combine), the sampler, the batching/prefill engine. **New:** everything in the
+attention tower.
+
+Stages, each independently testable (parity against a reference before the next):
+
+1. **Architecture selector + metadata schema.** Introduce an `Arch` enum (`qwen4exp`, `deepseek4`,
+   `qwen35moe`) and route `ModelGeometry` population + tensor naming through it, replacing the single
+   `check_architecture` gate. Deliverable: `deepseek4` models are *recognised* and their geometry is
+   read into a `Ds4Geometry`; the engine still refuses to run until stage 4.
+2. **Pack tooling for the DS4 tensors.** `tools/strata_pack.py` (or a `ds4_pack.py`) must map the MLA
+   tensors (`q_a_proj`, `q_b_proj`, `kv_a_proj_with_mqa`, `kv_b_proj`, `o_proj` with 8 output groups),
+   Engram hash tables, the 256-expert/6-used/1-shared MoE, and the MTP head into the pack layout, with a
+   `canonical_xcheck.py`-style byte xcheck per tensor class.
+3. **Layer graph.** A `Ds4Layer` that wires: RMSNorm → MLA proj (with the q/kv LoRA ranks) → sparse
+   attention selection (compress_ratios 4/128 + sliding_window 128 + indexer top_k 512) → MLA output
+   (8 groups, output_lora_rank 1024) → hyper-connection residual → sigmoid-gated MoE (256/6/1, ff 2048,
+   weights_norm, scale 1.5, swiglu_clamp_exp 10) → Engram hash layers (first 3). Correctness first,
+   speed second.
+4. **MLA attention kernel.** Start with a *naive, correct* MLA (materialise the absorbed `q` and the
+   latent KV, standard softmax) — no absorption, no flash. Verify per-layer logits against a reference.
+   Then add: RoPE (partial, 64 dims, yarn), the compressed-KV cache for compress_ratio 128 layers, and
+   the DSA indexer gate. This is the largest stage.
+5. **Sparse / compressed attention.** Implement the compress-4 and compress-128 paths + the sliding
+   window (128) + the indexer's top_k 512 selection. This is what makes 1M context tractable; get it
+   correct before optimizing.
+6. **Engram hash layers** (first 3 layers): the deterministic hash lookup (analogous to qwen4exp's PLE
+   n-gram table) — host RAM / mmap, prefetched.
+7. **MTP head** (`nextn_predict_layers 1`) for speculative decode — reuse the existing `--mtp` path.
+8. **GPU tuning on gfx1201** — MMA shape selection, LDS budget (64 KB/block), the PCIe-4.0 budget, the
+   hyper-connection FP8 state, eviction/residency — only after 1-6 pass parity.
+
+**Effort:** stages 1-3 ≈ one session each; stage 4-5 are the project (MLA + sparse attention is a
+kernel-suite); 6-8 follow. Each stage has a hard gate (byte/logit parity vs a reference before
+proceeding). `qwen35moe` (§13 line item) is the smaller sibling — same GDN + gated-attention lineage as
+qwen4exp — and is the recommended warm-up before the DeepSeek attention tower.
+
+
 
 
 
