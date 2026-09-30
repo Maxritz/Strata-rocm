@@ -783,30 +783,44 @@ bool load_control_vectors(const Options& o, const strata::core::ModelGeometry& g
 double probe_pcie_h2d_gbps() {
     constexpr size_t kBytes = 256ull << 20;
     constexpr int kIters = 4;
-    void* h = nullptr;
-    void* d = nullptr;
-    hipEvent_t ev0, ev1;
-    if (hipHostMalloc(&h, kBytes) != hipSuccess) return -1.0;
-    if (hipMalloc(&d, kBytes) != hipSuccess || hipEventCreate(&ev0) != hipSuccess ||
-        hipEventCreate(&ev1) != hipSuccess) {
-        if (d != nullptr) hipFree(d);
-        hipHostFree(h);
-        return -1.0;
-    }
-    std::memset(h, 0, kBytes);   // fault the pages in before timing
-    hipMemcpyAsync(d, h, kBytes, hipMemcpyHostToDevice, nullptr);   // warmup: context up, copy engine primed
-    hipEventRecord(ev0, nullptr);
-    for (int i = 0; i < kIters; ++i) hipMemcpyAsync(d, h, kBytes, hipMemcpyHostToDevice, nullptr);
-    hipEventRecord(ev1, nullptr);
-    const bool ok = hipEventSynchronize(ev1) == hipSuccess;
-    float ms = 0.f;
-    const bool timed = ok && hipEventElapsedTime(&ms, ev0, ev1) == hipSuccess && ms > 0.01f;
-    const double bw = timed ? ((double) kIters * (double) kBytes / (ms * 1e-3)) / 1e9 : -1.0;
-    hipEventDestroy(ev0);
-    hipEventDestroy(ev1);
-    hipFree(d);
-    hipHostFree(h);
-    return bw;
+    // time `kIters` host->device copies from `h` (already faulted in).  Returns GB/s, or -1.
+    auto measure = [&](void* h) -> double {
+        void* d = nullptr;
+        hipEvent_t ev0 = nullptr, ev1 = nullptr;
+        if (hipMalloc(&d, kBytes) != hipSuccess || hipEventCreate(&ev0) != hipSuccess ||
+            hipEventCreate(&ev1) != hipSuccess) {
+            if (d) hipFree(d);
+            if (ev0) hipEventDestroy(ev0);
+            if (ev1) hipEventDestroy(ev1);
+            return -1.0;
+        }
+        std::memset(h, 0, kBytes);   // fault the pages in before timing
+        hipMemcpyAsync(d, h, kBytes, hipMemcpyHostToDevice, nullptr);   // warmup: context up, copy engine primed
+        hipEventRecord(ev0, nullptr);
+        for (int i = 0; i < kIters; ++i) hipMemcpyAsync(d, h, kBytes, hipMemcpyHostToDevice, nullptr);
+        hipEventRecord(ev1, nullptr);
+        const bool ok = hipEventSynchronize(ev1) == hipSuccess;
+        float ms = 0.f;
+        const bool timed = ok && hipEventElapsedTime(&ms, ev0, ev1) == hipSuccess && ms > 0.01f;
+        const double bw = timed ? ((double) kIters * (double) kBytes / (ms * 1e-3)) / 1e9 : -1.0;
+        hipEventDestroy(ev0);
+        hipEventDestroy(ev1);
+        hipFree(d);
+        return bw;
+    };
+    constexpr double kMaxPlausible = 100.0;   // PCIe 5.0 x16 tops out ~64 GB/s; more means the copy was elided
+    // 1) pinned host memory: the engine's staged path (copy engine / DMA).
+    void* hp = nullptr;
+    if (hipHostMalloc(&hp, kBytes) != hipSuccess) return -1.0;
+    double bw = measure(hp);
+    hipHostFree(hp);
+    if (bw > 0.0 && bw <= kMaxPlausible) return bw;
+    // 2) On ROCm with a large BAR the driver ELIDES a pinned host->device copy (measured ~22 TB/s on gfx1201).
+    //    A pageable buffer has to go through the driver's staging path, so it cannot be elided - use it to get
+    //    the real link rate when the pinned probe was meaningless.
+    std::vector<char> pageable(kBytes);
+    bw = measure(pageable.data());
+    return (bw > 0.0 && bw <= kMaxPlausible) ? bw : -1.0;
 }
 
 }  // namespace
