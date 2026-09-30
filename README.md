@@ -54,9 +54,21 @@ fixed pool of experts in RAM and evicts the least recently used instead of pinni
 coherent and byte-identical to the pinned mode; the ring is the newer path, so it is a little slower for now
 (closing that gap is ongoing).
 
-**Models that run:** the three `qwen4exp` GGUFs — reap-288 (`10 × 288`), the 512-expert original, and Swift 1.5
-IQ2_XS. `strata --model-info <file.gguf>` says whether a given file runs. **Setup, flags and examples:
-[docs/USAGE.md](docs/USAGE.md)**; port log and measurements: [docs/ROCM_PORTING.md](docs/ROCM_PORTING.md).
+**Models that run on AMD** (the compiled `qwen4exp` path — 2560 embd / 4 hyper-connections / n_ff 640 /
+ssm 128 / top-10):
+
+| Model file | Experts | Status |
+| --- | ---: | --- |
+| `qwen3.8-flash-next-reap-288-Q4_K_M.gguf` | 10 × 288 | **runs** |
+| `Qwen3.8-Flash-Next-ngram-embeddings-Q4_0.gguf` | 10 × 512 | **runs** |
+| `Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-*.gguf` | 10 × 512 | **runs** |
+| `DeepSeek-V4-Flash-…` | 6 × 256 | recognised, plan in [`docs/ROCM_PORTING.md`](docs/ROCM_PORTING.md) §14 |
+| `Whittle-Qwen-3.8-35B-A3B-…` | 8 × 180 | `qwen4exp`, geometry needs generalising |
+| Qwen3.5-35B-A3B, Tiel-Coder-35B, ornith-35B, … (`qwen35moe`) | 8 × … | new architecture — see [`docs/MODEL_SUPPORT.md`](docs/MODEL_SUPPORT.md) |
+
+`strata --model-info <file.gguf>` reports a file's architecture, geometry and whether this build runs it.
+**Setup, flags and examples: [docs/USAGE.md](docs/USAGE.md)**; port log and measurements:
+[docs/ROCM_PORTING.md](docs/ROCM_PORTING.md).
 
 ## Which model should I pick?
 
