@@ -30,15 +30,23 @@ __global__ void iu4_gemm_lds_kernel(const uint8_t* __restrict__ A, const uint8_t
 
     i32x8 c = {0, 0, 0, 0, 0, 0, 0, 0};
     for (int k0 = 0; k0 < K; k0 += BK) {
-        for (int idx = tid; idx < BM * BK; idx += THREADS) {
-            const int r = idx / BK, kk = idx - r * BK, k = k0 + kk;
-            const uint8_t b = A[(long long) (m0 + r) * (K / 2) + (k >> 1)];
-            As[r][kk] = (int8_t) ((k & 1) ? (b >> 4) : (b & 0xF));
+        // 128-bit staging: a row's BK int4 = BK/2 bytes = one uint4, unpacked into LDS.  (Byte-wise loads were
+        // the bottleneck - the disassembly showed global_load_d16_u8.)
+        if (tid < BM) {
+            const uint4 v = *reinterpret_cast<const uint4*>(A + (long long) (m0 + tid) * (K / 2) + (k0 >> 1));
+            const uint8_t* vb = reinterpret_cast<const uint8_t*>(&v);
+#pragma unroll
+            for (int j = 0; j < BK; ++j) As[tid][j] = (int8_t) ((j & 1) ? (vb[j >> 1] >> 4) : (vb[j >> 1] & 0xF));
         }
-        for (int idx = tid; idx < BK * BN; idx += THREADS) {
-            const int kk = idx / BN, cc = idx - kk * BN, k = k0 + kk;
-            const uint8_t b = B[(long long) k * (N / 2) + ((n0 + cc) >> 1)];
-            Bs[kk][cc] = (int8_t) (((n0 + cc) & 1) ? (b >> 4) : (b & 0xF));
+        // B tile: BK rows x BN codes = BK * (BN/2) bytes; each row's BN/2 bytes via 2 uint4 per (BN=64) row.
+        for (int idx = tid; idx < BK * (BN / 16); idx += THREADS) {
+            const int r = idx / (BN / 16), seg = idx % (BN / 16);   // seg: 16 codes = 8 bytes... use uint4 = 16 codes
+            const int k = k0 + r;
+            const int cc = seg * 16;
+            const uint4 v = *reinterpret_cast<const uint4*>(B + (long long) k * (N / 2) + ((n0 + cc) >> 1));
+            const uint8_t* vb = reinterpret_cast<const uint8_t*>(&v);
+#pragma unroll
+            for (int j = 0; j < 16; ++j) Bs[r][cc + j] = (int8_t) ((j & 1) ? (vb[j >> 1] >> 4) : (vb[j >> 1] & 0xF));
         }
         __syncthreads();
         for (int kk = 0; kk < BK; kk += 16) {
