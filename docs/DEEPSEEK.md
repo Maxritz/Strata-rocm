@@ -105,3 +105,22 @@ SILU, weights_norm, scale, gating_func)` — the router carries the **`exp_probs
 **GGUF → pack:** already handled by `tools/iq_pack.py` (arch-generic since this session): `blk.1..46.*_exps`,
 64 experts, `n_embd 2048`, `n_ff 1536`; layer 0 is dense.  `attn_k_b`/`attn_v_b` are 3-D and served natively.
 
+---
+
+## 6. The gate for step S4 (the MLA projections) — the weight format
+
+`mla_layer` composes projections from `s_gemv`/`s_gemv_q8k`, but those take the **canonical SForm**
+(`s_gemv.hpp`: `code_bits` ∈ {2,4,8}, `Codebook` ∈ {Affine, Iq4Nl}, `has_offset`, `act_kind`).  GLM's MLA
+projections are **Q6_K** (6-bit — no SForm), **IQ4_XS** (S4 + Iq4Nl, representable), **Q5_K** (S8 + offset) and
+**Q8_0** (S8).  So one of:
+
+- **(a) canonicalize** the K-quant projections at pack time (Q6_K → the S-form the pack already emits for the
+  experts; `tools/pack_index.py` already writes an `act_kind` column, so the machinery exists), or
+- **(b) add a GPU GEMV** for the raw ggml K-quant blocks (Q6_K 210-byte blocks) — a new kernel.
+
+Until one lands, a GLM projection on the GPU is blocked, and this host (no AVX-512) would run it on the CPU via
+ggml — which the contract's G-GPU forbids.  **This is the first real task of the S4 session**, and it is why S4 is
+a kernel-suite session and not just wiring: the same gate applies to every K-quant projection in every new family
+(M1 qwen35moe Q4_K, M3 k2-horizon Q4_K, laguna IQ4_XS).
+
+
