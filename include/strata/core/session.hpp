@@ -93,6 +93,14 @@ struct SessionState {
     int32_t* ds2_ids_host = nullptr;     ///< (k,) pinned
     float* ds2_w_host = nullptr;         ///< (k,) pinned
     float* ds2_parts_host = nullptr;     ///< (k, n_embd) pinned: the pool's answer
+    /// The DEVICE aliases of the four mapped-pinned regions above (`hipHostGetDevicePointer`), so the handoff
+    /// uses `doorbell_publish`/`copy_from_mapped` KERNELS on the compute queue instead of copy-engine memcpys -
+    /// WDDM submits a copy node separately and the doorbell note records ~67 flushes/token from that alone.
+    float* ds2_x_host_d = nullptr;
+    int32_t* ds2_ids_host_d = nullptr;
+    float* ds2_w_host_d = nullptr;
+    float* ds2_parts_host_d = nullptr;
+    uint32_t* ds2_seq = nullptr;         ///< 4 B device scratch `doorbell_publish` increments (unused by the sync path)
     float ds2_norm_eps = 1e-5f;          ///< `deepseek2.attention.layer_norm_rms_epsilon`
     float ds2_rope_base = 1000000.0f;    ///< `deepseek2.rope.freq_base`
     float ds2_expert_scale = 1.0f;       ///< `deepseek2.expert_weights_scale`

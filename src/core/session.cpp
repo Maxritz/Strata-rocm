@@ -120,6 +120,12 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
             hipHostAlloc((void**) &s.ds2_parts_host, (size_t) k * (uint64_t) g.n_embd * 4,
                          hipHostMallocMapped | hipHostMallocPortable) != hipSuccess)
             return 0;
+        if (hipHostGetDevicePointer((void**) &s.ds2_x_host_d, s.ds2_x_host, 0) != hipSuccess ||
+            hipHostGetDevicePointer((void**) &s.ds2_ids_host_d, s.ds2_ids_host, 0) != hipSuccess ||
+            hipHostGetDevicePointer((void**) &s.ds2_w_host_d, s.ds2_w_host, 0) != hipSuccess ||
+            hipHostGetDevicePointer((void**) &s.ds2_parts_host_d, s.ds2_parts_host, 0) != hipSuccess)
+            return 0;
+        s.ds2_seq = (uint32_t*) take(16);
         return used;
     }
 
@@ -857,7 +863,7 @@ bool ds2_token(const WeightTable& tables, const ModelGeometry& g, int64_t pos, S
                void* user, void* stream, std::string& err) {
     using namespace strata::kernels;
     if (g.mla == 0 || s.ds2_x == nullptr || s.ds2_xn == nullptr || s.ds2_attn == nullptr || s.ds2_ffn == nullptr ||
-        s.mla_states == nullptr || s.ds2_parts == nullptr) {
+        s.mla_states == nullptr || s.ds2_parts == nullptr || s.ds2_x_host_d == nullptr || s.ds2_seq == nullptr) {
         err = "ds2_token: the session was not initialised for a deepseek2 model";
         return false;
     }
@@ -925,12 +931,15 @@ bool ds2_token(const WeightTable& tables, const ModelGeometry& g, int64_t pos, S
                 // The router's selection is produced on the device; the CPU pool needs it on the host.  This is
                 // the SYNCHRONOUS (token-at-a-time) handoff: no doorbell, no overlap, because a deepseek2 decode
                 // is the uncaptured path until a batched prefill exists.
+                // The handoff is a COMPUTE-QUEUE kernel, not three D2H memcpys: a WDDM copy node is submitted
+                // separately and the doorbell note measures ~67 flushes/token from that alone.  `doorbell_publish`
+                // copies x/ids/weights into the mapped host regions (device aliases) and fences; the sync then
+                // makes them visible to this host thread.
                 const auto ts0 = std::chrono::steady_clock::now();
-                if (hipMemcpyAsync(s.ds2_x_host, xn, (size_t) g.n_embd * 4, hipMemcpyDeviceToHost, cs) != hipSuccess ||
-                    hipMemcpyAsync(s.ds2_ids_host, s.moe.ids, (size_t) k * 4, hipMemcpyDeviceToHost, cs) != hipSuccess ||
-                    hipMemcpyAsync(s.ds2_w_host, s.moe.weights, (size_t) k * 4, hipMemcpyDeviceToHost, cs) != hipSuccess ||
-                    hipStreamSynchronize(cs) != hipSuccess) {
-                    err = "ds2_token: the router staging copy failed";
+                strata::kernels::doorbell_publish(xn, s.moe.ids, s.moe.weights, g.n_embd, k, s.ds2_x_host_d,
+                                                  s.ds2_ids_host_d, s.ds2_w_host_d, s.ds2_seq, cs);
+                if (hipStreamSynchronize(cs) != hipSuccess) {
+                    err = "ds2_token: the router staging failed";
                     return false;
                 }
                 const auto tp0 = std::chrono::steady_clock::now();
@@ -938,11 +947,7 @@ bool ds2_token(const WeightTable& tables, const ModelGeometry& g, int64_t pos, S
                 const auto tp1 = std::chrono::steady_clock::now();
                 l_sync = std::chrono::duration<double, std::milli>(tp0 - ts0).count();
                 l_pool = std::chrono::duration<double, std::milli>(tp1 - tp0).count();
-                if (hipMemcpyAsync(s.ds2_parts, s.ds2_parts_host, (size_t) k * g.n_embd * 4, hipMemcpyHostToDevice,
-                                   cs) != hipSuccess) {
-                    err = "ds2_token: the expert-output upload failed";
-                    return false;
-                }
+                strata::kernels::copy_from_mapped(s.ds2_parts, s.ds2_parts_host_d, k * g.n_embd, cs);
             } else {
                 if (hipMemsetAsync(s.ds2_parts, 0, (size_t) k * g.n_embd * 4, cs) != hipSuccess) {
                     err = "ds2_token: zeroing the expert outputs failed";
