@@ -142,6 +142,23 @@ MLA + compressed sparse attention is the largest single piece. Full staged plan:
 
 ---
 
+## 6b. RDNA2 (RX 6700 XT, gfx1031) — no WMMA, and the code already knows it
+
+The 6700 XT is a **first-class target**, not a fallback tier. There is **no WMMA intrinsic anywhere in the
+engine** — every quantized matmul runs through `__dp4a`, and `include/strata/hip_compat.h` maps it per ISA:
+
+```
+RDNA3 / RDNA4 (gfx11xx, gfx120x) : __builtin_amdgcn_sudot4
+CDNA / RDNA2  (gfx9xx, gfx103x)  : __builtin_amdgcn_sdot4
+older                            : scalar fallback
+```
+
+So RDNA2 gets `V_DOT4_I32_I8` natively; `gfx1031` is in the default `CMAKE_HIP_ARCHITECTURES` and its build
+passes 125/125 parity. **WMMA/MFMA injection (`native_qsa_score.cu` has the note) is a speed-up for
+RDNA3/4, never a correctness requirement.** What differs on the 6700 XT is *tuning*: ~384 GB/s bandwidth (vs
+~640 on the 9070 XT) and no RDNA4-specific matrix path, so the kernel-shape and cache choices must be
+measured on it separately — but the same binaries' code paths run.
+
 ## 7. Priority
 
 1. **Family A (`qwen4exp` geometry)** — smallest, unlocks real models, and de-risks the kernel plumbing the
