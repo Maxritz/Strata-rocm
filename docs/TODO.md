@@ -9,7 +9,22 @@ The single list. Priorities: **P0** blocks a shipping milestone, **P1** a family
 
 0. **The CPU expert library SIGILLs on any CPU without AVX-512** (found 2026-09-30). This host is a
    Ryzen 9 5900XT (Zen 3, **no AVX-512**), and `strata_kernels_cpu` is compiled with **unconditional**
-   `-mavx512f -mavx512bw -mavx512vl -mavx512dq -mavx512vnni -mavx512vbmi` for the whole target. Clang
+   `-mavx512f -mavx512bw -mavx512vl -mavx512dq -mavx512vnni -mavx512vbmi` for the whole target.
+
+## P1 — MXFP4 / NVFP4 on gfx1201 (host capability, probed 2026-09-30)
+
+Decision basis for the FP4 matmul kernel, from `hipcc --offload-arch` probes + `amd_hip_mx_common.h`:
+
+- No FP4 tensor core on gfx1201; **FP4 convert/decode is a software path** (`HIP_ENABLE_GFX950_OCP_BUILTINS==0`
+  here, `HIP_ENABLE_HOST_OCP_CONVERSIONS==1`; native FP4 convert/pack builtins are gated to gfx950/gfx1250).
+- **The matmul dot is UDOT4**: `__builtin_amdgcn_udot4` compiles for gfx1201 (unsigned INT8 dot-4).
+  That is the primitive the FP4 kernel uses — MX/NVFP4 4-bit codes are expanded to signed INT8 codes
+  (from the `kvalues_fp4` codebook) and summed with the activations' INT8 codes via UDOT4, then rescaled.
+- **WMMA is present**: `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12` (and the bf16 variant) compile
+  for gfx1201 requiring `wmma-128b-insts`; they are rejected on gfx1031. The project currently uses none.
+- Inline-asm probes are unreliable for capability (clang keeps inline asm verbatim without ISA feature
+  validation); only the `__builtin_*` feature-rejection path was trusted.
+ Clang
    therefore emits EVEX/AVX-512 into *every* function of that translation unit, including
    `act_quant_q8_1` (`expert.cpp:396-412`, `_mm512_set1_ps` / `_mm512_cvtepi32_epi8`), which is **not**
    on the VNNI path the runtime guard protects.

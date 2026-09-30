@@ -86,10 +86,10 @@ for the gfx1201 host we actually run on.
 
 | Fact | gfx1031 (analysis tier) | gfx1201 (this host) |
 |---|---|---|
-| FP4 / INT4 matmul hardware | none; no FP4 tensor core, no WMMA-INT | **UNVERIFIED** — see below |
-| WMMA | absent | present in hardware; **the project uses no WMMA at all** |
-| 2:4 structured sparsity | no benefit | **UNVERIFIED** |
-| Native MXFP4/NVFP4 unpack | none, software only | **UNVERIFIED** |
+| FP4 / INT4 matmul hardware | none; no FP4 tensor core, no WMMA-INT | no FP4 tensor core; the matmul dot is **UDOT4** (`v_dot4_i32_i8`, unsigned INT8), confirmed by compiling `__builtin_amdgcn_udot4` for gfx1201 |
+| WMMA | absent | **present** — `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12` and `…_bf16_w32_gfx12` compile and require `wmma-128b-insts` (absent on gfx1031); the project uses no WMMA |
+| 2:4 structured sparsity | no benefit | **UNVERIFIED** (no probe run) |
+| Native MXFP4/NVFP4 unpack / convert | none; software only | **software only** — `HIP_ENABLE_GFX950_OCP_BUILTINS==0` here, so `amd_hip_fp4.h` takes its `HIP_ENABLE_HOST_OCP_CONVERSIONS==1` path; the hardware FP4 convert instructions are gated to gfx950/gfx1250, which gfx1201 is not |
 | VRAM | 12 GB | 15.922 GiB measured |
 | Bandwidth | ~350 GB/s assumed | **not measured** |
 
@@ -97,24 +97,36 @@ for the gfx1201 host we actually run on.
   dot-4-accumulate) and `sdot4` are the integer fast paths, and both tiers have
   them. Any paper whose contribution is "run FP4 on the FP4 tensor core" is
   `REJECT` *as a kernel* on gfx1031, regardless of how good the algorithm is.
-- **The project emits no WMMA.** Grepping the tree finds no
-  `__builtin_amdgcn_wmma*` use, so on gfx1201 the WMMA path is available but
-  unclaimed. Whether gfx1201 has a *usable* FP4 path is **UNVERIFIED** and is
-  worth one probe kernel before any FP4 work is scheduled. Verify with
-  `rocminfo | grep -i -E 'fp4|int4|wmma'` on gfx1201 hardware, or by compiling a
-  single `_builtin_amdgcn_...` probe and reading the ISA from the disassembly —
-  do not infer it from RDNA generation alone.
-- **No native MXFP4/NVFP4 unpack path (gfx1031).** Every FP4 weight must be
-  converted in software. This makes *software-only* FP4 error-reduction
-  techniques unusually valuable, because we are already paying the conversion
-  cost. Unverified for gfx1201.
-- **No sparse tensor cores (gfx1031).** 2:4 structured sparsity gets no hardware
-  benefit. Unverified for gfx1201.
-- **Bandwidth-bound, not compute-bound (gfx1031).** At 350 GB/s VRAM and
-  ~1.5-2 TB/s host-to-device, almost every win in this corpus is a *traffic* win,
-  not a FLOP win. Papers reporting "throughput" on B200/B300/H100 are reporting
-  a different bottleneck entirely. **This reasoning is unchanged on gfx1201 in
-  direction but not in magnitude** — the absolute figure is unmeasured.
+- **The project emits no WMMA.** Grepping the tree finds no `__builtin_amdgcn_wmma*`
+  use, so the WMMA path is available on gfx1201 but unclaimed. Confirmed (not inferred
+  from RDNA generation) by compiling `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12`
+  and `…_bf16_w32_gfx12` for `-mcpu=gfx1201` (success, gated on `wmma-128b-insts`) and
+  the same names for `-mcpu=gfx1031` (failure). If a paper's acceleration *is* its
+  matrix core call, mark the kernel `ADOPT-HYBRID` and rewrite that part for UDOT4 —
+  do not ship a WMMA intrinsic this tree does not already carry.
+- **FP4 on gfx1201 is software unpack + UDOT4 matmul.** There is no FP4 tensor core;
+  MXF4/NVFP4 *weights* are unpacked in software (`HIP_ENABLE_GFX950_OCP_BUILTINS==0`
+  here, so `amd_hip_fp4.h` takes its host-conversion path; the hardware FP4 convert
+  instructions are gated to gfx950/gfx1250, which this host is not) and summed through
+  **UDOT4** (`__builtin_amdgcn_udot4` → `v_dot4_i32_i8`, unsigned INT8), the same class of
+  dot the project already targets. `v_cvt_f32_fp4` (the scalar FP4→f32 decode) assembles
+  for gfx1201; verify that fact rather than re-asserting it. So: a paper is `REJECT`
+  only as "native FP4 hardware" — its algorithm, schedule, and scale-sharing transfer.
+  **This is why the packed-FP4 work is scheduled before the `__dp4a` INT8 path
+  described in the engine — INT8 dot is present, FP4 unpack is ours to write.**
+- **No native MXFP4/NVFP4 unpack path (gfx1031).** Every FP4 weight must be converted
+  in software. On gfx1201 this is also software: `HIP_ENABLE_GFX950_OCP_BUILTINS==0`
+  here, so `amd_hip_fp4.h` resolves to its host-conversion fallback; the only native
+  FP4 work uses `v_cvt_f32_fp4` (scalar decode) and the int8 UDOT4 dot. Software-only
+  FP4 error-reduction techniques are disproportionately valuable because we are already
+  paying the conversion cost. No further probe needed for this statement.
+- **2:4 structured sparsity: no hardware benefit on gfx1031; UNVERIFIED on gfx1201.**
+  No probe run — do not infer RDNA4 behavior from RDNA2.
+- **Bandwidth-bound, not compute-bound.** On gfx1031 the figures that used to be stated
+  here were unmeasured assumptions; on gfx11+ the relevant number is the per-tier VRAM
+  bandwidth, which is **not measured on this host** and is left out of the decision
+  math entirely. Directionally unchanged (every win is a traffic win), but no figure is
+  reused across tiers.
 - **VRAM is 12 GB (gfx1031); 15.922 GiB here.** This is why the engine streams
   experts from host memory and disk on the small tier. The 16 GB host has more
   room, which shifts the expert-cache/ring tuning thresholds rather than
