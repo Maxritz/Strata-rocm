@@ -90,6 +90,14 @@ The single list. Priorities: **P0** blocks a shipping milestone, **P1** a family
    Also add **NVFP4** (`case 40`) for the agentworld variant, and note **ROCmFPX** (AMD's own FP4/FP6/FP8,
    used by e.g. `Ornith-1.0-9B-ROCmFPX-STRIX_LEAN`) is a *separate* layout — but see P2 #21: on gfx1201 the
    RDNA4 FP4/FP6 paths are **native**, so ROCmFPX support and the WMMA item are the same project.
+
+   NVFP4 now measured from `ggml-common.h` too (**not** 17 B/16 elem — that is the scale sub-block, and
+   conflating the two is the easy mistake): **36 bytes per 64 elements = 4.5 bits/elem** = 4 × UE4M3 scale
+   (one per 16-elem sub-block) + 32 B packed E2M1. Both layouts, the E2M1 codebook, and a 45-paper survey
+   of what does and does not apply to gfx1031 are in **`RESEARCH_NOTES.md`** — read §3 before writing the
+   dequant and §4.1 for why activations stay INT8. Two adopted specifics: **keep the FP4 packed and expand
+   via an int8 LUT into `__dp4a`** (no offline FP4→int8 expansion), and the **UE4M3 scale edge cases
+   (NaN/255) need explicit tests** — a 255 scale is a plausible calibration bug that silently zeroes weights.
 7. **`qwen35moe`** (Qwen3.5-35B-A3B, ornith-35b, Tiel-Coder-35B, qwable, Unsloth-Ornith-1.5). Measured:
    40L / d 2048 / **16 heads / 2 kv** (8:1 GQA) / key=val=256, **256 experts / 8 + shared 512**, GDN on 3 of
    every 4 layers (`full_attention_interval = 4`), **partial RoPE 64 of 256** with
