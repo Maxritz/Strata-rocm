@@ -1057,7 +1057,17 @@ int main(int argc, char** argv) {
                 const bool ok = e > 0 && hc > 0 && lr > 0 && ff > 0 && sm == 128;
                 std::printf("support: %s\n", ok ? "SUPPORTED (qwen4exp; geometry read from the header)"
                                                 : "NOT runnable: needs ssm 128 and positive widths");
-            } else if (arch == "deepseek4" || arch == "deepseek4-dspark") {
+            } else if (arch == "deepseek4-dspark" || arch.rfind("dspark", 0) == 0) {
+                // **A DRAFT HEAD, NOT A MODEL.**  These GGUFs carry only `dspark.*` (layers / block size /
+                // markov rank / stages / target layers) - a speculative-decoding drafter for a DeepSeek-V4
+                // target, useless without it.  Reported as such rather than as a broken full model.
+                std::printf("  DSPARK speculative-draft head: %lld layers, block %lld, markov_rank %lld, "
+                            "stages %lld, noise_token %lld  (drafts for a DeepSeek-V4 target)\n",
+                            u("dspark.n_layers"), u("dspark.block_size"), u("dspark.markov_rank"),
+                            u("dspark.stage_count"), u("dspark.noise_token_id"));
+                std::printf("support: RECOGNISED, not yet runnable (a draft head needs its target model; "
+                            "docs/DEEPSEEK.md)\n");
+            } else if (arch == "deepseek4") {
                 std::printf("  MLA: heads %lld kv %lld key/value %lld  q_lora %lld  out_lora %lld x%lld  layers %lld embd %lld\n",
                             u("deepseek4.attention.head_count"), u("deepseek4.attention.head_count_kv"),
                             u("deepseek4.attention.key_length"), u("deepseek4.attention.q_lora_rank"),
